@@ -331,8 +331,8 @@ from git log alone.
 
 | Task | Description (short) | Status | Commit | Review verdict |
 |---|---|---|---|---|
-| 1 | Branch scaffold, Go module skeleton, Makefile targets | not-started | - | - |
-| 2 | CI workflow: golangci-lint, go vet, go test -race | not-started | - | - |
+| 1 | Branch scaffold, Go module skeleton, Makefile targets | done | 1421f47 + 353ea17 | approved (6 minors fixed)¹ |
+| 2 | CI workflow: golangci-lint, go vet, go test -race | done | 17d1c3b + 9cb194f | approved (6 minors fixed)² |
 | 3 | Config loader + running-config writer (parsed-blob diff) | not-started | - | - |
 | 4 | Journal entry model, repr UTF-8 fallback, JSON serialization | not-started | - | - |
 | 5 | Filters (field/unit-log-level/secret/search) | not-started | - | - |
@@ -369,3 +369,16 @@ to `in-progress`. If a task is returned with changes required, keep it
 `review` (or `in-progress` if rework was dispatched) and update the
 verdict. Milestones (plan: A after Task 18, B after Task 20, C after Task
 30) are noted in the verdict column of the completing task.
+
+¹ Task 1 evidence: `make build-go` / `unittest-go` (exit-code parity
+subtests, `-race`) / `systest-go` / `lint-go` all green on 353ea17;
+missing-config message renders Python-faithfully as `PosixPath(<path>)`.
+**Carried note (resolved in Task 2)**: the preinstalled golangci-lint
+2.12.2 is built with go1.26 and refuses `go.mod` targeting 1.27; CI now
+installs v2.14.0 from source with the go.mod toolchain (Go 1.27).
+
+² Task 2 evidence: `golangci-lint config verify` OK (.golangci.yml v2,
+D10 linter set + gofumpt); trivial intentional lint failures verified to
+block once on the branch (errcheck exit 2; gofumpt and gocyclo reported);
+`make lint-go` / `unittest-go` green on 9cb194f; workflow YAML parsed
+(actual GitHub Actions run pending the first Go-touching PR).

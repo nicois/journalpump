@@ -1,12 +1,15 @@
 # Go CI for the Python-to-Go migration (plan Task 2, decision D10):
 # golangci-lint (config in .golangci.yml), go vet, and `go test -race`.
-# The system-test job is added by plan Task 27 (build-go.yml systest job
-# + podman script), so this workflow is lint + unit tests only for now.
+# The system-test job is added by plan Task 30 (build-go.yml systest job
+# + scripts/systest-go-on-podman), so this workflow is lint + unit tests
+# only for now.
 
 name: Build journalpump (Go)
 
 on:
   pull_request:
+    # Task 30 must add "scripts/**" here when its podman systest script
+    # (scripts/systest-go-on-podman) lands.
     paths:
       - ".github/workflows/build-go.yml"
       - ".golangci.yml"
@@ -43,6 +46,11 @@ jobs:
           # go.mod toolchain so the lint binary is guaranteed to be built
           # with Go 1.27 (release binaries are not; see the Task 1 ledger
           # note: a go1.26-built golangci-lint refuses go.mod 1.27).
+          # GOBIN/PATH are set explicitly rather than relying on the
+          # runner image's PATH convention (Task 30's podman script
+          # reuses this pattern).
+          export GOBIN="$(go env GOPATH)/bin"
+          export PATH="$GOBIN:$PATH"
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
           make lint-go
 

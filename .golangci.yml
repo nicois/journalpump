@@ -5,15 +5,21 @@ version: "2"
 
 linters:
   # Default-enabled in v2: errcheck, govet, ineffassign, staticcheck,
-  # unused. Listed explicitly so the D10 linter set is auditable here.
+  # unused. All five are listed explicitly (plus the non-default gocyclo,
+  # gocritic, revive) so the D10 linter set is auditable here.
   enable:
     - errcheck
     - govet
     - ineffassign
     - staticcheck
+    - unused
     - gocyclo
     - gocritic
     - revive
+  settings:
+    gocyclo:
+      # Explicit for auditability; equals the golangci-lint default.
+      min-complexity: 30
 
 formatters:
   # gofumpt is the strict superset of gofmt; it subsumes the gofmt check
