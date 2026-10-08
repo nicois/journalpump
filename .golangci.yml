@@ -1,0 +1,22 @@
+# golangci-lint configuration for the Go journalpump (Python-to-Go
+# migration, decision D10: modern lint CI with gocyclo, ineffassign,
+# revive, staticcheck, errcheck, govet, gocritic).
+version: "2"
+
+linters:
+  # Default-enabled in v2: errcheck, govet, ineffassign, staticcheck,
+  # unused. Listed explicitly so the D10 linter set is auditable here.
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - gocyclo
+    - gocritic
+    - revive
+
+formatters:
+  # gofumpt is the strict superset of gofmt; it subsumes the gofmt check
+  # required by D10's formatting policy.
+  enable:
+    - gofumpt
