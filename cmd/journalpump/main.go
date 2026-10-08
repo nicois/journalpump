@@ -43,15 +43,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	configPath := args[0]
 	if !isRegularFile(configPath) {
-		// Python: ServiceDaemonError("Cannot start without json config file at {path!r}")
-		// reported via logging.fatal("%s failed to start: %s", "Journalpump", ex).
-		_, _ = fmt.Fprintf(stderr, "Journalpump failed to start: Cannot start without json config file at %q\n", configPath)
+		// Python: ServiceDaemonError("Cannot start without json config file at
+		// {self.config_path!r}") reported via logging.fatal("%s failed to
+		// start: %s", "Journalpump", ex). The path renders as pathlib's repr
+		// form, e.g. PosixPath('/var/lib/journalpump/journalpump.json'),
+		// reproduced here for log-parity with the Python daemon.
+		_, _ = fmt.Fprintf(stderr, "Journalpump failed to start: Cannot start without json config file at PosixPath(%q)\n", configPath)
 		return exitErr
 	}
 
 	return exitOK
 }
 
+// isRegularFile reports whether path names an existing regular file.
+// Deviation note: Python only raises the "Cannot start" error on
+// FileNotFoundError (daemon.py:101-103); a non-regular config path (e.g. a
+// directory) proceeds and fails later with a different error. The exit code
+// stays 1 either way; the non-regular-path failure mode is handled properly
+// by the config loader (migration Task 3).
 func isRegularFile(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()

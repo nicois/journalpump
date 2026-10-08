@@ -10,6 +10,10 @@ all: py-egg
 GO ?= go
 # Mirrors the Python Makefile's short_ver/long_ver logic: `git describe
 # --tags` with a VERSION env override.
+# Note: the fallback $(short_ver)-unknown diverges from Python's long_ver
+# fallback $(short_ver)-0-unknown-g<hash> (Python runs a second `git
+# describe --always` when the first fails); here there is simply no
+# describe output outside a git checkout.
 VERSION ?= $(shell git describe --tags 2>/dev/null || echo $(short_ver)-unknown)
 GO_LDFLAGS = -X github.com/Aiven-Open/journalpump/internal/version.Version=$(VERSION)
 
