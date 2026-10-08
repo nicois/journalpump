@@ -6,6 +6,13 @@ USE_RE2=${USE_RE2}
 
 all: py-egg
 
+# --- Go (Python-to-Go migration, docs/plan-python-to-go-migration.md) ---
+GO ?= go
+# Mirrors the Python Makefile's short_ver/long_ver logic: `git describe
+# --tags` with a VERSION env override.
+VERSION ?= $(shell git describe --tags 2>/dev/null || echo $(short_ver)-unknown)
+GO_LDFLAGS = -X github.com/Aiven-Open/journalpump/internal/version.Version=$(VERSION)
+
 PYTHON ?= python3
 PYLINT_DIRS = journalpump/ test/ systest/
 MYPY_TARGETS = journalpump/ test/ systest/ scripts/ conftest.py setup.py
@@ -37,6 +44,28 @@ py-egg:
 coverage:
 	$(PYTHON) -m pytest $(PYTEST_ARG) --cov-report term-missing --cov-report xml:coverage.xml \
 		--cov journalpump test/
+
+.PHONY: build-go
+build-go:
+	$(GO) build -ldflags "$(GO_LDFLAGS)" -o build/journalpump ./cmd/journalpump
+
+# Unit tests live next to the code (*_test.go); systest files carry the
+# `systest` build tag and are excluded here.
+.PHONY: unittest-go
+unittest-go:
+	$(GO) test -race ./...
+
+.PHONY: systest-go
+systest-go:
+	$(GO) test -race -tags systest ./systest-go/...
+
+# Lint per decision D10 (golangci-lint incl. gocyclo, ineffassign, revive,
+# staticcheck, errcheck, govet, gocritic); the golangci config is checked
+# in with the CI workflow (plan Task 2).
+.PHONY: lint-go
+lint-go:
+	$(GO) vet ./...
+	golangci-lint run ./...
 
 clean:
 	$(RM) -r *.egg-info/ build/ dist/
