@@ -99,6 +99,19 @@ in review regardless of passing tests elsewhere.
 NEWS entry — plan Task 28):
 - Wrong-typed config values are rejected at load by typed decoding,
   where Python crashed mid-run when the value was used (thread A17).
+  User decision (2026-10-09, Task 3 review): the strict rejection also
+  covers values Python silently coerced or truthiness-tested — numeric
+  strings/floats for integer keys (e.g. threshold_for_metric_emit "10"
+  or 10.5, msg_buffer_max_length 50000.0), non-string values for string
+  keys (initial_position 1.5, write_running_config "yes", statsd host as
+  number), boolean/float statsd and global-tag values, and readers: null
+  — all rejected at load.
+- Running-config dump formatting: the Go dump is parsed-JSON-equal to
+  Python's json.dump(..., sort_keys=True) but not byte-identical (Go
+  renders floats like 60.0 as "60" and 1e+20 as "1e+20", and emits
+  non-ASCII as raw UTF-8 where Python's ensure_ascii=True writes \uXXXX).
+  User decision (2026-10-09, Task 3 review): recorded as a deviation
+  rather than reimplementing Python's float repr.
 - Kafka: sarama send path replaces kafka-python's produce-per-message/
   future/flush dance with one `SyncProducer.SendMessages(batch)` call;
   per-future 1 s timeout maps to `WaitForAcks`/Net.ReadTimeout, NEWS note

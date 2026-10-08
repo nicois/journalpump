@@ -30,3 +30,11 @@ Source: `test/test_running_config.py` (5 tests), `systest/test_running_config.py
 | systest: no write when enabled without path | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/enabled without path warns` |
 | systest: writes to configured path (modes 0600/0700) | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/sorted full document with modes`; spawn-based case in Task 10 |
 | systest: does not chmod existing directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/existing directory is not chmodded` |
+
+Recorded deviation (user decision, Task 3 review; NEWS in plan Task 28):
+the running-config dump is parsed-JSON-equal to Python's
+`json.dump(..., sort_keys=True)` but **not byte-identical** — Go renders
+floats like 60.0 as "60" and 1e+20 as "1e+20" (Python: "60.0",
+"1e+20"), and emits non-ASCII as raw UTF-8 where Python's
+`ensure_ascii=True` writes \uXXXX. All parity assertions above compare
+parsed JSON, so none of them depend on the byte-level difference.

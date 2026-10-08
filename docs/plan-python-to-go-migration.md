@@ -521,7 +521,14 @@ sarama send-path timeout mapping NEWS note if user-visible (thread A7);
 senders up to `max_send_interval` to flush buffered messages where
 Python's daemon sender threads lose them** (D9); **sanctioned deviation:
 wrong-typed config values are rejected at load where Python crashed
-mid-run** (thread A17); no other behavior changes.
+mid-run — extended (user decision, Task 3 review) to values Python
+silently coerced or truthiness-tested: numeric strings/floats for integer
+keys, non-string values for string keys, boolean/float tag values,
+readers: null** (thread A17); **sanctioned deviation: the running-config
+dump is parsed-JSON-equal to Python's json.dump(sort_keys=True) but not
+byte-identical — float rendering (60.0 → "60", 1e-05, 1e+20) and
+non-ASCII emitted as raw UTF-8 instead of ensure_ascii \uXXXX** (user
+decision, Task 3 review); no other behavior changes.
 Acceptance: a user can follow the README to build, install, cut over, and
 roll back; every sanctioned deviation has a NEWS entry.
 Depends on: Task 27.

@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -63,7 +64,9 @@ var SeverityLevels = map[string]int64{
 // Python's logging.setLevel accepts at configure_logging time.
 var pythonLogLevels = map[string]int64{
 	"CRITICAL": 50,
+	"FATAL":    50, // alias, per logging._nameToLevel
 	"ERROR":    40,
+	"WARN":     30, // alias, per logging._nameToLevel
 	"WARNING":  30,
 	"INFO":     20,
 	"DEBUG":    10,
@@ -190,14 +193,91 @@ func (c *Config) ReadersBlob() map[string]any {
 
 // ReadersChanged reports whether the readers blob differs from the active
 // one (Python: `if self.readers_active_config == new_config`). Comparison
-// is over parsed structures, so key order and whitespace never trigger a
-// reload; a nil active blob (first load) always counts as changed, like
-// Python's None == {} comparison.
+// is over parsed structures with Python's == semantics (blobEqual), so key
+// order and whitespace never trigger a reload, and numeric types compare
+// by value like Python dicts do (10 == 10.0 == True); a nil active blob
+// (first load) always counts as changed, like Python's None == {}.
 func ReadersChanged(active, blob map[string]any) bool {
 	if active == nil {
 		return true
 	}
-	return !reflect.DeepEqual(active, blob)
+	return !blobEqual(active, blob)
+}
+
+// blobEqual compares two parsed JSON values with Python's == semantics:
+// dict/list structure, scalars by value across numeric types (Python's
+// bool is an int subclass, so 1 == True and 0 == False), None == None.
+func blobEqual(a, b any) bool {
+	switch av := a.(type) {
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for key, value := range av {
+			other, present := bv[key]
+			if !present || !blobEqual(value, other) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !blobEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return scalarEqual(a, b)
+	}
+}
+
+// scalarNumber renders a scalar as a float for Python-style numeric
+// comparison. Note: Python compares int vs float exactly, so the float64
+// rendering here diverges for integers beyond float64 precision — those
+// cannot appear as user-facing config semantics.
+func scalarNumber(v any) (float64, bool) {
+	switch typed := v.(type) {
+	case bool:
+		if typed {
+			return 1, true
+		}
+		return 0, true
+	case int64:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	case json.Number: // out-of-int64 integer literal
+		value, err := typed.Float64()
+		return value, err == nil
+	}
+	return 0, false
+}
+
+func scalarEqual(a, b any) bool {
+	valueA, numericA := scalarNumber(a)
+	valueB, numericB := scalarNumber(b)
+	if numericA && numericB {
+		return valueA == valueB
+	}
+	if numericA != numericB {
+		// Python: a number never equals a string/None (e.g. 1 == "1" is
+		// False).
+		return false
+	}
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if strA, ok := a.(string); ok {
+		strB, ok := b.(string)
+		return ok && strA == strB
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 // Load reads and decodes the config file at path.
@@ -211,11 +291,21 @@ func Load(path string) (*Config, error) {
 
 // Decode parses journalpump.json content into a typed Config.
 func Decode(data []byte) (*Config, error) {
+	// Python reads the file as UTF-8 text and raises UnicodeDecodeError on
+	// invalid bytes; Go's decoder would silently substitute U+FFFD.
+	if !utf8.Valid(data) {
+		return nil, fmt.Errorf("parsing journalpump.json: config is not valid UTF-8")
+	}
 	var raw map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("parsing journalpump.json: %w", err)
+	}
+	if decoder.More() {
+		// Python: json.load raises ValueError("Extra data") on trailing
+		// content after the first document.
+		return nil, fmt.Errorf("parsing journalpump.json: extra data after the JSON document")
 	}
 	normalizeNumbers(raw)
 	return newConfig(raw)
@@ -231,10 +321,13 @@ func isIntegerLiteral(s string) bool {
 // normalizeNumbers converts json.Number values the way Python's json.load
 // does: integer literals become int64 (Python ints are arbitrary precision,
 // so out-of-int64 integer literals stay as json.Number and marshal
-// verbatim), everything else becomes float64 (Go marshals float64 with the
-// same shortest-round-trip repr Python uses, so running-config floats
-// render identically). Value-equality comparisons over the parsed readers
-// blob (reload diffing) then match Python's int/float semantics.
+// verbatim), everything else becomes float64. Value-equality comparisons
+// over the parsed readers blob (reload diffing) then match Python's
+// int/float semantics via blobEqual. Recorded deviation (NEWS, Task 28):
+// the running-config dump is parsed-JSON-equal to Python's
+// json.dump(..., sort_keys=True) but not byte-identical — Go renders
+// float64 like 60.0 as "60", 1e-05 as "1e-05", 1e+20 as "1e+20", and emits
+// non-ASCII as raw UTF-8 where Python's ensure_ascii=True writes \uXXXX.
 func normalizeNumbers(raw map[string]any) {
 	for key, val := range raw {
 		switch typed := val.(type) {

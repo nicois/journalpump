@@ -404,13 +404,14 @@ func decodeSecretFilters(entry map[string]any, name string) ([]SecretFilterConfi
 		}
 		parsed := SecretFilterConfig{Raw: filter}
 		// Python checks replacement first, then pattern, and raises
-		// ValueError with these exact messages at reader construction.
-		replacement, ok := filter["replacement"]
-		if !ok {
+		// ValueError with these exact messages at reader construction; a
+		// present-but-null field is missing (`.get(...) is None`).
+		replacement, present := filter["replacement"]
+		if !present || replacement == nil {
 			return nil, fmt.Errorf("%s: invalid secret_filters configuration - missing field 'replacement'", readerPath(name))
 		}
-		pattern, ok := filter["pattern"]
-		if !ok {
+		pattern, present := filter["pattern"]
+		if !present || pattern == nil {
 			return nil, fmt.Errorf("%s: invalid secret_filters configuration - missing field 'pattern'", readerPath(name))
 		}
 		var err error

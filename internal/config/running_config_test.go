@@ -43,7 +43,8 @@ func TestWriteRunningConfigSkips(t *testing.T) {
 	t.Parallel()
 	t.Run("path set without enable warns", func(t *testing.T) {
 		t.Parallel()
-		cfg := mustDecode(t, `{"json_running_config_path": "/tmp/running.json"}`)
+		notWritten := filepath.Join(t.TempDir(), "running.json")
+		cfg := mustDecode(t, `{"json_running_config_path": "`+notWritten+`"}`)
 		reason, err := cfg.WriteRunningConfigFile()
 		if err != nil {
 			t.Fatalf("WriteRunningConfig failed: %v", err)
@@ -52,7 +53,7 @@ func TestWriteRunningConfigSkips(t *testing.T) {
 		if reason != want {
 			t.Errorf("skip reason = %q, want %q", reason, want)
 		}
-		if _, err := os.Stat("/tmp/running.json"); err == nil {
+		if _, err := os.Stat(notWritten); err == nil {
 			t.Error("running config must not be written without opt-in")
 		}
 	})

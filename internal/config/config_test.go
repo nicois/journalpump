@@ -422,6 +422,7 @@ func TestDecodeRejectsWrongTypedValues(t *testing.T) {
 		{"log_level wrong type", `{"log_level": 1.5}`, "log_level: must be a log level name or an integer"},
 		{"statsd wrong type", `{"statsd": "127.0.0.1"}`, "statsd: must be an object"},
 		{"statsd port wrong type", `{"statsd": {"host": "h", "port": "8125"}}`, "statsd.port: must be an integer"},
+		{"statsd host wrong type", `{"statsd": {"host": 5}}`, "statsd.host: must be a string"},
 		{"statsd tag wrong type", `{"statsd": {"host": "h", "port": 1, "tags": {"a": true}}}`, "statsd.tags.a: must be a string"},
 		{"tags wrong type", `{"tags": ["a"]}`, "tags: must be an object"},
 		{"msg_buffer_max_length wrong type", `{"msg_buffer_max_length": "50000"}`, "msg_buffer_max_length: must be an integer"},
@@ -447,7 +448,9 @@ func TestDecodeRejectsWrongTypedValues(t *testing.T) {
 		{"secret_filters not a list", `{"readers": {"r": {"secret_filters": {"pattern": "x"}}}}`, "invalid secret_filters configuration - must be a list"},
 		{"secret_filters not a list (entry)", `{"readers": {"r": {"secret_filters": ["x"]}}}`, "invalid secret_filters configuration - must be a list"},
 		{"secret_filter missing replacement", `{"readers": {"r": {"secret_filters": [{"pattern": "x"}]}}}`, "invalid secret_filters configuration - missing field 'replacement'"},
+		{"secret_filter null replacement", `{"readers": {"r": {"secret_filters": [{"pattern": "x", "replacement": null}]}}}`, "invalid secret_filters configuration - missing field 'replacement'"},
 		{"secret_filter missing pattern", `{"readers": {"r": {"secret_filters": [{"replacement": "r"}]}}}`, "invalid secret_filters configuration - missing field 'pattern'"},
+		{"secret_filter null pattern", `{"readers": {"r": {"secret_filters": [{"replacement": "r", "pattern": null}]}}}`, "invalid secret_filters configuration - missing field 'pattern'"},
 		{"match_key wrong type", `{"readers": {"r": {"match_key": 5, "senders": {}}}}`, "readers.r.match_key: must be a string"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -495,5 +498,91 @@ func TestReadersChanged(t *testing.T) {
 	f2 := mustDecode(t, `{"readers": {"a": {"senders": {}, "ratio": 0.30}}}`)
 	if ReadersChanged(f1.ReadersBlob(), f2.ReadersBlob()) {
 		t.Error("numerically equal floats must NOT trigger a reload")
+	}
+}
+
+// TestReadersChangedNumericEquality is the quirk-lock for Python dict
+// equality across numeric types: 10 == 10.0 and 1 == True compare equal
+// (Python's bool is an int subclass), so neither triggers a reload.
+func TestReadersChangedNumericEquality(t *testing.T) {
+	t.Parallel()
+	intVersion := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": 10}}}`)
+	floatVersion := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": 10.0}}}`)
+	if ReadersChanged(intVersion.ReadersBlob(), floatVersion.ReadersBlob()) {
+		t.Error("10 vs 10.0 must NOT trigger a reload (Python: {\"x\":10} == {\"x\":10.0})")
+	}
+	boolVersion := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": true}}}`)
+	oneVersion := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": 1}}}`)
+	if ReadersChanged(oneVersion.ReadersBlob(), boolVersion.ReadersBlob()) {
+		t.Error("1 vs true must NOT trigger a reload (Python: 1 == True)")
+	}
+	zero := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": 0}}}`)
+	falseVersion := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": false}}}`)
+	if ReadersChanged(zero.ReadersBlob(), falseVersion.ReadersBlob()) {
+		t.Error("0 vs false must NOT trigger a reload (Python: 0 == False)")
+	}
+	// ... but a real value change does.
+	changed := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": 11}}}`)
+	if !ReadersChanged(intVersion.ReadersBlob(), changed.ReadersBlob()) {
+		t.Error("10 vs 11 must trigger a reload")
+	}
+	// A number never equals a string or null (Python: 1 == "1" is False).
+	stringVersion := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": "10"}}}`)
+	if !ReadersChanged(intVersion.ReadersBlob(), stringVersion.ReadersBlob()) {
+		t.Error("10 vs \"10\" must trigger a reload")
+	}
+	nullVersion := mustDecode(t, `{"readers": {"a": {"senders": {}, "x": null}}}`)
+	if !ReadersChanged(intVersion.ReadersBlob(), nullVersion.ReadersBlob()) {
+		t.Error("10 vs null must trigger a reload")
+	}
+}
+
+// TestDecodeStrictParsing locks the strict-load behaviors Python shares:
+// trailing data after the first JSON document ("Extra data") and invalid
+// UTF-8 bytes (UnicodeDecodeError) are load errors.
+func TestDecodeStrictParsing(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{"trailing object", `{"readers": {}} {"readers": {}}`, "extra data"},
+		{"trailing garbage", `{} trailing`, "extra data"},
+		{"invalid utf-8", "{\"readers\": {}}\xff\xfe", "not valid UTF-8"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Decode([]byte(tc.config))
+			if err == nil {
+				t.Fatalf("Decode succeeded, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestDecodeLogLevelAliases locks Python's logging._nameToLevel aliases:
+// FATAL == CRITICAL and WARN == WARNING both load.
+func TestDecodeLogLevelAliases(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		level string
+		want  int64
+	}{
+		{"WARN alias", "WARN", 30},
+		{"FATAL alias", "FATAL", 50},
+		{"canonical names", "WARNING", 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := mustDecode(t, `{"log_level": "`+tc.level+`"}`)
+			if cfg.LogLevel != tc.want {
+				t.Errorf("LogLevel(%q) = %d, want %d", tc.level, cfg.LogLevel, tc.want)
+			}
+		})
 	}
 }

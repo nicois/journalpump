@@ -72,9 +72,12 @@ func (c *Config) WriteRunningConfigFile() (skipReason string, err error) {
 // json.dump(config, fp, indent=4, sort_keys=True) — four-space indent,
 // alphabetically sorted keys (encoding/json sorts map keys byte-wise, which
 // matches Python's str ordering for UTF-8), no trailing newline, and no
-// HTML escaping (Python never escapes <, >, & either). Note: Python's
-// ensure_ascii=True writes non-ASCII as \uXXXX while Go emits raw UTF-8;
-// the files are parsed-JSON-equal, which is what the parity tests assert.
+// HTML escaping (Python never escapes <, >, & either). Recorded deviation
+// (NEWS, Task 28): the output is parsed-JSON-equal to Python's dump, not
+// byte-identical — Python's ensure_ascii=True writes non-ASCII as \uXXXX
+// (Go emits raw UTF-8) and Python renders floats like 60.0 as "60.0"
+// (Go renders the same value as "60"); the parity tests assert
+// parsed-equality, which is what the systests assert too.
 func writeSortedJSON(writer io.Writer, raw map[string]any) error {
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
