@@ -262,86 +262,96 @@ func parseProxyURL(proxy string) (*url.URL, error) {
 	return u, nil
 }
 
-// shouldBypassProxies mirrors requests.utils.should_bypass_proxies in full,
-// including the Linux proxy_bypass fallback (urllib.request
-// proxy_bypass_environment): requests' `set_environ("no_proxy", None)` leaves
-// the environment untouched, so the fallback runs against the ambient no_proxy
-// and is NOT a no-op. Two layers apply, OR-ed:
+// shouldBypassProxies mirrors requests.utils.should_bypass_proxies in full.
+// It is TWO OR-ed layers with DIFFERENT sources and matching rules, and
+// conflating them is wrong:
 //
-//  1. requests' own no_proxy loop: for a non-IP host, a plain suffix match on
-//     the host and on host:port; for an IP host, CIDR/plain-IP matching. Space
-//     characters are stripped and empty entries skipped.
-//  2. urllib's proxy_bypass_environment: NO_PROXY="*" bypasses everything; a
-//     case-insensitive, leading-dot-tolerant match (hostonly == name or a
-//     ".name" label-boundary suffix).
+//  1. requests' own no_proxy loop (only when `get_proxy("no_proxy")`, i.e.
+//     a lowercase value or the uppercase fallback, is non-empty). It is
+//     CASE-SENSITIVE and a PLAIN suffix: for a hostname, the RAW entry must
+//     suffix-match the lowercased host or host:port with no label boundary;
+//     for an IP host, CIDR and plain-IP matching apply. Space characters are
+//     stripped and empty entries skipped.
+//  2. urllib's proxy_bypass_environment fallback (requests' `set_environ(
+//     "no_proxy", None)` leaves the environment untouched, so it is NOT a
+//     no-op). Its list comes from getproxies_environment()["no"] — a DIFFERENT
+//     source: an empty lowercase no_proxy REMOVES the entry, so `no_proxy=""`
+//     with `NO_PROXY="*"` does NOT bypass everything. Matching here IS
+//     case-insensitive and label-boundary aware (hostonly == name or a
+//     ".name" suffix), with exact `== "*"` bypassing all.
 //
-// The no_proxy lookup is lowercase-first with an uppercase fallback
-// (`os.environ.get("no_proxy") or os.environ.get("NO_PROXY")`). Loopback
-// targets are NOT special-cased: they are proxied unless no_proxy matches.
+// Loopback targets are NOT special-cased: they are proxied unless no_proxy
+// matches.
 func shouldBypassProxies(u *url.URL) bool {
-	noProxy := os.Getenv("no_proxy")
-	if noProxy == "" {
-		noProxy = os.Getenv("NO_PROXY")
-	}
 	host := u.Hostname()
 	if host == "" {
 		return true
 	}
 	hostLower := strings.ToLower(host)
-	var entries []string
-	if noProxy != "" {
-		for _, entry := range strings.Split(strings.ReplaceAll(noProxy, " ", ""), ",") {
-			if entry != "" {
-				entries = append(entries, entry)
-			}
-		}
-	}
 	hostWithPort := hostLower
 	if port := u.Port(); port != "" {
 		hostWithPort = hostLower + ":" + port
 	}
-	if ip := net.ParseIP(hostLower); ip != nil {
-		for _, entry := range entries {
-			if _, network, err := net.ParseCIDR(entry); err == nil {
-				if network.Contains(ip) {
+
+	// Layer 1: requests' own case-sensitive, plain-suffix loop.
+	firstNoProxy := os.Getenv("no_proxy")
+	if firstNoProxy == "" {
+		firstNoProxy = os.Getenv("NO_PROXY")
+	}
+	if firstNoProxy != "" {
+		entries := splitNoProxyEntries(firstNoProxy)
+		if ip := net.ParseIP(hostLower); ip != nil {
+			for _, entry := range entries {
+				if _, network, err := net.ParseCIDR(entry); err == nil {
+					if network.Contains(ip) {
+						return true
+					}
+					continue
+				}
+				if other := net.ParseIP(entry); other != nil && other.Equal(ip) {
 					return true
 				}
-				continue
 			}
-			if other := net.ParseIP(entry); other != nil && other.Equal(ip) {
-				return true
-			}
-		}
-	} else {
-		// requests' explicit no_proxy loop (plain suffix, no label boundary).
-		for _, entry := range entries {
-			entryLower := strings.ToLower(entry)
-			if strings.HasSuffix(hostLower, entryLower) || strings.HasSuffix(hostWithPort, entryLower) {
-				return true
+		} else {
+			for _, entry := range entries {
+				if strings.HasSuffix(hostLower, entry) || strings.HasSuffix(hostWithPort, entry) {
+					return true
+				}
 			}
 		}
 	}
-	// urllib proxy_bypass_environment fallback.
-	if noProxy == "*" {
+
+	// Layer 2: urllib's case-insensitive, label-boundary fallback, fed by
+	// proxyEnvironment()["no"] (empty lowercase removes the entry).
+	fallback, present := proxyEnvironment()["no"]
+	if !present || fallback == "" {
+		return false
+	}
+	if fallback == "*" {
 		return true
 	}
-	hostonly := hostLower
-	if h, _, err := net.SplitHostPort(hostLower); err == nil {
-		hostonly = h
-	}
-	for _, entry := range entries {
+	for _, entry := range splitNoProxyEntries(fallback) {
 		name := strings.ToLower(strings.TrimLeft(entry, "."))
 		if name == "" {
 			continue
 		}
-		if hostonly == name || hostLower == name {
-			return true
-		}
-		if strings.HasSuffix(hostonly, "."+name) || strings.HasSuffix(hostLower, "."+name) {
+		if hostLower == name || strings.HasSuffix(hostLower, "."+name) {
 			return true
 		}
 	}
 	return false
+}
+
+// splitNoProxyEntries mirrors requests' no_proxy preprocessing: strip ALL
+// spaces, split on commas, drop empty entries.
+func splitNoProxyEntries(noProxy string) []string {
+	var entries []string
+	for _, entry := range strings.Split(strings.ReplaceAll(noProxy, " ", ""), ",") {
+		if entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
 }
 
 // proxyEnvironment builds the scheme -> proxy map like urllib's

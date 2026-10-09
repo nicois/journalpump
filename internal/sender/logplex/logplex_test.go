@@ -770,6 +770,15 @@ func TestNoProxySelection(t *testing.T) {
 		{"wildcard ip", "http://127.0.0.1/input", map[string]string{"no_proxy": "*"}, true},
 		{"mixed-case entry", "http://example.com/input", map[string]string{"no_proxy": "Example.Com"}, true},
 		{"mixed-case uppercase entry", "http://example.com/input", map[string]string{"NO_PROXY": "EXAMPLE.COM"}, true},
+		// Layer-1 negative control: requests' own loop is CASE-SENSITIVE, so a
+		// mixed-case entry misses the plain suffix, and urllib's fallback is
+		// label-boundary aware so it misses "notexample.com" too. Python does
+		// NOT bypass here (probe-verified against requests 2.33.1).
+		{"mixed-case non-boundary not bypassed", "http://notexample.com/input", map[string]string{"no_proxy": "Example.Com"}, false},
+		// Layer-2 source control: an empty lowercase no_proxy REMOVES the
+		// uppercase entry from getproxies_environment()["no"], so an uppercase
+		// "*" does NOT bypass everything (probe-verified).
+		{"empty lowercase removes uppercase wildcard", "http://anything.invalid/input", map[string]string{"no_proxy": "", "NO_PROXY": "*"}, false},
 		{"leading dot matches apex", "http://example.com/input", map[string]string{"no_proxy": ".example.com"}, true},
 		{"leading dot matches subdomain", "http://foo.example.com/input", map[string]string{"no_proxy": ".example.com"}, true},
 		{"bare domain matches subdomain", "http://foo.example.com/input", map[string]string{"no_proxy": "example.com"}, true},
