@@ -97,8 +97,20 @@ func (p *Pump) reloadConfig() error {
 // unit-log-level registries are rebuilt, the readers are reconfigured,
 // and the running config is (re)written.
 func (p *Pump) handleNewConfig(cfg *config.Config) error {
+	// daemon.py:reload_config sets self.log_level from the config and
+	// reconfigures logging BEFORE handle_new_config.
+	if setter, ok := p.log.(LevelSetter); ok {
+		setter.SetLevel(int(cfg.LogLevel))
+	}
 	p.stats = statsd.New(cfg.Statsd.Host, cfg.Statsd.Port, cfg.Statsd.Tags, cfg.Statsd.TagOrder, cfg.Statsd.Prefix, p.log)
 	p.tags = tagged.New(cfg.Tags)
+	// Install the new global snapshot so running readers consult it per
+	// entry (Python's readers read the live pump).
+	p.installSettings(cfg)
+	// journalpump.py:get_state_file_path reads the CURRENT config, so a
+	// reload that changes/enables/disables json_state_file_path moves the
+	// resume reads and the periodic saves to the new path.
+	p.statePath = cfg.JSONStateFilePath
 
 	if cfg.GeoipDatabase != "" {
 		p.log.Printf("Loading GeoIP data from %q", cfg.GeoipDatabase)
@@ -265,7 +277,7 @@ func (p *Pump) retireReader(rt *ReaderRuntime) {
 func (p *Pump) writeRunningConfig(cfg *config.Config) {
 	reason, err := cfg.WriteRunningConfigFile()
 	if reason != "" {
-		p.log.Printf("%s", reason)
+		p.logWarning("%s", reason)
 	}
 	if err != nil {
 		path := config.RunningConfigPath(cfg.JSONRunningConfigPath, os.Getenv("RUNTIME_DIRECTORY"))

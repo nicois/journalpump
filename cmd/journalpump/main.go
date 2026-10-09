@@ -11,7 +11,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 
 	"github.com/Aiven-Open/journalpump/internal/config"
@@ -39,18 +38,18 @@ func main() {
 // immediate exit through the same path.
 var newSignals = daemon.ListenSignals
 
-// newLogger selects the log sink (daemon.py:configure_logging, 58-70):
-// when stdout is a terminal the daemon logs to it with a timestamp
-// prefix; otherwise it logs to the systemd journal through the native
-// datagram socket, where journald supplies the timestamp (Python's
-// journal formatter carries no asctime either). A non-*os.File stdout
-// (the test seam) is used as-is so tests stay deterministic without a
-// live journald.
-var newLogger = func(stdout io.Writer) *log.Logger {
+// newLogger selects the log sink and applies the config log level
+// (daemon.py:configure_logging, 58-70). When stdout is a terminal the
+// daemon logs to it with Python's LOG_FORMAT; otherwise it logs to the
+// systemd journal through the native datagram socket, applying
+// LOG_FORMAT_JOURNAL and mapping each level to a journald PRIORITY. A
+// non-*os.File stdout (the test seam) is used as-is so tests stay
+// deterministic without a live journald.
+var newLogger = func(stdout io.Writer, level int64) *journaldlog.Log {
 	if f, ok := stdout.(*os.File); ok && !journaldlog.IsTerminal(f) {
-		return log.New(journaldlog.NewWriter(), "", 0)
+		return journaldlog.NewJournalLog("journalpump", int(level))
 	}
-	return log.New(stdout, "", log.LstdFlags)
+	return journaldlog.NewTTYLog("journalpump", stdout, int(level))
 }
 
 // run mirrors journalpump/daemon.py:ServiceDaemon.main:
@@ -97,8 +96,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	// Python logs "Loading configuration" (daemon.py:107) through the
 	// logging module: stdout on a tty, the systemd journal otherwise
-	// (daemon.py:58-70).
-	logger := newLogger(stdout)
+	// (daemon.py:58-70), filtered by the configured log_level.
+	logger := newLogger(stdout, cfg.LogLevel)
 	logger.Printf("Loading configuration")
 	registerSenders()
 	pump, err := daemon.NewPump(cfg, daemon.PumpDeps{Log: logger, ConfigPath: configPath})

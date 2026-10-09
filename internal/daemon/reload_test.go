@@ -7,6 +7,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -111,7 +112,7 @@ func TestConfigureReadersReplacesAndResumesCursor(t *testing.T) {
 	registerFakeSenders()
 	overrideReopener(t)
 	initial := decodeConfig(t, `{"json_state_file_path":"/tmp/state.json","readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
-	updated := decodeConfig(t, `{"readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	updated := decodeConfig(t, `{"json_state_file_path":"/tmp/state.json","readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
 	p, err := NewPump(initial, PumpDeps{
 		Log:       &captureLog{},
 		ReadState: func(string) (*state.State, error) { return stateWithCursor("r2", "s", "cur9"), nil },
@@ -205,6 +206,144 @@ func TestPumpWarnsRunningConfigWithoutEnable(t *testing.T) {
 	}
 }
 
+// levelLog records SetLevel calls (the OPTIONAL LevelSetter capability).
+type levelLog struct {
+	captureLog
+	levels []int
+}
+
+func (l *levelLog) SetLevel(level int) { l.levels = append(l.levels, level) }
+
+// TestReloadAppliesLogLevel locks the logging wiring: a reload applies the
+// config log_level through SetLevel (daemon.py sets log_level then
+// reconfigures logging on every reload).
+func TestReloadAppliesLogLevel(t *testing.T) {
+	registerFakeSenders()
+	initial := decodeConfig(t, `{"log_level":"INFO","readers":{}}`)
+	updated := decodeConfig(t, `{"log_level":"WARNING","readers":{}}`)
+	log := &levelLog{}
+	p, err := NewPump(initial, PumpDeps{Log: log})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.handleNewConfig(updated); err != nil {
+		t.Fatalf("handleNewConfig: %v", err)
+	}
+	if len(log.levels) == 0 || log.levels[len(log.levels)-1] != 30 {
+		t.Fatalf("SetLevel calls = %v, want the last to be 30 (WARNING)", log.levels)
+	}
+}
+
+// TestReloadUpdatesStatePath locks get_state_file_path being re-read on
+// reload: a changed json_state_file_path moves the resume reads and saves,
+// for both an unchanged and a replaced readers blob.
+func TestReloadUpdatesStatePath(t *testing.T) {
+	registerFakeSenders()
+	overrideReopener(t)
+	empty := func(string) (*state.State, error) {
+		return &state.State{Readers: map[string]*state.ReaderState{}}, nil
+	}
+	initial := decodeConfig(t, `{"json_state_file_path":"/old/state.json","readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	p, err := NewPump(initial, PumpDeps{Log: &captureLog{}, ReadState: empty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.statePath != "/old/state.json" {
+		t.Fatalf("statePath = %q, want /old/state.json", p.statePath)
+	}
+
+	// Unchanged readers blob, new state path.
+	same := decodeConfig(t, `{"json_state_file_path":"/new/state.json","readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	if err := p.handleNewConfig(same); err != nil {
+		t.Fatalf("handleNewConfig (unchanged readers): %v", err)
+	}
+	if p.statePath != "/new/state.json" {
+		t.Errorf("statePath after unchanged-blob reload = %q, want /new/state.json", p.statePath)
+	}
+
+	// Replaced readers resume from the NEW path.
+	cancel := startReaderGroup(p)
+	defer cancel()
+	t.Cleanup(func() { retireAll(p) })
+	var readPaths []string
+	p.readState = func(path string) (*state.State, error) {
+		readPaths = append(readPaths, path)
+		return &state.State{Readers: map[string]*state.ReaderState{}}, nil
+	}
+	replaced := decodeConfig(t, `{"json_state_file_path":"/new2/state.json","readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	if err := p.handleNewConfig(replaced); err != nil {
+		t.Fatalf("handleNewConfig (replaced readers): %v", err)
+	}
+	if p.statePath != "/new2/state.json" {
+		t.Errorf("statePath after replaced-blob reload = %q, want /new2/state.json", p.statePath)
+	}
+	if len(readPaths) == 0 || readPaths[len(readPaths)-1] != "/new2/state.json" {
+		t.Errorf("state reads = %v, want the new path last", readPaths)
+	}
+}
+
+// failingSource is a ReaderSource whose Ensure always fails, so a reloaded
+// reader goroutine reports an error immediately.
+type failingSource struct{ err error }
+
+func (f failingSource) Ensure() (reader.Reader, error) { return nil, f.err }
+func (failingSource) Invalidate()                      {}
+
+// TestZeroReaderStartDeliversLaterReaderFailure locks the reader-error
+// channel capacity: starting with ZERO readers and reloading in one that
+// then fails must still surface the failure to Run (an unbuffered channel
+// would drop startReader's non-blocking report).
+func TestZeroReaderStartDeliversLaterReaderFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		disableSignals(t)
+		registerFakeSenders()
+		boom := errors.New("reader boom")
+		previous := newReopener
+		newReopener = func(func() reader.OpenConfig, Logger) ReaderSource { return failingSource{err: boom} }
+		t.Cleanup(func() { newReopener = previous })
+
+		initial := decodeConfig(t, `{"readers":{}}`)
+		updated := decodeConfig(t, `{"readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+		var statCalls int
+		t0 := time.Now()
+		p, err := NewPump(initial, PumpDeps{
+			Log:        &captureLog{},
+			Notifier:   &fakeNotifier{},
+			ConfigPath: filepath.Join(t.TempDir(), "config.json"),
+			StatConfig: func(string) (time.Time, error) {
+				statCalls++
+				if statCalls <= 1 {
+					return t0, nil
+				}
+				return t0.Add(time.Hour), nil
+			},
+			LoadConfig: func(string) (*config.Config, error) { return updated, nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.readers) != 0 {
+			t.Fatalf("readers = %d, want 0", len(p.readers))
+		}
+
+		hup := make(chan os.Signal, 1)
+		done := make(chan error, 1)
+		go func() { done <- p.Run(context.Background(), hup) }()
+		synctest.Wait()
+		hup <- syscall.SIGHUP
+		synctest.Wait()
+
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "reader boom") {
+				t.Fatalf("Run = %v, want the reader failure", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("reader failure dropped after a zero-reader start")
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // SIGHUP reload through Run
 
@@ -218,7 +357,7 @@ func TestRunSIGHUPReload(t *testing.T) {
 		overrideReopener(t)
 
 		initial := decodeConfig(t, `{"json_state_file_path":"/tmp/state.json","readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
-		updated := decodeConfig(t, `{"readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
+		updated := decodeConfig(t, `{"json_state_file_path":"/tmp/state.json","readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
 
 		var statCalls int
 		t0 := time.Now()

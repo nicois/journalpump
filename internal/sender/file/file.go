@@ -64,6 +64,12 @@ type Sender struct {
 	payloadEnd int64
 	// flushedPayload is the payload watermark derived from count.n.
 	flushedPayload int64
+	// boundary is the raw byte offset of the last COMPLETE line written
+	// to the file. A bufio auto-flush can end in the middle of a line, so
+	// the file may hold a partial line; discarding or a failed flush
+	// truncates back to boundary, guaranteeing the file only ever ends on
+	// a complete-line edge (replay then appends a clean line).
+	boundary int64
 }
 
 // flushMark is one accepted line's cumulative byte ends.
@@ -133,9 +139,29 @@ func (s *Sender) flushedLocked() int64 {
 	n := s.count.n
 	for len(s.queue) > 0 && s.queue[0].rawEnd <= n {
 		s.flushedPayload = s.queue[0].payloadEnd
+		s.boundary = s.queue[0].rawEnd
 		s.queue = s.queue[1:]
 	}
 	return s.flushedPayload
+}
+
+// discardUnflushedLocked drops the buffered, not-yet-written bytes plus
+// the unflushed tail, and truncates any partially-written line back to the
+// last complete-line boundary, so the file ends on a clean edge. Caller
+// holds s.mu.
+func (s *Sender) discardUnflushedLocked() error {
+	// Settle the complete-line boundary from what actually reached disk
+	// (while the queue still holds the marks), then remove any partial
+	// line past it.
+	s.flushedLocked()
+	// Drop buffered, unwritten bytes (bufio.Reset does not write them).
+	s.buf.Reset(s.count)
+	s.queue = nil
+	if err := s.output.Truncate(s.boundary); err != nil {
+		return err
+	}
+	s.count.n = s.boundary
+	return nil
 }
 
 // Finalize flushes the buffered tail without releasing the handle. The
@@ -150,8 +176,14 @@ func (s *Sender) Finalize() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	err := s.buf.Flush()
+	if err != nil {
+		// A partial line may have reached the file before the failure:
+		// roll back to the last complete-line boundary so a restart's
+		// replay appends a clean line rather than corrupting this one.
+		return errors.Join(err, s.discardUnflushedLocked())
+	}
 	_ = s.flushedLocked()
-	return err
+	return nil
 }
 
 // Close flushes the buffered tail and releases the output handle.
@@ -172,10 +204,8 @@ func (s *Sender) Close() error {
 func (s *Sender) CloseDiscarding() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// bufio.Reset discards any buffered, unflushed data.
-	s.buf.Reset(s.count)
-	s.queue = nil
-	return s.output.Close()
+	discardErr := s.discardUnflushedLocked()
+	return errors.Join(discardErr, s.output.Close())
 }
 
 // New is the wiring-map constructor for output_type "file"

@@ -1502,6 +1502,109 @@ func TestReloadRetireDiscardsUnflushedFileTail(t *testing.T) {
 	retireAll(p)
 }
 
+// TestReloadRetireTruncatesPartialLineKeepingValidJSONL locks the
+// partial-line fix end to end: a buffer auto-flush cuts through the second
+// JSON line, leaving a corrupt prefix on disk; the reload retire truncates
+// it back to the first complete line, so the file stays valid JSONL.
+func TestReloadRetireTruncatesPartialLineKeepingValidJSONL(t *testing.T) {
+	registerFakeSenders()
+	overrideReopener(t)
+	outPath := filepath.Join(t.TempDir(), "out.log")
+	// A message size between half and all of the 131072-byte buffer makes
+	// the second message overflow the buffer, so its flush cuts through
+	// the line (the first line is complete, the second is partial).
+	padding := strings.Repeat("x", 69000)
+	cfgJSON := fmt.Sprintf(`{"readers":{"r1":{"senders":{"s":{"output_type":"file","file_output":%q,"extra_field_values":{"PADDING":%q}}}}}}`, outPath, padding)
+	initial := decodeConfig(t, cfgJSON)
+	updated := decodeConfig(t, `{"readers":{"r2":{"senders":{"s":{"output_type":"file","file_output":"`+outPath+`"}}}}}`)
+	p, err := NewPump(initial, PumpDeps{Log: &captureLog{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel := startReaderGroup(p)
+	defer cancel()
+
+	rt := p.readers[0]
+	rt.initSenders()
+	rt.journaldReader = &fakeReader{}
+	processEntries(t, rt, "c1", "c2")
+	waitSent(t, p, "r1", "s", 2)
+
+	// The auto-flush left a partial second line on disk.
+	if info, statErr := os.Stat(outPath); statErr != nil {
+		t.Fatalf("stat: %v", statErr)
+	} else if info.Size() == 0 {
+		t.Fatalf("expected the auto-flush to write bytes")
+	}
+
+	if err := p.handleNewConfig(updated); err != nil {
+		t.Fatalf("handleNewConfig: %v", err)
+	}
+
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+		t.Fatalf("output does not end on a line boundary: %q", raw[max(0, len(raw)-40):])
+	}
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+		t.Fatalf("expected at least one complete line, got %q", raw)
+	}
+	seen := map[string]bool{}
+	for i, line := range lines {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("line %d is not valid JSON: %q", i, line)
+		}
+		if seen[line] {
+			t.Fatalf("duplicate output line %d", i)
+		}
+		seen[line] = true
+	}
+	retireAll(p)
+}
+
+// TestReloadGlobalMatchAppliesToUnchangedReader locks the global-settings
+// semantics: a reload changing ONLY the pump-level match rules, with an
+// unchanged readers blob, keeps the reader — but the new rules take effect,
+// because the handler consults the current pump settings per entry
+// (journalpump.py:723 self.pump.check_match).
+func TestReloadGlobalMatchAppliesToUnchangedReader(t *testing.T) {
+	registerFakeSenders()
+	initial := decodeConfig(t, `{"match_key":"SYSLOG_IDENTIFIER","match_value":"old","readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	updated := decodeConfig(t, `{"match_key":"SYSLOG_IDENTIFIER","match_value":"new","readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	p, err := NewPump(initial, PumpDeps{Log: &captureLog{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := p.readers[0]
+	if err := p.handleNewConfig(updated); err != nil {
+		t.Fatalf("handleNewConfig: %v", err)
+	}
+	if p.readers[0] != before {
+		t.Fatal("reader was replaced despite an unchanged readers blob")
+	}
+	rt := p.readers[0]
+	rt.initSenders()
+	defer stopSendersNow(p)
+
+	hit := journal.Entry{Cursor: "c1", Fields: []journal.Field{
+		{Key: "SYSLOG_IDENTIFIER", Value: "new"},
+		{Key: "MESSAGE", Value: "m"},
+	}}
+	if _, _, hasBytes, err := rt.process(context.Background(), hit); err != nil || !hasBytes {
+		t.Fatalf("new global match rule not applied: hasBytes=%v err=%v", hasBytes, err)
+	}
+	miss := journal.Entry{Cursor: "c2", Fields: []journal.Field{
+		{Key: "SYSLOG_IDENTIFIER", Value: "old"},
+		{Key: "MESSAGE", Value: "m"},
+	}}
+	if _, _, hasBytes, _ := rt.process(context.Background(), miss); hasBytes {
+		t.Error("old global match value still accepted after the reload")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Pump.Run supervisor
 

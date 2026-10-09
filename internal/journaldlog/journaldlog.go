@@ -11,17 +11,23 @@
 //
 // The datagram format is the journal "native protocol"
 // (sd_journal_send-style, D10): a sequence of NAME=value fields, one per
-// line. Field values containing a newline are written as the field name
-// followed by the value on the following lines. Multi-line log messages
-// therefore stay a single journal entry.
+// line. A value containing a newline is written in the binary field form:
+// the field name, a newline, an 8-byte little-endian value length, the
+// value bytes, and a trailing newline. Multi-line log messages therefore
+// stay a single journal entry.
 package journaldlog
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -29,20 +35,77 @@ import (
 // DefaultSocket is the well-known systemd journal datagram socket.
 var DefaultSocket = "/run/systemd/journal/socket"
 
-// Journal priority levels (syslog PRIORITY values).
+// Journal priority levels (syslog PRIORITY values, journal.py LOG_*).
 const (
-	PriorityErr  = 3
-	PriorityInfo = 6
+	PriorityAlert   = 1
+	PriorityCrit    = 2
+	PriorityErr     = 3
+	PriorityWarning = 4
+	PriorityNotice  = 5
+	PriorityInfo    = 6
+	PriorityDebug   = 7
 )
 
+// Python logging level numbers (logging._nameToLevel).
+const (
+	LevelDebug    = 10
+	LevelInfo     = 20
+	LevelWarning  = 30
+	LevelError    = 40
+	LevelCritical = 50
+)
+
+// Priority maps a Python logging level number to a journald priority,
+// exactly like systemd.journal.JournalHandler.map_priority.
+func Priority(level int) int {
+	switch {
+	case level <= LevelDebug:
+		return PriorityDebug
+	case level <= LevelInfo:
+		return PriorityInfo
+	case level <= LevelWarning:
+		return PriorityWarning
+	case level <= LevelError:
+		return PriorityErr
+	case level <= LevelCritical:
+		return PriorityCrit
+	default:
+		return PriorityAlert
+	}
+}
+
+// LevelName maps a Python logging level number to its uppercase name
+// (logging.getLevelName for the standard levels).
+func LevelName(level int) string {
+	switch level {
+	case LevelDebug:
+		return "DEBUG"
+	case LevelInfo:
+		return "INFO"
+	case LevelWarning:
+		return "WARNING"
+	case LevelError:
+		return "ERROR"
+	case LevelCritical:
+		return "CRITICAL"
+	default:
+		return "Level " + strconv.Itoa(level)
+	}
+}
+
+// Logger name Python uses at the root (daemon.py: self.name =
+// self.__class__.__name__.lower()).
+const defaultIdentifier = "journalpump"
+
 // Writer is an io.Writer that sends each Write as one journal entry.
-// Identifier is the SYSLOG_IDENTIFIER field (Python uses the daemon
-// class name lowercased, "journalpump"); Priority is the numeric
-// PRIORITY field.
+// Identifier is the SYSLOG_IDENTIFIER field, Priority the numeric
+// PRIORITY field, and Name the optional LOGGER field (Python's
+// JournalHandler passes LOGGER=record.name).
 type Writer struct {
 	Socket     string
 	Identifier string
 	Priority   int
+	Name       string
 }
 
 // NewWriter builds a Writer with the daemon defaults
@@ -51,52 +114,66 @@ func NewWriter() Writer {
 	return Writer{Socket: DefaultSocket, Identifier: "journalpump", Priority: PriorityInfo}
 }
 
-// Write sends one datagram for p, returning len(p) on success so it
-// satisfies io.Writer. A missing socket is an error; log.Logger ignores
-// it, matching the "logging must never take the daemon down" property.
+// Write sends one datagram for p at the writer's default priority,
+// returning len(p) on success so it satisfies io.Writer. A missing socket
+// is an error; a caller that must not propagate it (logging) ignores it,
+// matching the "logging never takes the daemon down" property.
 func (w Writer) Write(p []byte) (int, error) {
+	if err := w.Send(strings.TrimRight(string(p), "\n"), w.Priority); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Send writes one journal entry with the given priority.
+func (w Writer) Send(message string, priority int) error {
 	socket := w.Socket
 	if socket == "" {
 		socket = DefaultSocket
 	}
 	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: socket, Net: "unixgram"})
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer conn.Close() //nolint:errcheck // datagram socket, nothing to flush
-	if _, err := conn.Write(w.datagram(p)); err != nil {
-		return 0, err
-	}
-	return len(p), nil
+	_, err = conn.Write(w.datagram(message, priority))
+	return err
 }
 
 // datagram renders the native-protocol field sequence: MESSAGE (the log
-// line, newlines encoded per the protocol), SYSLOG_IDENTIFIER and
-// PRIORITY. The trailing newline log.Logger appends is stripped so the
-// journal entry does not gain an empty line.
-func (w Writer) datagram(p []byte) []byte {
-	message := strings.TrimRight(string(p), "\n")
+// line, newlines encoded per the protocol), SYSLOG_IDENTIFIER, PRIORITY,
+// and LOGGER when a name is set.
+func (w Writer) datagram(message string, priority int) []byte {
 	identifier := w.Identifier
 	if identifier == "" {
-		identifier = "journalpump"
+		identifier = defaultIdentifier
 	}
-	var b strings.Builder
+	var b bytes.Buffer
 	writeField(&b, "MESSAGE", message)
 	fmt.Fprintf(&b, "SYSLOG_IDENTIFIER=%s\n", sanitizeFieldValue(identifier))
-	fmt.Fprintf(&b, "PRIORITY=%s\n", strconv.Itoa(w.Priority))
-	return []byte(b.String())
+	fmt.Fprintf(&b, "PRIORITY=%s\n", strconv.Itoa(priority))
+	if w.Name != "" {
+		fmt.Fprintf(&b, "LOGGER=%s\n", sanitizeFieldValue(w.Name))
+	}
+	return b.Bytes()
 }
 
-// writeField writes one native-protocol field. Newlines in the value are
-// encoded as the field name on its own line followed by the value
-// (journal's binary-safe multiline form); an embedded NUL would need the
-// binary form, which log lines never carry.
-func writeField(b *strings.Builder, name, value string) {
+// writeField writes one native-protocol field. A value containing a
+// newline is written in the binary form: the field name, a newline, the
+// value length as an 8-byte little-endian integer, the value, and a
+// trailing newline. A single-line value uses the simple NAME=value form.
+func writeField(b *bytes.Buffer, name, value string) {
 	if !strings.ContainsRune(value, '\n') {
 		fmt.Fprintf(b, "%s=%s\n", name, value)
 		return
 	}
-	fmt.Fprintf(b, "%s\n%s\n", name, value)
+	b.WriteString(name)
+	b.WriteByte('\n')
+	var size [8]byte
+	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
+	b.Write(size[:])
+	b.WriteString(value)
+	b.WriteByte('\n')
 }
 
 // sanitizeFieldValue removes the newline characters a single-line field
@@ -116,4 +193,88 @@ func IsTerminal(f *os.File) bool {
 	}
 	_, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
 	return err == nil
+}
+
+// Log is the daemon's level-aware logging seam (daemon.py:configure_logging):
+// it applies Python's level threshold and message formats, maps the level
+// to a journald PRIORITY (see Priority), and carries the logger-name
+// context (the LOGGER field and the %(name)s in the message). On a tty it
+// writes to an io.Writer; otherwise it sends journal datagrams. SetLevel
+// is honoured on config reload (daemon.py:reload_config sets log_level
+// then reconfigures logging).
+type Log struct {
+	name   string
+	out    io.Writer // non-nil => tty sink
+	writer Writer    // journald sink used when out == nil
+
+	mu    sync.Mutex
+	level int
+}
+
+// NewJournalLog builds a journald-backed Log for the given logger name and
+// minimum Python logging level. The socket is resolved per write from
+// DefaultSocket so tests can redirect it.
+func NewJournalLog(name string, level int) *Log {
+	if name == "" {
+		name = defaultIdentifier
+	}
+	return &Log{name: name, level: level}
+}
+
+// NewTTYLog builds an io.Writer-backed Log with Python's tty format
+// (LOG_FORMAT: asctime\tname\tlevelname\tmessage).
+func NewTTYLog(name string, out io.Writer, level int) *Log {
+	if name == "" {
+		name = defaultIdentifier
+	}
+	return &Log{name: name, out: out, level: level}
+}
+
+// SetLevel updates the minimum level (config reload).
+func (l *Log) SetLevel(level int) {
+	l.mu.Lock()
+	l.level = level
+	l.mu.Unlock()
+}
+
+// Level reports the current minimum level.
+func (l *Log) Level() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.level
+}
+
+// Printf logs at INFO (the daemon's default logging level).
+func (l *Log) Printf(format string, args ...any) { l.logf(LevelInfo, format, args...) }
+
+// Errorf logs at ERROR (Python's log.exception / log.error).
+func (l *Log) Errorf(format string, args ...any) { l.logf(LevelError, format, args...) }
+
+// Warningf logs at WARNING (Python's log.warning).
+func (l *Log) Warningf(format string, args ...any) { l.logf(LevelWarning, format, args...) }
+
+// Debugf logs at DEBUG (Python's log.debug).
+func (l *Log) Debugf(format string, args ...any) { l.logf(LevelDebug, format, args...) }
+
+// logf filters by level, then emits through the selected sink.
+func (l *Log) logf(level int, format string, args ...any) {
+	l.mu.Lock()
+	threshold := l.level
+	l.mu.Unlock()
+	if level < threshold {
+		return
+	}
+	message := fmt.Sprintf(format, args...)
+	if l.out != nil {
+		// LOG_FORMAT: "%(asctime)s\t%(name)s\t%(levelname)s\t%(message)s".
+		asctime := time.Now().Format("2006-01-02 15:04:05,000")
+		_, _ = fmt.Fprintf(l.out, "%s\t%s\t%s\t%s\n", asctime, l.name, LevelName(level), message)
+		return
+	}
+	// LOG_FORMAT_JOURNAL:
+	// "%(name)-20s  %(levelname)-8s  %(message)s".
+	writer := l.writer
+	writer.Identifier = l.name
+	writer.Name = l.name
+	_ = writer.Send(fmt.Sprintf("%-20s  %-8s  %s", l.name, LevelName(level), message), Priority(level))
 }

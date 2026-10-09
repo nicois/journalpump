@@ -210,13 +210,19 @@ func TestBufferedVisibilityAndFlushOnClose(t *testing.T) {
 	}
 }
 
-// newTestSender builds a file Sender writing to a temp path.
+// newTestSender builds a file Sender writing to a fresh temp path.
 func newTestSender(t *testing.T) (*Sender, string) {
 	t.Helper()
-	outPath := filepath.Join(t.TempDir(), "out.log")
+	return newTestSenderAt(t, filepath.Join(t.TempDir(), "out.log"))
+}
+
+// newTestSenderAt builds a file Sender appending to path (a restart on the
+// same output).
+func newTestSenderAt(t *testing.T, path string) (*Sender, string) {
+	t.Helper()
 	inst, err := New(sender.ConstructorArgs{
 		Name:   "s",
-		Config: map[string]any{"output_type": "file", "file_output": outPath},
+		Config: map[string]any{"output_type": "file", "file_output": path},
 		Tags:   tagged.New(nil),
 	})
 	if err != nil {
@@ -226,7 +232,7 @@ func newTestSender(t *testing.T) (*Sender, string) {
 	if !ok {
 		t.Fatalf("transport type %T", inst.Transport)
 	}
-	return tr, outPath
+	return tr, path
 }
 
 // TestFlushedPayloadBytesLagsUntilFlush locks the delivery checkpoint at
@@ -314,6 +320,84 @@ func TestCloseDiscardingDropsUnflushedTail(t *testing.T) {
 	}
 	if got := tr.FlushedPayloadBytes(); got != 0 {
 		t.Errorf("flushed = %d after discarding, want 0", got)
+	}
+}
+
+// TestRestartAfterPartialFlushReplaysCleanly locks the end-to-end
+// guarantee: a bufio auto-flush can cut through a line, leaving a JSON
+// prefix on disk; discarding truncates it back to the last complete line,
+// so a replay from that edge appends a clean line (valid JSONL, no
+// corrupted partial object).
+func TestRestartAfterPartialFlushReplaysCleanly(t *testing.T) {
+	tr, outPath := newTestSender(t)
+
+	if err := tr.SendMessages(context.Background(), [][]byte{[]byte("first")}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	big := bytes.Repeat([]byte("x"), pythonBufferSize+10)
+	if err := tr.SendMessages(context.Background(), [][]byte{big}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	info, err := os.Stat(outPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() <= int64(len("first\n")) {
+		t.Fatalf("size = %d, want the complete line plus a partial prefix", info.Size())
+	}
+
+	// Discard (the failed-flush/reload path) removes the partial prefix.
+	if err := tr.CloseDiscarding(); err != nil {
+		t.Fatalf("CloseDiscarding: %v", err)
+	}
+
+	// Restart: a fresh sender re-appends the unflushed line.
+	tr2, _ := newTestSenderAt(t, outPath)
+	if err := tr2.SendMessages(context.Background(), [][]byte{big}, ""); err != nil {
+		t.Fatalf("replay SendMessages: %v", err)
+	}
+	if err := tr2.Close(); err != nil {
+		t.Fatalf("replay Close: %v", err)
+	}
+
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	want := "first\n" + string(big) + "\n"
+	if string(raw) != want {
+		t.Fatalf("output length = %d, want %d (clean replay, no corrupt partial)", len(raw), len(want))
+	}
+}
+
+// TestDiscardTruncatesToLastCompleteLine locks the clean-edge guarantee:
+// when a flush cuts through a line, only the partial line is removed — the
+// preceding complete line stays, so replay resumes from a valid edge.
+func TestDiscardTruncatesToLastCompleteLine(t *testing.T) {
+	tr, outPath := newTestSender(t)
+
+	if err := tr.SendMessages(context.Background(), [][]byte{[]byte("first")}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	// The next write overflows the buffer, flushing "first\n" plus a
+	// partial prefix of the big line.
+	big := bytes.Repeat([]byte("x"), pythonBufferSize+10)
+	if err := tr.SendMessages(context.Background(), [][]byte{big}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	if got := tr.FlushedPayloadBytes(); got != int64(len("first")) {
+		t.Fatalf("flushed = %d, want %d (only the complete line)", got, len("first"))
+	}
+
+	if err := tr.CloseDiscarding(); err != nil {
+		t.Fatalf("CloseDiscarding: %v", err)
+	}
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(raw) != "first\n" {
+		t.Errorf("output = %q, want %q (partial truncated, complete line kept)", raw, "first\n")
 	}
 }
 

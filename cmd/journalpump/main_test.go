@@ -8,7 +8,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -118,9 +117,19 @@ func TestRunExitCodes(t *testing.T) {
 }
 
 // TestNewLoggerSelectsSink locks the stdout-vs-journald choice
-// (daemon.py:58-70): a non-tty *os.File selects the journald writer, and
-// a non-file writer (the test seam) is used as-is.
+// (daemon.py:58-70): a non-tty *os.File selects the journald sink, and a
+// non-file writer (the test seam) is used as-is.
 func TestNewLoggerSelectsSink(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "journal.sock")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sock, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	previous := journaldlog.DefaultSocket
+	journaldlog.DefaultSocket = sock
+	defer func() { journaldlog.DefaultSocket = previous }()
+
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -128,12 +137,53 @@ func TestNewLoggerSelectsSink(t *testing.T) {
 	defer func() { _ = r.Close() }()
 	defer func() { _ = w.Close() }()
 
-	if _, ok := newLogger(w).Writer().(journaldlog.Writer); !ok {
-		t.Errorf("non-tty file did not select the journald writer: %T", newLogger(w).Writer())
+	newLogger(w, journaldlog.LevelDebug).Printf("to-journal")
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
 	}
-	buf := &bytes.Buffer{}
-	if newLogger(buf).Writer() != io.Writer(buf) {
+	buf := make([]byte, 4096)
+	n, _, err := conn.ReadFromUnix(buf)
+	if err != nil {
+		t.Fatalf("non-tty file did not select the journald sink: %v", err)
+	}
+	if !strings.Contains(string(buf[:n]), "to-journal") {
+		t.Errorf("datagram = %q, want the message", string(buf[:n]))
+	}
+
+	ttyBuf := &bytes.Buffer{}
+	newLogger(ttyBuf, journaldlog.LevelDebug).Printf("to-tty")
+	if !strings.Contains(ttyBuf.String(), "to-tty") {
 		t.Error("non-file writer was not used as-is")
+	}
+}
+
+// TestNewLoggerHonorsLevel locks the startup level wiring: a config
+// log_level above INFO suppresses the INFO "Loading configuration" line.
+func TestNewLoggerHonorsLevel(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "journal.sock")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sock, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	previous := journaldlog.DefaultSocket
+	journaldlog.DefaultSocket = sock
+	defer func() { journaldlog.DefaultSocket = previous }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
+
+	newLogger(w, journaldlog.LevelWarning).Printf("suppressed")
+	if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	if n, _, err := conn.ReadFromUnix(buf); err == nil {
+		t.Fatalf("INFO line emitted at WARNING level: %q", string(buf[:n]))
 	}
 }
 
@@ -178,8 +228,14 @@ func TestRunLogsToJournaldWhenStdoutNotTTY(t *testing.T) {
 		t.Fatalf("journal datagram not received: %v", err)
 	}
 	got := string(buf[:n])
-	if !strings.Contains(got, "MESSAGE=Loading configuration\n") {
+	if !strings.Contains(got, "Loading configuration") {
 		t.Errorf("datagram = %q, want the loading log line", got)
+	}
+	if !strings.Contains(got, "PRIORITY=6\n") {
+		t.Errorf("datagram = %q, want PRIORITY=6 (INFO)", got)
+	}
+	if !strings.Contains(got, "LOGGER=journalpump\n") {
+		t.Errorf("datagram = %q, want LOGGER=journalpump", got)
 	}
 	if !strings.Contains(got, "SYSLOG_IDENTIFIER=journalpump\n") {
 		t.Errorf("datagram = %q, want SYSLOG_IDENTIFIER=journalpump", got)
