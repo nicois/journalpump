@@ -330,7 +330,7 @@ func shouldBypassProxies(u *url.URL) bool {
 	if fallback == "*" {
 		return true
 	}
-	for _, entry := range splitNoProxyEntries(fallback) {
+	for _, entry := range splitFallbackEntries(fallback) {
 		name := strings.ToLower(strings.TrimLeft(entry, "."))
 		if name == "" {
 			continue
@@ -342,11 +342,27 @@ func shouldBypassProxies(u *url.URL) bool {
 	return false
 }
 
-// splitNoProxyEntries mirrors requests' no_proxy preprocessing: strip ALL
-// spaces, split on commas, drop empty entries.
+// splitNoProxyEntries mirrors requests' no_proxy preprocessing for LAYER 1:
+// strip ALL ASCII spaces, split on commas, drop empty entries (tabs and other
+// whitespace are NOT removed here).
 func splitNoProxyEntries(noProxy string) []string {
 	var entries []string
 	for _, entry := range strings.Split(strings.ReplaceAll(noProxy, " ", ""), ",") {
+		if entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// splitFallbackEntries mirrors urllib's proxy_bypass_environment preprocessing
+// for LAYER 2: split on commas, then strip each entry's leading/trailing
+// whitespace (Python str.strip(): space, \t, \n, \r, \f, \v — TrimSpace also
+// covers these), dropping empty entries.
+func splitFallbackEntries(noProxy string) []string {
+	var entries []string
+	for _, entry := range strings.Split(noProxy, ",") {
+		entry = strings.TrimSpace(entry)
 		if entry != "" {
 			entries = append(entries, entry)
 		}

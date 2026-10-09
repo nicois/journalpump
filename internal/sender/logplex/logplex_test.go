@@ -770,6 +770,10 @@ func TestNoProxySelection(t *testing.T) {
 		{"wildcard ip", "http://127.0.0.1/input", map[string]string{"no_proxy": "*"}, true},
 		{"mixed-case entry", "http://example.com/input", map[string]string{"no_proxy": "Example.Com"}, true},
 		{"mixed-case uppercase entry", "http://example.com/input", map[string]string{"NO_PROXY": "EXAMPLE.COM"}, true},
+		// Layer-2 preprocessing: urllib strips leading/trailing whitespace
+		// (space, \t, \n, \r, \f, \v) from each entry, while layer 1 removes
+		// only ASCII spaces; a tab-padded entry is stripped by the fallback.
+		{"tab-padded mixed-case entry", "http://example.com/input", map[string]string{"no_proxy": "\tExample.Com\t"}, true},
 		// Layer-1 negative control: requests' own loop is CASE-SENSITIVE, so a
 		// mixed-case entry misses the plain suffix, and urllib's fallback is
 		// label-boundary aware so it misses "notexample.com" too. Python does
