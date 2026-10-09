@@ -41,6 +41,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/sender"
@@ -234,13 +235,47 @@ func proxyForRequest(req *http.Request) (*url.URL, error) {
 	if proxy == "" {
 		return nil, nil
 	}
-	return url.Parse(proxy)
+	return parseProxyURL(proxy)
 }
 
-// shouldBypassProxies mirrors requests.utils.should_bypass_proxies (minus the
-// platform-specific proxy_bypass call, which is a no-op on Linux: requests
-// clears no_proxy around it when no explicit no_proxy was supplied). The
-// no_proxy lookup is lowercase-first with an uppercase fallback
+// parseProxyURL normalizes a proxy address the way requests does before
+// building the connection: a scheme-less address (e.g. HTTP_PROXY=
+// "proxy.example:8080") gets an "http://" scheme prepended
+// (utils.prepend_scheme_if_needed), and the result must have a host. requests
+// accepts these addresses; net/url would otherwise parse "proxy.example:8080"
+// as an opaque URL with no usable host.
+func parseProxyURL(proxy string) (*url.URL, error) {
+	if !strings.Contains(proxy, "://") {
+		if strings.HasPrefix(proxy, "//") {
+			proxy = "http:" + proxy
+		} else {
+			proxy = "http://" + proxy
+		}
+	}
+	u, err := url.Parse(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("proxy %q: %w", proxy, err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("proxy %q has no host", proxy)
+	}
+	return u, nil
+}
+
+// shouldBypassProxies mirrors requests.utils.should_bypass_proxies in full,
+// including the Linux proxy_bypass fallback (urllib.request
+// proxy_bypass_environment): requests' `set_environ("no_proxy", None)` leaves
+// the environment untouched, so the fallback runs against the ambient no_proxy
+// and is NOT a no-op. Two layers apply, OR-ed:
+//
+//  1. requests' own no_proxy loop: for a non-IP host, a plain suffix match on
+//     the host and on host:port; for an IP host, CIDR/plain-IP matching. Space
+//     characters are stripped and empty entries skipped.
+//  2. urllib's proxy_bypass_environment: NO_PROXY="*" bypasses everything; a
+//     case-insensitive, leading-dot-tolerant match (hostonly == name or a
+//     ".name" label-boundary suffix).
+//
+// The no_proxy lookup is lowercase-first with an uppercase fallback
 // (`os.environ.get("no_proxy") or os.environ.get("NO_PROXY")`). Loopback
 // targets are NOT special-cased: they are proxied unless no_proxy matches.
 func shouldBypassProxies(u *url.URL) bool {
@@ -252,15 +287,21 @@ func shouldBypassProxies(u *url.URL) bool {
 	if host == "" {
 		return true
 	}
-	if noProxy == "" {
-		return false
-	}
-	entries := strings.Split(strings.ReplaceAll(noProxy, " ", ""), ",")
-	if ip := net.ParseIP(host); ip != nil {
-		for _, entry := range entries {
-			if entry == "" {
-				continue
+	hostLower := strings.ToLower(host)
+	var entries []string
+	if noProxy != "" {
+		for _, entry := range strings.Split(strings.ReplaceAll(noProxy, " ", ""), ",") {
+			if entry != "" {
+				entries = append(entries, entry)
 			}
+		}
+	}
+	hostWithPort := hostLower
+	if port := u.Port(); port != "" {
+		hostWithPort = hostLower + ":" + port
+	}
+	if ip := net.ParseIP(hostLower); ip != nil {
+		for _, entry := range entries {
 			if _, network, err := net.ParseCIDR(entry); err == nil {
 				if network.Contains(ip) {
 					return true
@@ -271,17 +312,32 @@ func shouldBypassProxies(u *url.URL) bool {
 				return true
 			}
 		}
-		return false
+	} else {
+		// requests' explicit no_proxy loop (plain suffix, no label boundary).
+		for _, entry := range entries {
+			entryLower := strings.ToLower(entry)
+			if strings.HasSuffix(hostLower, entryLower) || strings.HasSuffix(hostWithPort, entryLower) {
+				return true
+			}
+		}
 	}
-	hostWithPort := host
-	if port := u.Port(); port != "" {
-		hostWithPort = host + ":" + port
+	// urllib proxy_bypass_environment fallback.
+	if noProxy == "*" {
+		return true
+	}
+	hostonly := hostLower
+	if h, _, err := net.SplitHostPort(hostLower); err == nil {
+		hostonly = h
 	}
 	for _, entry := range entries {
-		if entry == "" {
+		name := strings.ToLower(strings.TrimLeft(entry, "."))
+		if name == "" {
 			continue
 		}
-		if strings.HasSuffix(host, entry) || strings.HasSuffix(hostWithPort, entry) {
+		if hostonly == name || hostLower == name {
+			return true
+		}
+		if strings.HasSuffix(hostonly, "."+name) || strings.HasSuffix(hostLower, "."+name) {
 			return true
 		}
 	}
@@ -457,8 +513,12 @@ func pyStr(v any) string {
 // pyRepr renders repr(value), used inside list/object interpolation. Strings
 // follow Python's repr exactly: single quotes unless the string contains a
 // single quote and no double quote (then double quotes), with backslash
-// escaping of the chosen quote, backslash, the short escapes \t \n \r, and
-// \xNN for every other control character (including NUL and DEL).
+// escaping of the chosen quote, backslash, the short escapes \t \n \r, and an
+// escaped form for every NONPRINTABLE rune — \xNN up to U+00FF, \uNNNN up to
+// U+FFFF, \UXXXXXXXX above (Python repr's escape-width rule). Python's
+// printability test (Cc/Cf/Co/Cs/Zl/Zp and Zs except U+0020 non-printable)
+// agrees with Go's unicode.IsPrint for the ranges journalpump can see, so a
+// printable non-ASCII character (é, ☃, 😀) is emitted literally.
 func pyRepr(v any) string {
 	s, ok := v.(string)
 	if !ok {
@@ -481,8 +541,16 @@ func pyRepr(v any) string {
 			b.WriteString(`\n`)
 		case r == '\r':
 			b.WriteString(`\r`)
-		case r < 0x20 || r == 0x7f:
-			_, _ = fmt.Fprintf(&b, `\x%02x`, r)
+		case !unicode.IsPrint(r):
+			// Python repr's nonprintable escape width.
+			switch {
+			case r <= 0xff:
+				_, _ = fmt.Fprintf(&b, `\x%02x`, r)
+			case r <= 0xffff:
+				_, _ = fmt.Fprintf(&b, `\u%04x`, r)
+			default:
+				_, _ = fmt.Fprintf(&b, `\U%08x`, r)
+			}
 		default:
 			b.WriteRune(r)
 		}

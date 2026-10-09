@@ -524,6 +524,11 @@ func TestPyStrMatchesPython(t *testing.T) {
 		{"backslash", []any{`back\slash`}, `['back\\slash']`},
 		{"scalars", []any{1, 2.5, true, nil}, `[1, 2.5, True, None]`},
 		{"object", map[string]any{"k": "a'b"}, `{'k': "a'b"}`},
+		{"latin-1 nonprintables", []any{"nel\u0085", "nbsp\u00a0", "softhy\u00ad"}, `['nel\x85', 'nbsp\xa0', 'softhy\xad']`},
+		{"bmp nonprintables", []any{"zwsp\u200b", "ls\u2028", "ps\u2029", "nnbsp\u202f", "wj\u2060", "bom\ufeff", "ideo\u3000"}, `['zwsp\u200b', 'ls\u2028', 'ps\u2029', 'nnbsp\u202f', 'wj\u2060', 'bom\ufeff', 'ideo\u3000']`},
+		{"private use is nonprintable", []any{"\ue000", "\uf8ff"}, `['\ue000', '\uf8ff']`},
+		{"astral nonprintable", []any{"\U000e0001"}, `['\U000e0001']`},
+		{"printable non-ascii is literal", []any{"\u00e9", "\u2603", "\U0001f600", "\ufffd"}, "['\u00e9', '\u2603', '\U0001f600', '\ufffd']"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -745,29 +750,120 @@ func TestProxySelectionMatchesRequests(t *testing.T) {
 	}
 }
 
-// TestNoProxySelection: no_proxy (lowercase-first) bypasses matching hosts.
+// TestNoProxySelection exercises the full requests/urllib no_proxy semantics
+// (requests' plain suffix loop OR urllib's proxy_bypass_environment fallback):
+// lowercase-first lookup, wildcard, case-insensitivity, leading-dot and
+// label-boundary matching, port handling, CIDR/plain IP, and that loopback is
+// not special-cased.
 func TestNoProxySelection(t *testing.T) {
-	bypassed := func(url string, env map[string]string) bool {
-		t.Helper()
-		syncProxyEnv(t, env)
-		req, err := http.NewRequest(http.MethodPost, url, nil)
-		if err != nil {
-			t.Fatalf("NewRequest: %v", err)
+	cases := []struct {
+		name string
+		url  string
+		env  map[string]string
+		want bool // bypass?
+	}{
+		{"hostname match", "http://logplex.example.invalid/input", map[string]string{"no_proxy": "logplex.example.invalid"}, true},
+		{"hostname no match", "http://logplex.example.invalid/input", map[string]string{"no_proxy": "other.invalid"}, false},
+		{"loopback not special-cased", "http://logplex.example.invalid/input", map[string]string{}, false},
+		{"uppercase NO_PROXY ip", "http://127.0.0.1/input", map[string]string{"NO_PROXY": "127.0.0.1"}, true},
+		{"wildcard", "http://logplex.example.invalid/input", map[string]string{"no_proxy": "*"}, true},
+		{"wildcard ip", "http://127.0.0.1/input", map[string]string{"no_proxy": "*"}, true},
+		{"mixed-case entry", "http://example.com/input", map[string]string{"no_proxy": "Example.Com"}, true},
+		{"mixed-case uppercase entry", "http://example.com/input", map[string]string{"NO_PROXY": "EXAMPLE.COM"}, true},
+		{"leading dot matches apex", "http://example.com/input", map[string]string{"no_proxy": ".example.com"}, true},
+		{"leading dot matches subdomain", "http://foo.example.com/input", map[string]string{"no_proxy": ".example.com"}, true},
+		{"bare domain matches subdomain", "http://foo.example.com/input", map[string]string{"no_proxy": "example.com"}, true},
+		// requests' explicit no_proxy loop is a PLAIN suffix match with no label
+		// boundary, so "example.com" also matches "notexample.com" (probe-verified
+		// against requests 2.33.1). Python parity is preserved here deliberately;
+		// a stricter label-boundary rule would be an unsanctioned deviation.
+		{"plain suffix has no label boundary", "http://notexample.com/input", map[string]string{"no_proxy": "example.com"}, true},
+		{"port match", "http://example.com:8080/input", map[string]string{"no_proxy": "example.com:8080"}, true},
+		{"port mismatch", "http://example.com:9090/input", map[string]string{"no_proxy": "example.com:8080"}, false},
+		{"bare domain ignores port", "http://example.com:9090/input", map[string]string{"no_proxy": "example.com"}, true},
+		{"cidr network", "http://10.1.2.3/input", map[string]string{"no_proxy": "10.0.0.0/8"}, true},
+		{"cidr mismatch", "http://11.1.2.3/input", map[string]string{"no_proxy": "10.0.0.0/8"}, false},
+		{"plain ip match", "http://10.1.2.3/input", map[string]string{"no_proxy": "10.1.2.3"}, true},
+		{"plain ip mismatch", "http://10.1.2.4/input", map[string]string{"no_proxy": "10.1.2.3"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{"HTTP_PROXY": "http://up:1"}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			syncProxyEnv(t, env)
+			req, err := http.NewRequest(http.MethodPost, tc.url, nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			got, err := proxyForRequest(req)
+			if err != nil {
+				t.Fatalf("proxyForRequest: %v", err)
+			}
+			if bypassed := got == nil; bypassed != tc.want {
+				t.Fatalf("proxyForRequest = %v (bypassed=%v), want bypassed=%v", got, bypassed, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseProxyURL: requests accepts scheme-less proxy addresses and prepends
+// "http://" (utils.prepend_scheme_if_needed); a proxy with no host is rejected.
+func TestParseProxyURL(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"proxy.example:8080", "http://proxy.example:8080", false},
+		{"//proxy.example:8080", "http://proxy.example:8080", false},
+		{"http://proxy.example:8080", "http://proxy.example:8080", false},
+		{"socks5://proxy.example:1080", "socks5://proxy.example:1080", false},
+		{"proxy.example", "http://proxy.example", false},
+		{"http://", "", true},
+	}
+	for _, tc := range cases {
+		u, err := parseProxyURL(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("parseProxyURL(%q) = %v, want an error", tc.in, u)
+			}
+			continue
 		}
-		got, err := proxyForRequest(req)
 		if err != nil {
-			t.Fatalf("proxyForRequest: %v", err)
+			t.Fatalf("parseProxyURL(%q): %v", tc.in, err)
 		}
-		return got == nil
+		if u.String() != tc.want {
+			t.Fatalf("parseProxyURL(%q) = %q, want %q", tc.in, u.String(), tc.want)
+		}
 	}
-	if !bypassed("http://logplex.example.invalid/input", map[string]string{"HTTP_PROXY": "http://up:1", "no_proxy": "logplex.example.invalid"}) {
-		t.Fatal("no_proxy hostname match did not bypass")
+}
+
+// TestProxyConfiguredWithoutScheme: a recording proxy configured WITHOUT a
+// scheme (HTTP_PROXY=host:port) is still used for delivery.
+func TestProxyConfiguredWithoutScheme(t *testing.T) {
+	var proxied int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&proxied, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+	schemeLess := strings.TrimPrefix(proxy.URL, "http://")
+	syncProxyEnv(t, map[string]string{"HTTP_PROXY": schemeLess})
+
+	cfg := baseConfig()
+	cfg["logplex_log_input_url"] = "http://logplex.example.invalid/input"
+	inst, err := New(sender.ConstructorArgs{Name: "x", Config: cfg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	if bypassed("http://logplex.example.invalid/input", map[string]string{"HTTP_PROXY": "http://up:1"}) {
-		t.Fatal("a non-loopback target with a proxy set was bypassed; loopback is not special-cased")
+	s := inst.Transport.(*Sender)
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err != nil {
+		t.Fatalf("SendMessages through a scheme-less proxy: %v", err)
 	}
-	if !bypassed("http://127.0.0.1/input", map[string]string{"HTTP_PROXY": "http://up:1", "NO_PROXY": "127.0.0.1"}) {
-		t.Fatal("NO_PROXY=127.0.0.1 did not bypass a loopback target")
+	if atomic.LoadInt32(&proxied) != 1 {
+		t.Fatalf("proxy hits = %d, want 1 (scheme-less proxy address)", proxied)
 	}
 }
 
