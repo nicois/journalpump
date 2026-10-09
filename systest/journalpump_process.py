@@ -2,6 +2,25 @@
 #
 # This file is under the Apache License, Version 2.0.
 # See the file `LICENSE` for details.
+"""Implementation-agnostic systest harness (spec §7, plan Task 10).
+
+The harness spawns a journalpump BINARY — never an in-process import —
+so every black-box suite built on it runs against BOTH implementations.
+The ``JOURNALPUMP_BIN`` environment variable selects the implementation:
+
+- unset or ``python``: ``python3 -m journalpump`` (the Python daemon;
+  the default keeps ``make systest`` exercising the Python binary
+  during the migration);
+- ``go``: the built Go binary at ``build/journalpump`` (``make build-go``);
+- any other value: treated as the path of a journalpump-compatible
+  binary (or executable stub, as the harness unit tests use).
+
+Whatever binary is selected gets the same environment: ``RUNTIME_DIRECTORY``
+(unless suppressed), an abstract-socket ``NOTIFY_SOCKET``, and the
+caller-provided ``env``. The harness asserts the systemd notify
+datagrams (``READY=1``, ``RELOADING=1`` → ``READY=1``, ``WATCHDOG=1``)
+and captures the exit code on SIGTERM.
+"""
 
 from pathlib import Path
 from typing import Self
@@ -16,6 +35,18 @@ import sys
 import tempfile
 import threading
 import time
+
+_GO_BINARY_PATH = Path(__file__).resolve().parent.parent / "build" / "journalpump"
+
+
+def _command(selection: str | None) -> list[str]:
+    """Return the argv for the journalpump implementation selected by
+    the ``JOURNALPUMP_BIN`` value (see the module docstring)."""
+    if selection is None or selection == "python":
+        return [sys.executable, "-m", "journalpump"]
+    if selection == "go":
+        return [str(_GO_BINARY_PATH)]
+    return [selection]
 
 
 def _raise_if_journalpump_exited(journalpump: subprocess.Popen[str] | None, *, waiting_for: str) -> None:
@@ -87,8 +118,9 @@ class JournalpumpProcess:
             journalpump_env.pop("RUNTIME_DIRECTORY", None)
         journalpump_env["NOTIFY_SOCKET"] = "@" + self._notify_socket_name
         journalpump_env["PYTHONUNBUFFERED"] = "1"
+        argv = _command(journalpump_env.get("JOURNALPUMP_BIN"))
         self._journalpump = subprocess.Popen(
-            [sys.executable, "-m", "journalpump", str(config_path)],
+            [*argv, str(config_path)],
             env=journalpump_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
