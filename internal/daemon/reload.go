@@ -7,6 +7,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -198,8 +199,22 @@ func (p *Pump) configureReaders(cfg *config.Config) error {
 
 	// Commit: retire the previous readers (and their senders), swap in
 	// the new runtimes, start them, and record the active blob.
+	//
+	// A retire cleanup failure means an output's complete-line boundary
+	// could not be restored (a partial line may remain on disk). Starting
+	// a replacement writer on such an output would append replay onto the
+	// corrupt prefix, so refuse: abort BEFORE starting the new readers and
+	// leave the active blob unrecorded (the next reload retries). The new
+	// runtimes are never started, so no sender has written yet and nothing
+	// needs unwinding; the old readers are already stopped.
+	var retireErrs []error
 	for _, rt := range p.readers {
-		p.retireReader(rt)
+		if err := p.retireReader(rt); err != nil {
+			retireErrs = append(retireErrs, err)
+		}
+	}
+	if len(retireErrs) > 0 {
+		return fmt.Errorf("retiring readers: %w", errors.Join(retireErrs...))
 	}
 	p.readers = runtimes
 	for _, rt := range p.readers {
@@ -240,7 +255,11 @@ func (p *Pump) startReader(rt *ReaderRuntime) {
 // Python's request_stop-then-exit rather than the D9 shutdown grace), and
 // the transports are closed to release descriptors (Go resource hygiene;
 // Python relies on process-lifetime daemon threads).
-func (p *Pump) retireReader(rt *ReaderRuntime) {
+//
+// The cleanup error is returned rather than dropped: a failed
+// CloseDiscarding (a partial line that could not be truncated) must stop
+// the caller from starting a replacement writer on the same output.
+func (p *Pump) retireReader(rt *ReaderRuntime) error {
 	// A reader built but never started (a unit test, or a reload before
 	// Run wired the group) has no goroutine to join.
 	if rt.cancelRun != nil {
@@ -252,6 +271,7 @@ func (p *Pump) retireReader(rt *ReaderRuntime) {
 	entries := p.senders[rt.name]
 	delete(p.senders, rt.name)
 	p.senderMu.Unlock()
+	var errs []error
 	for _, entry := range entries {
 		entry.cancel()
 		if entry.done != nil {
@@ -263,11 +283,16 @@ func (p *Pump) retireReader(rt *ReaderRuntime) {
 			// never claimed it): a reload retire must not deliver lines
 			// the persisted cursor does not cover, or replay would
 			// duplicate them.
-			_ = transport.CloseDiscarding()
+			if err := transport.CloseDiscarding(); err != nil {
+				errs = append(errs, fmt.Errorf("sender %s/%s: %w", rt.name, entry.name, err))
+			}
 		case io.Closer:
-			_ = transport.Close()
+			if err := transport.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("sender %s/%s: %w", rt.name, entry.name, err))
+			}
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // writeRunningConfig ports write_running_config (journalpump.py:929-948):
@@ -281,6 +306,6 @@ func (p *Pump) writeRunningConfig(cfg *config.Config) {
 	}
 	if err != nil {
 		path := config.RunningConfigPath(cfg.JSONRunningConfigPath, os.Getenv("RUNTIME_DIRECTORY"))
-		p.log.Printf("Writing running config to %q failed: %v", path, err)
+		p.logError("Writing running config to %q failed: %v", path, err)
 	}
 }

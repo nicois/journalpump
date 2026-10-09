@@ -49,7 +49,7 @@ const pythonBufferSize = 131072
 // shared loop turns into the persisted sent cursor. The result: the state
 // file's cursor reflects DELIVERY (bytes on disk), not send() completion.
 type Sender struct {
-	output *os.File
+	output outputFile
 	buf    *bufio.Writer
 	count  *countingWriter
 
@@ -70,6 +70,21 @@ type Sender struct {
 	// truncates back to boundary, guaranteeing the file only ever ends on
 	// a complete-line edge (replay then appends a clean line).
 	boundary int64
+	// base is the file size at construction (the append offset). All the
+	// byte counters below are RUN-relative (they start at zero for this
+	// handle), so an absolute Truncate needs base + the run-relative
+	// boundary. Without this a retire that has not written anything yet
+	// would truncate the file to zero, deleting previously delivered lines.
+	base int64
+}
+
+// outputFile is the output-handle subset the Sender uses: the *os.File an
+// "ab" open returns, or a test double that can fail a write/truncate.
+type outputFile interface {
+	io.Writer
+	Truncate(size int64) error
+	Close() error
+	Stat() (os.FileInfo, error)
 }
 
 // flushMark is one accepted line's cumulative byte ends.
@@ -157,7 +172,8 @@ func (s *Sender) discardUnflushedLocked() error {
 	// Drop buffered, unwritten bytes (bufio.Reset does not write them).
 	s.buf.Reset(s.count)
 	s.queue = nil
-	if err := s.output.Truncate(s.boundary); err != nil {
+	// boundary is run-relative; Truncate needs the absolute file offset.
+	if err := s.output.Truncate(s.base + s.boundary); err != nil {
 		return err
 	}
 	s.count.n = s.boundary
@@ -247,15 +263,33 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	if err != nil {
 		return sender.Instance{}, fmt.Errorf("opening %s: %w", path, err)
 	}
-	count := &countingWriter{w: output}
+	// open(path, "ab") appends; record where this handle starts so an
+	// absolute truncate can preserve pre-existing complete lines.
+	info, err := output.Stat()
+	if err != nil {
+		_ = output.Close()
+		return sender.Instance{}, fmt.Errorf("stat %s: %w", path, err)
+	}
 	return sender.Instance{
-		Transport: &Sender{output: output, buf: bufio.NewWriterSize(count, pythonBufferSize), count: count},
+		Transport: newSender(output, info.Size()),
 		// file.py:8-11 — mark_disconnected() (already disconnected,
 		// no-op) then mark_connected() right after the open.
 		ConnectOnInit:   true,
 		MaxSendInterval: time.Duration(seconds * float64(time.Second)),
 		Type:            "FileSender",
 	}, nil
+}
+
+// newSender wires a Sender around an output handle; base is the handle's
+// current size (the append offset).
+func newSender(output outputFile, base int64) *Sender {
+	count := &countingWriter{w: output}
+	return &Sender{
+		output: output,
+		buf:    bufio.NewWriterSize(count, pythonBufferSize),
+		count:  count,
+		base:   base,
+	}
 }
 
 // intervalSeconds renders a decoded JSON number as float seconds.

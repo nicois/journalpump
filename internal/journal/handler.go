@@ -44,6 +44,12 @@ type HandlerLogger interface {
 	Printf(format string, args ...any)
 }
 
+// warningLogger is the OPTIONAL HandlerLogger capability for WARNING-level
+// lines (the level-aware journald sink provides Warningf).
+type warningLogger interface {
+	Warningf(format string, args ...any)
+}
+
 // HandlerConfig carries the pump- and reader-side state the per-message
 // handler consults (Python's JournalReader and JournalPump attributes
 // the handler reaches): the search set, the match_key/match_value pair
@@ -373,7 +379,13 @@ func (h *Handler) truncateLongMessage(jsonEntry []byte, timestamp any) ([]byte, 
 		// logging module); Go renders a quoted Go string — a rendering
 		// deviation recorded in the parity doc.
 		if h.cfg.Log != nil {
-			h.cfg.Log.Printf("%s: %q ...", errorText, string(truncated))
+			// Python log.warning (journalpump.py:810): WARNING level when
+			// the logger supports it, else the Printf seam.
+			if w, ok := h.cfg.Log.(warningLogger); ok {
+				w.Warningf("%s: %q ...", errorText, string(truncated))
+			} else {
+				h.cfg.Log.Printf("%s: %q ...", errorText, string(truncated))
+			}
 		}
 		h.errorReported = true
 	}

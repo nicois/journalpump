@@ -143,9 +143,10 @@ func TestPriorityMapping(t *testing.T) {
 }
 
 // TestLogJournalFormatAndPriority locks the journald sink of the
-// level-aware Log: Python's LOG_FORMAT_JOURNAL message (name padded to
-// 20, level padded to 8), the mapped PRIORITY, the LOGGER field, and
-// SYSLOG_IDENTIFIER.
+// level-aware Log: Python's LOG_FORMAT_JOURNAL_MULTI_THREAD message
+// (journalpump is constructed multi_threaded=True, so name padded to 20,
+// threadName padded to 15, level padded to 8), the mapped PRIORITY, the
+// LOGGER field, and SYSLOG_IDENTIFIER.
 func TestLogJournalFormatAndPriority(t *testing.T) {
 	conn := listenDatagram(t)
 	previous := DefaultSocket
@@ -155,7 +156,7 @@ func TestLogJournalFormatAndPriority(t *testing.T) {
 	log := NewJournalLog("journalpump", LevelDebug)
 	log.Errorf("boom %d", 7)
 	got := readDatagram(t, conn)
-	wantMessage := fmt.Sprintf("%-20s  %-8s  %s", "journalpump", "ERROR", "boom 7")
+	wantMessage := fmt.Sprintf("%-20s  %-15s %-8s  %s", "journalpump", "MainThread", "ERROR", "boom 7")
 	if !strings.Contains(got, "MESSAGE="+wantMessage+"\n") {
 		t.Errorf("MESSAGE = %q, want %q", got, wantMessage)
 	}
@@ -167,6 +168,38 @@ func TestLogJournalFormatAndPriority(t *testing.T) {
 	}
 	if !strings.Contains(got, "SYSLOG_IDENTIFIER=journalpump\n") {
 		t.Errorf("datagram = %q, want SYSLOG_IDENTIFIER", got)
+	}
+}
+
+// TestLogNamedChildLocks the per-component logger context: Named derives
+// a child that shares the core (SYSLOG_IDENTIFIER, level) but emits the
+// component name as LOGGER and in the message, like Python's
+// logging.getLogger("JournalReader:r").
+func TestLogNamedChild(t *testing.T) {
+	conn := listenDatagram(t)
+	previous := DefaultSocket
+	DefaultSocket = conn.LocalAddr().String()
+	t.Cleanup(func() { DefaultSocket = previous })
+
+	root := NewJournalLog("journalpump", LevelDebug)
+	child := root.Named("JournalReader:r")
+	// SetLevel on the root applies to the child too (shared core).
+	root.SetLevel(LevelWarning)
+	child.Printf("dropped-info") // suppressed via the shared level
+	child.Warningf("kept %d", 1)
+	got := readDatagram(t, conn)
+	if strings.Contains(got, "dropped-info") {
+		t.Fatalf("child did not share the root level: %q", got)
+	}
+	wantMessage := fmt.Sprintf("%-20s  %-15s %-8s  %s", "JournalReader:r", "MainThread", "WARNING", "kept 1")
+	if !strings.Contains(got, "MESSAGE="+wantMessage+"\n") {
+		t.Errorf("MESSAGE = %q, want %q", got, wantMessage)
+	}
+	if !strings.Contains(got, "LOGGER=JournalReader:r\n") {
+		t.Errorf("datagram = %q, want LOGGER=JournalReader:r", got)
+	}
+	if !strings.Contains(got, "SYSLOG_IDENTIFIER=journalpump\n") {
+		t.Errorf("datagram = %q, want SYSLOG_IDENTIFIER=journalpump (root identifier)", got)
 	}
 }
 

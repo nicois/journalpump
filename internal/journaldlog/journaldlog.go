@@ -202,10 +202,22 @@ func IsTerminal(f *os.File) bool {
 // writes to an io.Writer; otherwise it sends journal datagrams. SetLevel
 // is honoured on config reload (daemon.py:reload_config sets log_level
 // then reconfigures logging).
+//
+// Loggers derived with Named share one core (sink + level), exactly like
+// Python's logging.getLogger(name) sharing the root handlers: the level
+// threshold and the SYSLOG_IDENTIFIER stay the daemon's, while the LOGGER
+// field and %(name)s take the component name (Python's
+// JournalReader:<name>, LogSender:<reader>, MsgBuffer, ...).
 type Log struct {
-	name   string
-	out    io.Writer // non-nil => tty sink
-	writer Writer    // journald sink used when out == nil
+	core *logCore
+	name string
+}
+
+// logCore is the shared state of a logger tree.
+type logCore struct {
+	identifier string    // SYSLOG_IDENTIFIER (daemon.py:64, self.name)
+	out        io.Writer // non-nil => tty sink
+	threadName string    // %(threadName)s of the multi-thread format
 
 	mu    sync.Mutex
 	level int
@@ -218,7 +230,10 @@ func NewJournalLog(name string, level int) *Log {
 	if name == "" {
 		name = defaultIdentifier
 	}
-	return &Log{name: name, level: level}
+	return &Log{
+		core: &logCore{identifier: defaultIdentifier, threadName: "MainThread", level: level},
+		name: name,
+	}
 }
 
 // NewTTYLog builds an io.Writer-backed Log with Python's tty format
@@ -227,21 +242,40 @@ func NewTTYLog(name string, out io.Writer, level int) *Log {
 	if name == "" {
 		name = defaultIdentifier
 	}
-	return &Log{name: name, out: out, level: level}
+	return &Log{
+		core: &logCore{identifier: defaultIdentifier, out: out, threadName: "MainThread", level: level},
+		name: name,
+	}
 }
 
-// SetLevel updates the minimum level (config reload).
+// Named returns a child logger with the given component name that shares
+// this logger's sink and level (Python logging.getLogger(name) sharing
+// the root handlers). The SYSLOG_IDENTIFIER stays the daemon's; only the
+// LOGGER field and the %(name)s change.
+func (l *Log) Named(name string) *Log {
+	return &Log{core: l.core, name: name}
+}
+
+// Namer is implemented by loggers that can derive a named child with the
+// daemon's shared sink and level. The daemon uses it to attach the
+// per-component logger names Python emits.
+type Namer interface {
+	Named(name string) *Log
+}
+
+// SetLevel updates the minimum level (config reload). It applies to every
+// logger sharing this core.
 func (l *Log) SetLevel(level int) {
-	l.mu.Lock()
-	l.level = level
-	l.mu.Unlock()
+	l.core.mu.Lock()
+	l.core.level = level
+	l.core.mu.Unlock()
 }
 
 // Level reports the current minimum level.
 func (l *Log) Level() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.level
+	l.core.mu.Lock()
+	defer l.core.mu.Unlock()
+	return l.core.level
 }
 
 // Printf logs at INFO (the daemon's default logging level).
@@ -258,23 +292,30 @@ func (l *Log) Debugf(format string, args ...any) { l.logf(LevelDebug, format, ar
 
 // logf filters by level, then emits through the selected sink.
 func (l *Log) logf(level int, format string, args ...any) {
-	l.mu.Lock()
-	threshold := l.level
-	l.mu.Unlock()
+	l.core.mu.Lock()
+	threshold := l.core.level
+	l.core.mu.Unlock()
 	if level < threshold {
 		return
 	}
 	message := fmt.Sprintf(format, args...)
-	if l.out != nil {
+	if l.core.out != nil {
 		// LOG_FORMAT: "%(asctime)s\t%(name)s\t%(levelname)s\t%(message)s".
 		asctime := time.Now().Format("2006-01-02 15:04:05,000")
-		_, _ = fmt.Fprintf(l.out, "%s\t%s\t%s\t%s\n", asctime, l.name, LevelName(level), message)
+		_, _ = fmt.Fprintf(l.core.out, "%s\t%s\t%s\t%s\n", asctime, l.name, LevelName(level), message)
 		return
 	}
-	// LOG_FORMAT_JOURNAL:
-	// "%(name)-20s  %(levelname)-8s  %(message)s".
-	writer := l.writer
-	writer.Identifier = l.name
-	writer.Name = l.name
-	_ = writer.Send(fmt.Sprintf("%-20s  %-8s  %s", l.name, LevelName(level), message), Priority(level))
+	// LOG_FORMAT_JOURNAL_MULTI_THREAD (journalpump.py:858 constructs
+	// JournalPump with multi_threaded=True):
+	// "%(name)-20s  %(threadName)-15s %(levelname)-8s  %(message)s".
+	writer := Writer{
+		Socket:     DefaultSocket,
+		Identifier: l.core.identifier,
+		Priority:   Priority(level),
+		Name:       l.name,
+	}
+	_ = writer.Send(
+		fmt.Sprintf("%-20s  %-15s %-8s  %s", l.name, l.core.threadName, LevelName(level), message),
+		Priority(level),
+	)
 }

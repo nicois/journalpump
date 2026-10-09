@@ -36,6 +36,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/filter"
 	"github.com/Aiven-Open/journalpump/internal/geoip"
 	"github.com/Aiven-Open/journalpump/internal/journal"
+	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/reader"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 	"github.com/Aiven-Open/journalpump/internal/state"
@@ -75,19 +76,44 @@ type LevelSetter interface {
 }
 
 func (p *Pump) logError(format string, args ...any) {
-	if l, ok := p.log.(ErrorLogger); ok {
-		l.Errorf(format, args...)
-		return
-	}
-	p.log.Printf(format, args...)
+	logErrorTo(p.log, format, args...)
 }
 
 func (p *Pump) logWarning(format string, args ...any) {
-	if l, ok := p.log.(WarningLogger); ok {
+	logWarningTo(p.log, format, args...)
+}
+
+// logWarningTo emits a WARNING-level line through the given logger when it
+// supports the capability (the level-aware journald sink does; plain test
+// loggers fall back to Printf). Python's log.warning call sites use it.
+func logWarningTo(log Logger, format string, args ...any) {
+	if l, ok := log.(WarningLogger); ok {
 		l.Warningf(format, args...)
 		return
 	}
-	p.log.Printf(format, args...)
+	log.Printf(format, args...)
+}
+
+// logErrorTo emits an ERROR-level line through the given logger when it
+// supports the capability, else falls back to Printf.
+func logErrorTo(log Logger, format string, args ...any) {
+	if l, ok := log.(ErrorLogger); ok {
+		l.Errorf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+// namedLogger derives a child logger carrying the given component name —
+// the per-component names Python emits (JournalReader:<name>,
+// LogSender:<reader>, JournalObjectHandler, MsgBuffer, ...). A logger
+// without the Namer capability (test capture loggers) is returned
+// unchanged.
+func namedLogger(log Logger, name string) Logger {
+	if n, ok := log.(journaldlog.Namer); ok {
+		return n.Named(name)
+	}
+	return log
 }
 
 type discardLogger struct{}
@@ -520,6 +546,11 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 		cursor = *resume
 	}
 
+	// Reader-level logger: Python logging.getLogger(f"JournalReader:{name}")
+	// (journalpump.py:154). The resume line above is pump-level
+	// (journalpump.py:909), so it keeps the daemon logger name.
+	readerLog := namedLogger(log, "JournalReader:"+name)
+
 	// Reader-level tags: JournalReader(Tagged) receives the pump's
 	// make_tags() and adds reader=<name> RAW via the Tagged kwargs
 	// (base.py:42-63) — no sanitization until make_tags.
@@ -534,7 +565,7 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 		return nil, err
 	}
 	searcher, err := filter.NewSearcher(
-		searches, float64(cfg.ThresholdForMetricEmit), p.stats, taggedReader, log,
+		searches, float64(cfg.ThresholdForMetricEmit), p.stats, taggedReader, readerLog,
 		map[string]filter.TagFunc{"ip_to_geohash": p.geoip.IPToGeohash},
 	)
 	if err != nil {
@@ -546,13 +577,13 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 		return nil, err
 	}
 	for _, warning := range warnings {
-		log.Printf("%s", warning)
+		readerLog.Printf("%s", warning)
 	}
 
 	rt := &ReaderRuntime{
 		pump:                p,
 		name:                name,
-		log:                 log,
+		log:                 readerLog,
 		cfg:                 cfg,
 		tags:                taggedReader,
 		searcher:            searcher,
@@ -570,7 +601,7 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 		resumeCursor:        cursor,
 	}
 
-	rt.stats = reader.NewStats(name, taggedReader.MakeTags(nil), p.stats, log, func() {
+	rt.stats = reader.NewStats(name, taggedReader.MakeTags(nil), p.stats, readerLog, func() {
 		// inc_line_stats' refresh_stats per sender (journalpump.py:381).
 		rt.mu.Lock()
 		entries := make([]*senderEntry, 0, len(rt.senders))
@@ -641,7 +672,7 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 			Initial:      rt.takeInitial(),
 			Stats:        rt.stats,
 		}
-	}, log)
+	}, readerLog)
 
 	// Resolve the senders now (see resolvedSender): unknown output
 	// types, field filters, or unit log levels are Python crashes
@@ -786,7 +817,7 @@ func (rt *ReaderRuntime) resolveSender(senderName string, raw any) (resolvedSend
 	// raw JSON text (rendering deviation, parity doc).
 	rawExtras, present := rt.cfg.ExtraFieldValuesRaw[senderName]
 	if present && len(rawExtras) > 0 && rawExtras[0] != '{' {
-		rt.log.Printf("Extra_field_values: %s not a dictionary object, ignoring", rawExtras)
+		logWarningTo(rt.log, "Extra_field_values: %s not a dictionary object, ignoring", rawExtras)
 	} else if present {
 		extras, err := journal.DecodeOrderedFields(rawExtras)
 		if err != nil {
@@ -834,8 +865,8 @@ func (rt *ReaderRuntime) initSenders() {
 		args := sender.ConstructorArgs{
 			Name:             resolved.name,
 			Config:           resolved.config,
-			Stats:            rt.settings().stats,
-			Tags:             rt.tags, // reader-level Tagged (base + reader=name)
+			Stats:            rt.stats.Client(), // reader-CAPTURED stats (Python stats=self.stats)
+			Tags:             rt.tags,           // reader-level Tagged (base + reader=name)
 			FieldFilter:      resolved.fieldFilter,
 			UnitLogLevels:    resolved.unitLogLevels,
 			ExtraFieldValues: resolved.extraFieldValues,
@@ -850,9 +881,10 @@ func (rt *ReaderRuntime) initSenders() {
 		buf := buffer.NewSenderBuffer(resolved.name, rt.msgBufferMaxLength)
 		loop := sender.NewLoop(sender.LoopConfig{
 			Name:  resolved.name,
-			Stats: rt.settings().stats,
+			Stats: rt.stats.Client(), // reader-CAPTURED stats (Python stats=self.stats)
 			Tags:  rt.senderTags(resolved.name),
-			Log:   rt.pump.log,
+			// Python logging.getLogger(f"LogSender:{reader.name}") (base.py:119).
+			Log: namedLogger(rt.pump.log, "LogSender:"+rt.name),
 		}, inst, buf.Chan())
 		// Delivery-checkpoint baseline: a durable sender's persisted
 		// cursor must not regress below the position this run resumed from.
@@ -1014,11 +1046,11 @@ func (rt *ReaderRuntime) updateStatus(ctx context.Context) error {
 		opened, err := rt.reopener.Ensure()
 		switch {
 		case err != nil && errors.Is(err, reader.ErrFilesNotAvailable):
-			rt.log.Printf("Journal files for %q are not yet available", rt.name)
+			logWarningTo(rt.log, "Journal files for %q are not yet available", rt.name)
 		case err != nil && errors.Is(err, os.ErrNotExist):
 			// Python renders "FileNotFoundError: [Errno 2] ..."; Go
 			// renders the wrapped error text (rendering deviation).
-			rt.log.Printf("Journal for %q not available yet: FileNotFoundError: %v", rt.name, err)
+			logWarningTo(rt.log, "Journal for %q not available yet: FileNotFoundError: %v", rt.name, err)
 		case err != nil:
 			// Python: any other open error propagates out of the run
 			// loop and crashes the daemon.
@@ -1132,7 +1164,7 @@ func (rt *ReaderRuntime) readSingleMessage(ctx context.Context) (hasMore bool, b
 // traceback; Go renders the error), the unexpected_exception counter,
 // a 0.5 s sleep, and (has_more=False, bytes_read=None).
 func (rt *ReaderRuntime) broadHandler(err error) {
-	rt.log.Printf("Unexpected exception while handling entry for %s: %v", rt.name, err)
+	rt.pump.logError("Unexpected exception while handling entry for %s: %v", rt.name, err)
 	if s := rt.settings(); s.stats != nil {
 		s.stats.UnexpectedException(err, "mainloop", s.tags.MakeTags(map[string]string{"app": "journalpump"}))
 	}
@@ -1198,7 +1230,8 @@ func (rt *ReaderRuntime) process(ctx context.Context, entry journal.Entry) (bool
 		PumpTags:              settings.tags,
 		IncLineStats:          rt.stats.IncLineStats,
 		NoteSecretFilterMatch: func() { rt.secretFilterMatches++ },
-		Log:                   rt.log,
+		// Python logging.getLogger(self.__class__.__name__) == "JournalObjectHandler".
+		Log: namedLogger(rt.pump.log, "JournalObjectHandler"),
 	})
 	hasMore, bytesRead, hasBytes, err := handler.Process(entry, targets)
 	if err == nil && enqueueErr != nil {
@@ -1226,11 +1259,13 @@ func (rt *ReaderRuntime) reportSecretFilterMetrics() {
 	if rt.secretFilterMatches == 0 {
 		return
 	}
-	settings := rt.settings()
-	if settings.stats == nil {
+	// Python reports through the reader's CAPTURED self.stats
+	// (journalpump.py:343-346), not the pump's live client.
+	stats := rt.stats.Client()
+	if stats == nil {
 		return
 	}
-	settings.stats.Increase("journal.secret_filter_match", rt.secretFilterMatches, rt.tags.MakeTags(nil))
+	stats.Increase("journal.secret_filter_match", rt.secretFilterMatches, rt.tags.MakeTags(nil))
 	rt.secretFilterMatches = 0
 }
 
@@ -1336,7 +1371,7 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 			// A reader goroutine failed: Python's unhandled exception in
 			// the single-threaded loop would crash the daemon — shut down
 			// (with the grace window) and propagate the error.
-			p.log.Printf("Reader failed, stopping daemon: %v", err)
+			p.logError("Reader failed, stopping daemon: %v", err)
 			p.log.Printf("Received SIGTERM, stopping daemon...")
 			shutErr := p.shutdown(cancelReaders, waitReaders)
 			if err != nil {
@@ -1349,7 +1384,7 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 			// full shutdown with the grace window honored for the other
 			// senders; shutdown's sender-group join re-propagates this
 			// error as Run's result.
-			p.log.Printf("Sender failed, stopping daemon: %v", err)
+			p.logError("Sender failed, stopping daemon: %v", err)
 			p.log.Printf("Received SIGTERM, stopping daemon...")
 			return p.shutdown(cancelReaders, waitReaders)
 		case <-ticker.C:
@@ -1473,7 +1508,7 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 		rollbackSent(st, p.previousState, f.reader, f.name)
 	}
 	if err := p.persistState(st); err != nil {
-		p.log.Printf("Saving state at shutdown failed: %v", err)
+		p.logError("Saving state at shutdown failed: %v", err)
 	}
 	for _, l := range live {
 		if closer, ok := l.entry.inst.Transport.(io.Closer); ok {
@@ -1585,7 +1620,11 @@ func (p *Pump) tick() error {
 		}
 		p.lastStateSave = p.now()
 		for _, rt := range p.readers {
-			rt.stats.Gauges.RefreshNonZero()
+			// Python's refresh_gauges re-emits each reader's gauge
+			// values/tags through the LIVE pump client (self.stats,
+			// journalpump.py:1102-1108), so a reload's new statsd
+			// client takes over the resend loop.
+			rt.stats.Gauges.RefreshNonZeroTo(p.stats)
 		}
 	}
 

@@ -19,6 +19,7 @@ import (
 
 	"github.com/Aiven-Open/journalpump/internal/config"
 	"github.com/Aiven-Open/journalpump/internal/reader"
+	"github.com/Aiven-Open/journalpump/internal/sender"
 	"github.com/Aiven-Open/journalpump/internal/state"
 	"golang.org/x/sync/errgroup"
 )
@@ -58,7 +59,7 @@ func startReaderGroup(p *Pump) context.CancelFunc {
 // retireAll stops every live reader and sender of the pump (test cleanup).
 func retireAll(p *Pump) {
 	for _, rt := range p.readers {
-		p.retireReader(rt)
+		_ = p.retireReader(rt)
 	}
 	if p.readerGroup != nil {
 		_ = p.readerGroup.Wait()
@@ -138,6 +139,54 @@ func TestConfigureReadersReplacesAndResumesCursor(t *testing.T) {
 	}
 	if config.ReadersChanged(p.readersActiveBlob, updated.ReadersBlob()) {
 		t.Error("active readers blob was not updated to the new one")
+	}
+}
+
+// failDiscardTransport is a sender.Discarder whose CloseDiscarding fails
+// (an output whose complete-line boundary could not be restored).
+type failDiscardTransport struct {
+	*fakeTransport
+}
+
+func (t *failDiscardTransport) CloseDiscarding() error { return errors.New("truncate boom") }
+
+// TestConfigureReadersRefusesReplacementOnDiscardFailure locks the
+// cleanup-error propagation: when retiring a reader's sender fails to
+// discard (restore its complete-line boundary), the reload aborts BEFORE
+// starting the replacement reader, so no replacement writer can append
+// replay onto a corrupt prefix.
+func TestConfigureReadersRefusesReplacementOnDiscardFailure(t *testing.T) {
+	registerFakeSenders()
+	overrideReopener(t)
+	initial := decodeConfig(t, `{"readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	updated := decodeConfig(t, `{"readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	p, err := NewPump(initial, PumpDeps{Log: &captureLog{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canceled := false
+	entry := &senderEntry{
+		name:   "s",
+		cancel: func() { canceled = true },
+		inst:   sender.Instance{Transport: &failDiscardTransport{}},
+	}
+	p.senderMu.Lock()
+	p.senders["r1"] = []*senderEntry{entry}
+	p.senderMu.Unlock()
+
+	err = p.handleNewConfig(updated)
+	if err == nil || !strings.Contains(err.Error(), "truncate boom") {
+		t.Fatalf("handleNewConfig err = %v, want the discard failure", err)
+	}
+	if !canceled {
+		t.Error("old sender was not cancelled")
+	}
+	if len(p.readers) != 1 || p.readers[0].name != "r1" {
+		t.Errorf("replacement reader started despite the discard failure (readers=%d)", len(p.readers))
+	}
+	if config.ReadersChanged(p.readersActiveBlob, initial.ReadersBlob()) {
+		t.Error("active readers blob changed despite the aborted reload")
 	}
 }
 

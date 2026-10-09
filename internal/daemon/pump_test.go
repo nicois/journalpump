@@ -23,6 +23,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/buffer"
 	"github.com/Aiven-Open/journalpump/internal/config"
 	"github.com/Aiven-Open/journalpump/internal/journal"
+	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/reader"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 	senderfile "github.com/Aiven-Open/journalpump/internal/sender/file"
@@ -344,10 +345,13 @@ func durableTransportRef() *durableTransport {
 	return durableSent
 }
 
-// captureLog records the pump's log lines for assertion.
+// captureLog records the pump's log lines for assertion. It is
+// level-aware (Errorf/Warningf) so tests can assert the severity routing.
 type captureLog struct {
-	mu    sync.Mutex
-	lines []string
+	mu       sync.Mutex
+	lines    []string
+	errors   []string
+	warnings []string
 }
 
 func (c *captureLog) Printf(format string, args ...any) {
@@ -356,10 +360,37 @@ func (c *captureLog) Printf(format string, args ...any) {
 	c.lines = append(c.lines, fmt.Sprintf(format, args...))
 }
 
+func (c *captureLog) Errorf(format string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	line := fmt.Sprintf(format, args...)
+	c.lines = append(c.lines, line)
+	c.errors = append(c.errors, line)
+}
+
+func (c *captureLog) Warningf(format string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	line := fmt.Sprintf(format, args...)
+	c.lines = append(c.lines, line)
+	c.warnings = append(c.warnings, line)
+}
+
 func (c *captureLog) contains(substr string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, line := range c.lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *captureLog) containsError(substr string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, line := range c.errors {
 		if strings.Contains(line, substr) {
 			return true
 		}
@@ -1246,6 +1277,67 @@ func TestFailedFinalFlushRollsBackState(t *testing.T) {
 	})
 }
 
+// TestReaderLoggerCarriesComponentName locks the per-component logger
+// context: the reader's logger is Python's JournalReader:<name> (so its
+// lines carry that LOGGER and %(name)s), while the pump's own logger
+// stays "journalpump".
+func TestReaderLoggerCarriesComponentName(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "journal.sock")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sock, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	previous := journaldlog.DefaultSocket
+	journaldlog.DefaultSocket = sock
+	t.Cleanup(func() { journaldlog.DefaultSocket = previous })
+
+	cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+	log := journaldlog.NewJournalLog("journalpump", journaldlog.LevelDebug)
+	_, rt := newTestRuntime(t, cfg, log)
+
+	rt.log.Printf("reader-line")
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	for i := 0; i < 10; i++ {
+		buf := make([]byte, 4096)
+		n, _, err := conn.ReadFromUnix(buf)
+		if err != nil {
+			t.Fatalf("read reader datagram: %v", err)
+		}
+		got = string(buf[:n])
+		if strings.Contains(got, "reader-line") {
+			break
+		}
+	}
+	if !strings.Contains(got, "LOGGER=JournalReader:r\n") {
+		t.Errorf("datagram = %q, want LOGGER=JournalReader:r", got)
+	}
+	if !strings.Contains(got, "SYSLOG_IDENTIFIER=journalpump\n") {
+		t.Errorf("datagram = %q, want the root SYSLOG_IDENTIFIER", got)
+	}
+}
+
+// a REAL state-save failure: Python logs "Saving state at shutdown
+// failed" via log.exception (ERROR), so the failure must reach Errorf.
+func TestShutdownStateSaveFailureLoggedAsError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		log := &captureLog{}
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+		p, _ := newTestRuntime(t, cfg, log)
+		// A path whose parent directory does not exist: the write fails.
+		p.statePath = filepath.Join(t.TempDir(), "missing-dir", "state.json")
+
+		_ = p.shutdown(func() {}, func() error { return nil })
+
+		if !log.containsError("Saving state at shutdown failed") {
+			t.Errorf("state-save failure not logged at ERROR; lines = %v", log.lines)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // delivery checkpoint (durable sender cursor)
 
@@ -2061,5 +2153,63 @@ func TestBroadHandlerDelayAndTags(t *testing.T) {
 	}
 	if !strings.Contains(line, "app=journalpump") {
 		t.Errorf("datagram = %q, want app=journalpump", line)
+	}
+}
+
+// TestStatsdReloadSplitDirection locks the stats-client split across a
+// statsd-only reload with an UNCHANGED readers blob: the reader's
+// CAPTURED client keeps taking the reader-owned metrics (secret-filter
+// matches), while the supervisor's periodic gauge refresh goes to the
+// LIVE pump client (Python refresh_gauges, journalpump.py:1102-1108).
+func TestStatsdReloadSplitDirection(t *testing.T) {
+	registerFakeSenders()
+	captureOld := newUDPCapture(t)
+	oldHost, oldPort := captureOld.addr()
+	captureNew := newUDPCapture(t)
+	newHost, newPort := captureNew.addr()
+
+	readers := `{"r":{"senders":{"s":{"output_type":"fake"}}}}`
+	initial := decodeConfig(t, fmt.Sprintf(`{"statsd":{"host":%q,"port":%d},"readers":%s}`, oldHost, oldPort, readers))
+	updated := decodeConfig(t, fmt.Sprintf(`{"statsd":{"host":%q,"port":%d},"readers":%s}`, newHost, newPort, readers))
+
+	synctest.Test(t, func(t *testing.T) {
+		p, err := NewPump(initial, PumpDeps{Log: &captureLog{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { retireAll(p) })
+		rt := p.readers[0]
+
+		// Past the 10 s reader stats window, then report secret-filter
+		// matches: they must land on the reader-CAPTURED (old) client.
+		time.Sleep(11 * time.Second)
+		rt.secretFilterMatches = 3
+		rt.reportSecretFilterMetrics()
+
+		// Statsd-only reload: same readers blob (the reader is kept), new
+		// statsd endpoint.
+		if err := p.handleNewConfig(updated); err != nil {
+			t.Fatalf("handleNewConfig: %v", err)
+		}
+		if len(p.readers) != 1 || p.readers[0] != rt {
+			t.Fatalf("reader replaced on a statsd-only reload (readers=%d)", len(p.readers))
+		}
+
+		// The supervisor's gauge refresh uses the LIVE client.
+		rt.stats.Gauges.Set("reader.nonzero", 5, map[string]string{})
+		if err := p.tick(); err != nil {
+			t.Fatalf("tick: %v", err)
+		}
+	})
+
+	// Reader-owned metric on the OLD endpoint.
+	old := captureOld.read(t)
+	if !strings.Contains(old, "journal.secret_filter_match") {
+		t.Errorf("old-client datagram = %q, want the secret-filter metric", old)
+	}
+	// Supervisor-owned gauge on the NEW endpoint.
+	newLine := captureNew.read(t)
+	if !strings.Contains(newLine, "reader.nonzero") {
+		t.Errorf("new-client datagram = %q, want the refreshed persistent gauge", newLine)
 	}
 }

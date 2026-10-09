@@ -376,12 +376,23 @@ func (g *PersistentGauges) Snapshot() map[string]GaugeState {
 // iterates the dict in insertion order; the datagrams are independent,
 // so Go's map order is not observable per metric.
 func (g *PersistentGauges) RefreshNonZero() {
-	if g.stats == nil {
+	g.RefreshNonZeroTo(g.stats)
+}
+
+// RefreshNonZeroTo is RefreshNonZero but emits through the GIVEN client
+// rather than the construction-time one. The pump's periodic
+// refresh_gauges uses the LIVE pump client (journalpump.py:1102-1108:
+// self.stats), while the gauge VALUES and TAGS stay the reader-owned
+// ones captured when each gauge was set — so a reload that replaces the
+// statsd client re-emits the running readers' persistent gauges through
+// the new client.
+func (g *PersistentGauges) RefreshNonZeroTo(stats GaugeSender) {
+	if stats == nil {
 		return
 	}
 	for metric, state := range g.Snapshot() {
 		if state.Value != 0 {
-			g.stats.GaugeInt(metric, state.Value, state.Tags)
+			stats.GaugeInt(metric, state.Value, state.Tags)
 		}
 	}
 }

@@ -45,6 +45,23 @@ type Logger interface {
 	Printf(format string, args ...any)
 }
 
+// errorLogger is the OPTIONAL Logger capability for ERROR-level lines
+// (the level-aware journald sink provides Errorf; plain test loggers do
+// not and fall back to Printf).
+type errorLogger interface {
+	Errorf(format string, args ...any)
+}
+
+// logError emits an ERROR-level line when the logger supports it,
+// falling back to INFO-level Printf otherwise.
+func logError(log Logger, format string, args ...any) {
+	if l, ok := log.(errorLogger); ok {
+		l.Errorf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
 type discardLogger struct{}
 
 func (discardLogger) Printf(_ string, _ ...any) {}
@@ -428,7 +445,7 @@ func (l *Loop) maybeMaintenance(ctx context.Context) {
 		l.mu.Lock()
 		l.lastMaintenance = time.Now()
 		l.mu.Unlock()
-		l.log.Printf("Maintenance operation failed for sender %q: %v", l.cfg.Name, err)
+		logError(l.log, "Maintenance operation failed for sender %q: %v", l.cfg.Name, err)
 		l.unexpected(err, "maintenance_operation", nil)
 	}
 }
@@ -474,10 +491,10 @@ func (l *Loop) failBatch(err error) {
 	retriable := l.classifier.Retriable(err)
 	l.MarkDisconnected(err)
 	if retriable {
-		l.log.Printf("Sender %q retriable error during send: %v, waiting", l.cfg.Name, err)
+		logError(l.log, "Sender %q retriable error during send: %v, waiting", l.cfg.Name, err)
 		return
 	}
-	l.log.Printf("Sender %q unexpected exception during send: %v", l.cfg.Name, err)
+	logError(l.log, "Sender %q unexpected exception during send: %v", l.cfg.Name, err)
 	l.unexpected(err, "sender", map[string]string{"app": "journalpump"})
 }
 

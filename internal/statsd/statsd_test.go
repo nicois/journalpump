@@ -417,6 +417,32 @@ func TestPersistentGaugeRefreshNonZero(t *testing.T) {
 	}
 }
 
+// TestPersistentGaugeRefreshNonZeroTo locks the pump's live-client
+// refresh: the gauge VALUES/TAGS are the recorded ones, but emission goes
+// through the GIVEN client — so a reload that replaces the statsd client
+// moves the resend loop to the new one (journalpump.py:1102-1108 uses
+// self.stats, the live pump client).
+func TestPersistentGaugeRefreshNonZeroTo(t *testing.T) {
+	oldSink := &recordingSink{}
+	gauges := NewPersistentGauges(oldSink)
+	gauges.Set("reader.nonzero", 5, map[string]string{"reader": "r"})
+	oldSink.reset()
+
+	newSink := &recordingSink{}
+	gauges.RefreshNonZeroTo(newSink)
+
+	if got := oldSink.emitted(); len(got) != 0 {
+		t.Fatalf("old client received %+v, want nothing", got)
+	}
+	got := newSink.emitted()
+	if len(got) != 1 || got[0].metric != "reader.nonzero" || got[0].value != 5 {
+		t.Fatalf("new client emitted %+v, want reader.nonzero=5", got)
+	}
+
+	// A nil live client is a no-op (Python self.stats is None).
+	gauges.RefreshNonZeroTo(nil)
+}
+
 // TestPersistentGaugeWithoutStats ports the self.stats is None case:
 // values are still tracked so the transition logic and the pump refresh
 // see them, but nothing is ever emitted.

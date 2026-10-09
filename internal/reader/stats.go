@@ -82,6 +82,14 @@ func NewStats(name string, tags map[string]string, client *statsd.Client, log Lo
 	}
 }
 
+// Client returns the construction-time stats client the reader captured
+// (Python JournalReader.self.stats, journalpump.py:170). Sender
+// initialization and secret-filter metrics emit through THIS client
+// (Python passes stats=self.stats at journalpump.py:294 and reports via
+// self.stats at :346); only the pump-level gauge refresh uses the live
+// client. May be nil when statsd is unconfigured.
+func (s *Stats) Client() *statsd.Client { return s.client }
+
 // IncLineStats ports inc_line_stats: journalLines/journalBytes join the
 // cumulative counters; at most once per 10 s the gauges are emitted,
 // the 120 s summary line logged, and the senders refreshed.

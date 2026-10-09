@@ -199,6 +199,72 @@ func TestSliceBatch(t *testing.T) {
 	}
 }
 
+// levelLogger records lines per severity so tests can assert the routing
+// of Python's log.error / log.warning call sites.
+type levelLogger struct {
+	mu       sync.Mutex
+	errors   []string
+	warnings []string
+}
+
+func (*levelLogger) Printf(string, ...any) {}
+
+func (l *levelLogger) Errorf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.errors = append(l.errors, fmt.Sprintf(format, args...))
+}
+
+func (l *levelLogger) Warningf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
+
+func (l *levelLogger) hasError(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.errors {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSendFailureLoggedAsError locks the severity routing of a REAL send
+// failure: base.py:279 logs "Problem sending ... messages" at ERROR, so
+// the loop's failBatch must emit through Errorf (not the INFO Printf).
+func TestSendFailureLoggedAsError(t *testing.T) {
+	t.Parallel()
+	tr := &fakeTransport{sendBehavior: func(int) error { return errors.New("send boom") }}
+	log := &levelLogger{}
+	in := make(chan Item, 4)
+	loop := NewLoop(
+		LoopConfig{Name: "out", Tags: map[string]string{}, Log: log},
+		Instance{Transport: tr, MaxSendInterval: time.Hour, Type: "FakeSender"},
+		in,
+	)
+	in <- Item{Payload: []byte("x"), Cursor: "c0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		loop.drain(ctx)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for tr.attemptCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel() // release the backoff sleep
+	<-done
+
+	if !log.hasError("during send") {
+		t.Errorf("send failure not logged at ERROR; errors = %v", log.errors)
+	}
+}
+
 func TestBackoffBaseDuration(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
