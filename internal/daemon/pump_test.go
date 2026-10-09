@@ -138,6 +138,20 @@ func registerFakeSenders() {
 				ConnectOnInit:   true,
 			}, nil
 		})
+		// gatedblock's loop parks in maintenance until its release
+		// channel closes, so a test controls when it delivers.
+		sender.Register("gatedblock", func(sender.ConstructorArgs) (sender.Instance, error) {
+			tr := &gatedTransport{release: currentGated()}
+			gatedMu.Lock()
+			gatedSent = tr
+			gatedMu.Unlock()
+			return sender.Instance{
+				Transport:       tr,
+				MaxSendInterval: 2 * time.Second,
+				Type:            "GatedSender",
+				ConnectOnInit:   true,
+			}, nil
+		})
 	})
 }
 
@@ -170,6 +184,63 @@ func (f *flushFailTransport) SendMessages(_ context.Context, batch [][]byte, _ s
 func (f *flushFailTransport) MaintenanceOperations(context.Context) error { return nil }
 
 func (f *flushFailTransport) Finalize() error { return errors.New("final flush boom") }
+
+// gatedTransport buffers everything until its release channel closes:
+// MaintenanceOperations blocks, so the loop never reaches its drain and
+// the caller controls exactly when the flush happens.
+type gatedTransport struct {
+	mu      sync.Mutex
+	msgs    int
+	release <-chan struct{}
+}
+
+func (g *gatedTransport) SendMessages(_ context.Context, batch [][]byte, _ string) error {
+	g.mu.Lock()
+	g.msgs += len(batch)
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *gatedTransport) MaintenanceOperations(ctx context.Context) error {
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+func (g *gatedTransport) messages() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.msgs
+}
+
+// gatedSent is the transport built for the most recent "gatedblock"
+// construction; the fail-fast test reads it to observe delivery.
+var (
+	gatedMu        sync.Mutex
+	gatedReleaseCh = make(chan struct{})
+	gatedSent      *gatedTransport
+)
+
+func setGatedRelease(ch chan struct{}) {
+	gatedMu.Lock()
+	gatedReleaseCh = ch
+	gatedSent = nil
+	gatedMu.Unlock()
+}
+
+func currentGated() <-chan struct{} {
+	gatedMu.Lock()
+	defer gatedMu.Unlock()
+	return gatedReleaseCh
+}
+
+func gatedTransportRef() *gatedTransport {
+	gatedMu.Lock()
+	defer gatedMu.Unlock()
+	return gatedSent
+}
 
 // captureLog records the pump's log lines for assertion.
 type captureLog struct {
@@ -1079,16 +1150,28 @@ func TestFailedFinalFlushRollsBackState(t *testing.T) {
 // TestSenderErrorFailsFastAndHonorsGrace locks the fail-fast ruling: a
 // sender-LOOP failure terminates the daemon on its own (NO external
 // cancellation), propagates as Run's result, and still honors the full
-// grace window for the OTHER senders (whose buffered messages flush).
+// grace window for the OTHER senders.
+//
+// The survivor's flush is GATED: its loop parks in maintenance until the
+// test releases it, so nothing is delivered while the daemon runs. The
+// test asserts ZERO delivered at the moment the failure surfaces, then
+// releases and asserts both messages are delivered during the grace
+// window. If the failure cancelled every sender immediately (no grace),
+// the survivor's drain would abort and delivery would be 0.
 func TestSenderErrorFailsFastAndHonorsGrace(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		disableSignals(t)
+		release := make(chan struct{})
+		setGatedRelease(release)
+		boomFailed := make(chan struct{})
+
 		orig := runSenderLoop
 		runSenderLoop = func(l *sender.Loop, ctx context.Context) error {
 			if l.Name() == "boom" {
-				// Delay so the reader drains its entries into the other
+				// Delay so the reader drains its entries into the gated
 				// sender's buffer before the failure surfaces.
 				time.Sleep(5 * pollInterval)
+				close(boomFailed)
 				return errors.New("sender boom")
 			}
 			return l.Run(ctx)
@@ -1097,8 +1180,8 @@ func TestSenderErrorFailsFastAndHonorsGrace(t *testing.T) {
 
 		cfg := testPumpConfig(map[string]config.ReaderConfig{
 			"r": fakeReaderConfig(map[string]any{
-				"boom": map[string]any{"output_type": "fake"},
-				"ok":   fakeSenderConfig(),
+				"boom":  map[string]any{"output_type": "fake"},
+				"gated": map[string]any{"output_type": "gatedblock"},
 			}),
 		})
 		p, rt := newTestRuntime(t, cfg, &captureLog{})
@@ -1112,41 +1195,39 @@ func TestSenderErrorFailsFastAndHonorsGrace(t *testing.T) {
 			},
 		}}
 
+		// On failure: assert nothing has been delivered yet, then release
+		// the gated sender so it can flush during the grace window.
+		released := make(chan struct{})
+		go func() {
+			<-boomFailed
+			releasedAtFailure := gatedTransportRef().messages()
+			if releasedAtFailure != 0 {
+				t.Errorf("gated sender delivered %d messages before shutdown began", releasedAtFailure)
+			}
+			close(release)
+			close(released)
+		}()
+
 		// No external cancellation: the sender failure alone must stop it.
 		done := make(chan error, 1)
 		go func() { done <- p.Run(context.Background(), make(chan os.Signal)) }()
 
-		synctest.Wait()
-		time.Sleep(10 * pollInterval)
-		synctest.Wait()
 		select {
 		case err := <-done:
 			if err == nil || !strings.Contains(err.Error(), "sender boom") {
 				t.Fatalf("Run = %v, want the sender error", err)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(30 * time.Second):
 			t.Fatal("Run did not return after the sender failure (no external cancellation)")
 		}
+		<-released
 		if !notifier.notified(StateStopping) {
 			t.Error("Run did not notify STOPPING=1")
 		}
-		// The OTHER sender must still have received its full grace window:
-		// its two buffered messages were flushed.
-		var okEntry *senderEntry
-		for _, e := range rt.pump.senders["r"] {
-			if e.name == "ok" {
-				okEntry = e
-			}
-		}
-		if okEntry == nil {
-			t.Fatal("ok sender not initialized")
-		}
-		transport, isFake := okEntry.inst.Transport.(*fakeTransport)
-		if !isFake {
-			t.Fatalf("transport type %T", okEntry.inst.Transport)
-		}
-		if got := transport.messages(); got != 2 {
-			t.Errorf("other sender flushed %d messages, want 2 (grace window honored)", got)
+		// The OTHER sender got its full grace window: both buffered
+		// messages were delivered.
+		if got := gatedTransportRef().messages(); got != 2 {
+			t.Errorf("gated sender delivered %d messages, want 2 (grace window honored)", got)
 		}
 	})
 }

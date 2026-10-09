@@ -30,11 +30,15 @@ type fakeTransport struct {
 func (f *fakeTransport) SendMessages(_ context.Context, batch [][]byte, _ string) error {
 	f.mu.Lock()
 	f.calls++
-	f.messages += len(batch)
 	f.mu.Unlock()
 	if f.gate != nil {
 		<-f.gate
 	}
+	// Count only COMPLETED sends: increment after the optional gate
+	// releases, so messageCount really means delivered.
+	f.mu.Lock()
+	f.messages += len(batch)
+	f.mu.Unlock()
 	return nil
 }
 
