@@ -479,6 +479,166 @@ func TestProducerConfigInheritsClientConfig(t *testing.T) {
 	}
 }
 
+// TestNormalizeKafkaVersion covers the kafka-python accepted syntax
+// (review item D10): "auto" (and empty) mean detection, "X.Y" and "X.Y.Z"
+// are zero-padded, 0.x versions get the fourth component sarama requires.
+func TestNormalizeKafkaVersion(t *testing.T) {
+	ver := func(v sarama.KafkaVersion) *sarama.KafkaVersion { return &v }
+	cases := []struct {
+		in   string
+		want *sarama.KafkaVersion
+	}{
+		{"2.5.0", ver(sarama.V2_5_0_0)},
+		{"2.5", ver(sarama.V2_5_0_0)},
+		{"0.10.2", ver(sarama.V0_10_2_0)},
+		{"0.10", ver(sarama.V0_10_0_0)},
+		{"0.11.0", ver(sarama.V0_11_0_0)},
+		{"1.0.0", ver(sarama.V1_0_0_0)},
+		{"auto", nil},
+		{"AUTO", nil},
+		{"", nil},
+	}
+	for _, tc := range cases {
+		got, err := normalizeKafkaVersion(tc.in)
+		if err != nil {
+			t.Errorf("normalizeKafkaVersion(%q): %v", tc.in, err)
+			continue
+		}
+		switch {
+		case tc.want == nil && got != nil:
+			t.Errorf("normalizeKafkaVersion(%q) = %v, want nil (auto)", tc.in, *got)
+		case tc.want != nil && (got == nil || *got != *tc.want):
+			t.Errorf("normalizeKafkaVersion(%q) = %v, want %v", tc.in, got, *tc.want)
+		}
+	}
+	for _, bad := range []string{"not-a-version", "2.x", "a.b.c"} {
+		if _, err := normalizeKafkaVersion(bad); err == nil {
+			t.Errorf("normalizeKafkaVersion(%q): want error", bad)
+		}
+	}
+}
+
+// TestInferKafkaVersion covers the auto-detection decision list (D11)
+// against synthetic ApiVersions responses.
+func TestInferKafkaVersion(t *testing.T) {
+	// keyVersions builds an ApiVersionsResponse whose only entry grants
+	// the given api key the given max version.
+	resp := func(pairs map[int16]int16) *sarama.ApiVersionsResponse {
+		var keys []sarama.ApiVersionsResponseKey
+		for k, v := range pairs {
+			keys = append(keys, sarama.ApiVersionsResponseKey{ApiKey: k, MinVersion: 0, MaxVersion: v})
+		}
+		return &sarama.ApiVersionsResponse{ApiKeys: keys}
+	}
+	cases := []struct {
+		name string
+		resp *sarama.ApiVersionsResponse
+		want sarama.KafkaVersion
+	}{
+		{"2.6 via DescribeClientQuotas", resp(map[int16]int16{48: 0, 29: 2}), sarama.V2_6_0_0},
+		{"2.5 via DescribeAcls v2", resp(map[int16]int16{29: 2}), sarama.V2_5_0_0},
+		{"2.4 via Produce v8", resp(map[int16]int16{0: 8}), sarama.V2_4_0_0},
+		{"2.3 via Fetch v11", resp(map[int16]int16{1: 11}), sarama.V2_3_0_0},
+		{"2.2 via ListOffsets v5", resp(map[int16]int16{2: 5}), sarama.V2_2_0_0},
+		{"2.1 via Fetch v10", resp(map[int16]int16{1: 10}), sarama.V2_1_0_0},
+		{"2.0 via Fetch v8", resp(map[int16]int16{1: 8}), sarama.V2_0_0_0},
+		{"1.1 via Fetch v7", resp(map[int16]int16{1: 7}), sarama.V1_1_0_0},
+		{"1.0 via Metadata v5", resp(map[int16]int16{3: 5}), sarama.V1_0_0_0},
+		{"0.11 via Metadata v4", resp(map[int16]int16{3: 4}), sarama.V0_11_0_0},
+		{"0.10.2 via OffsetFetch v2", resp(map[int16]int16{9: 2}), sarama.V0_10_2_0},
+		{"0.10.1 via Metadata v2", resp(map[int16]int16{3: 2}), sarama.V0_10_1_0},
+		{"fallback 0.10.0", resp(map[int16]int16{}), sarama.V0_10_0_0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inferKafkaVersion(tc.resp); got != tc.want {
+				t.Errorf("inferKafkaVersion = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildSaramaConfigDetectsVersion: an unset api_version probes the
+// broker, an explicit one does not (review items D10/D11).
+func TestBuildSaramaConfigDetectsVersion(t *testing.T) {
+	raw := baseConfig()
+	pc, err := resolveProducerConfig(raw)
+	if err != nil {
+		t.Fatalf("resolveProducerConfig: %v", err)
+	}
+	s := newSender(t, raw)
+	probed := false
+	s.detectVersion = func([]string, *sarama.Config) (sarama.KafkaVersion, error) {
+		probed = true
+		return sarama.V2_5_0_0, nil
+	}
+	cfg, err := s.buildSaramaConfig(pc)
+	if err != nil {
+		t.Fatalf("buildSaramaConfig: %v", err)
+	}
+	if !probed {
+		t.Error("unset api_version did not trigger detection")
+	}
+	if cfg.Version != sarama.V2_5_0_0 {
+		t.Errorf("cfg.Version = %v, want V2_5_0_0", cfg.Version)
+	}
+
+	raw["kafka_api_version"] = "1.1.0"
+	pc2, err := resolveProducerConfig(raw)
+	if err != nil {
+		t.Fatalf("resolveProducerConfig: %v", err)
+	}
+	s.detectVersion = func([]string, *sarama.Config) (sarama.KafkaVersion, error) {
+		t.Error("detection ran despite an explicit api_version")
+		return sarama.V0_10_0_0, nil
+	}
+	cfg2, err := s.buildSaramaConfig(pc2)
+	if err != nil {
+		t.Fatalf("buildSaramaConfig: %v", err)
+	}
+	if cfg2.Version != sarama.V1_1_0_0 {
+		t.Errorf("cfg.Version = %v, want V1_1_0_0", cfg2.Version)
+	}
+}
+
+// TestSaramaConfigRetryTimeouts pins the D12 mapping: exponential metadata
+// backoff capped at 10s, delivery timeout 120s, request timeout 30s,
+// retry backoff 100ms.
+func TestSaramaConfigRetryTimeouts(t *testing.T) {
+	pc, err := resolveProducerConfig(baseConfig())
+	if err != nil {
+		t.Fatalf("resolveProducerConfig: %v", err)
+	}
+	cfg, err := pc.saramaConfig()
+	if err != nil {
+		t.Fatalf("saramaConfig: %v", err)
+	}
+	if cfg.Metadata.Retry.Backoff != time.Second {
+		t.Errorf("Metadata.Retry.Backoff = %v, want 1s", cfg.Metadata.Retry.Backoff)
+	}
+	if cfg.Metadata.Retry.BackoffFunc == nil {
+		t.Fatal("Metadata.Retry.BackoffFunc is nil; the 10s cap cannot be expressed")
+	}
+	wantBackoff := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
+	for i, want := range wantBackoff {
+		if got := cfg.Metadata.Retry.BackoffFunc(i, cfg.Metadata.Retry.Max); got != want {
+			t.Errorf("BackoffFunc(%d) = %v, want %v", i, got, want)
+		}
+	}
+	if cfg.Producer.Timeout != 120*time.Second {
+		t.Errorf("Producer.Timeout = %v, want 120s", cfg.Producer.Timeout)
+	}
+	if cfg.Producer.Retry.Backoff != 100*time.Millisecond {
+		t.Errorf("Producer.Retry.Backoff = %v, want 100ms", cfg.Producer.Retry.Backoff)
+	}
+	if cfg.Net.ReadTimeout != 30*time.Second || cfg.Net.WriteTimeout != 30*time.Second {
+		t.Errorf("Net timeouts = %v/%v, want 30s/30s", cfg.Net.ReadTimeout, cfg.Net.WriteTimeout)
+	}
+	if cfg.Producer.Retry.Max <= 3 {
+		t.Errorf("Producer.Retry.Max = %d, want effectively unlimited (> sarama default 3)", cfg.Producer.Retry.Max)
+	}
+}
+
 func TestProducerConfigInvalidAPIVersion(t *testing.T) {
 	raw := baseConfig()
 	raw["kafka_api_version"] = "not-a-version"

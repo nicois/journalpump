@@ -11,8 +11,6 @@ import (
 	"net"
 	"testing"
 	"time"
-
-	"golang.org/x/net/proxy"
 )
 
 // socksRequest records the destination the client asked the proxy to
@@ -38,7 +36,7 @@ func startSocksServer(t *testing.T) (string, <-chan socksRequest) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		// Read the client greeting, then select "no authentication".
 		greeting := make([]byte, 2)
 		if _, err := io.ReadFull(conn, greeting); err != nil {
@@ -105,7 +103,7 @@ func TestSocks5ResolvesLocally(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Dial: %v", err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			select {
 			case req := <-requests:
 				if tc.wantResolved {
@@ -115,10 +113,8 @@ func TestSocks5ResolvesLocally(t *testing.T) {
 					if ip := net.ParseIP(req.addr); ip == nil || !ip.IsLoopback() {
 						t.Fatalf("socks5 destination = %q, want a loopback IP", req.addr)
 					}
-				} else {
-					if req.atyp != 3 || req.addr != tc.wantName {
-						t.Fatalf("socks5h destination = atyp %d %q, want a hostname %q", req.atyp, req.addr, tc.wantName)
-					}
+				} else if req.atyp != 3 || req.addr != tc.wantName {
+					t.Fatalf("socks5h destination = atyp %d %q, want a hostname %q", req.atyp, req.addr, tc.wantName)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("proxy did not receive a request")
@@ -167,5 +163,4 @@ func TestSocks5DialerHasTimeout(t *testing.T) {
 	if _, ok := dialer.(*timeoutDialer); !ok {
 		t.Fatalf("dialer = %T, want *timeoutDialer", dialer)
 	}
-	var _ proxy.Dialer = dialer
 }

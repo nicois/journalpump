@@ -43,6 +43,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -67,6 +68,19 @@ const (
 	// kafka_sender.py:59-60 (1 s / 10 s).
 	reconnectBackoffMS    = 1000
 	reconnectBackoffMaxMS = 10000
+)
+
+// Producer retry/timeout defaults mirroring kafka-python (review item D12):
+// retries bounded by delivery_timeout_ms=120000 and request_timeout_ms=30000,
+// with retry_backoff_ms=100. metadataRetryMax is how many metadata retries
+// sarama performs within one connect (kafka-python retries until its
+// backoff cap; the shared sender loop owns the unbounded outer retry).
+const (
+	deliveryTimeout  = 120 * time.Second
+	requestTimeout   = 30 * time.Second
+	retryBackoff     = 100 * time.Millisecond
+	metadataRetryMax = 10
+	producerRetryMax = 2147483647
 )
 
 // compressionName is the codec the deployment pins (snappy).
@@ -110,6 +124,9 @@ type Sender struct {
 	key         sarama.Encoder
 	newProducer producerFactory
 	newAdmin    adminFactory
+	// detectVersion probes the broker for its version when api_version is
+	// unset, reproducing kafka-python's check_version (review item D11).
+	detectVersion func(brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error)
 
 	mu sync.Mutex
 	// prod is the live producer; pc is the resolved producer config
@@ -200,6 +217,7 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	}
 	s.newProducer = s.connectProducer
 	s.newAdmin = s.connectAdmin
+	s.detectVersion = detectBrokerVersion
 	return sender.Instance{
 		Transport:       s,
 		MaxSendInterval: time.Duration(seconds * float64(time.Second)),
@@ -222,11 +240,11 @@ func resolveClientConfig(raw map[string]any) (clientConfig, error) {
 		if !ok {
 			return cfg, fmt.Errorf("kafka_api_version: %v is not a string", v)
 		}
-		ver, err := sarama.ParseKafkaVersion(s)
+		ver, err := normalizeKafkaVersion(s)
 		if err != nil {
-			return cfg, fmt.Errorf("kafka_api_version: %w", err)
+			return cfg, err
 		}
-		cfg.apiVersion = &ver
+		cfg.apiVersion = ver
 	}
 	if v, present := raw["kafka_address"]; present && v != nil {
 		brokers, err := parseBrokers(v)
@@ -320,16 +338,38 @@ func resolveProducerConfig(raw map[string]any) (producerConfig, error) {
 // saramaConfig projects the resolved config onto a *sarama.Config.
 func (pc producerConfig) saramaConfig() (*sarama.Config, error) {
 	cfg := sarama.NewConfig()
-	// api_version: kafka-python auto-detects when unset; sarama has no
-	// ApiVersions negotiation, so an unset version keeps sarama's
-	// default (documented divergence).
+	// api_version: an explicit value is used as-is; an unset one is
+	// auto-detected from the broker before connecting (buildSaramaConfig,
+	// review item D11).
 	if pc.apiVersion != nil {
 		cfg.Version = *pc.apiVersion
 	}
-	// reconnect 1 s / 10 s. sarama exposes the metadata retry backoff;
-	// there is no max-backoff cap to map the upper bound onto.
+	// reconnect_backoff_ms=1000 / reconnect_backoff_max_ms=10000
+	// (kafka_sender.py:59-60). sarama's metadata retry backoff is the
+	// equivalent reconnect knob; BackoffFunc supplies the exponential
+	// growth with the 10 s cap that the fixed Backoff alone cannot express
+	// (review item D12).
+	cfg.Metadata.Retry.Max = metadataRetryMax
 	cfg.Metadata.Retry.Backoff = reconnectBackoffMS * time.Millisecond
-	_ = reconnectBackoffMaxMS
+	maxBackoff := time.Duration(reconnectBackoffMaxMS) * time.Millisecond
+	cfg.Metadata.Retry.BackoffFunc = func(retries, _ int) time.Duration {
+		d := time.Duration(reconnectBackoffMS) * time.Millisecond
+		for i := 0; i < retries; i++ {
+			d *= 2
+			if d >= maxBackoff {
+				return maxBackoff
+			}
+		}
+		return d
+	}
+	// Producer defaults: kafka-python retries (effectively unlimited) are
+	// bounded by delivery_timeout_ms=120000 and request_timeout_ms=30000,
+	// with retry_backoff_ms=100 (review item D12).
+	cfg.Producer.Timeout = deliveryTimeout
+	cfg.Producer.Retry.Max = producerRetryMax
+	cfg.Producer.Retry.Backoff = retryBackoff
+	cfg.Net.ReadTimeout = requestTimeout
+	cfg.Net.WriteTimeout = requestTimeout
 
 	switch pc.securityProtocol {
 	case "SSL", "SASL_SSL":
@@ -425,7 +465,7 @@ func saslMechanism(name string) (sarama.SASLMechanism, error) {
 
 // connectProducer builds a live sarama SyncProducer.
 func (s *Sender) connectProducer(pc producerConfig) (producer, error) {
-	cfg, err := pc.saramaConfig()
+	cfg, err := s.buildSaramaConfig(pc)
 	if err != nil {
 		return nil, err
 	}
@@ -434,11 +474,104 @@ func (s *Sender) connectProducer(pc producerConfig) (producer, error) {
 
 // connectAdmin builds a live sarama ClusterAdmin.
 func (s *Sender) connectAdmin(pc producerConfig) (admin, error) {
-	cfg, err := pc.saramaConfig()
+	cfg, err := s.buildSaramaConfig(pc)
 	if err != nil {
 		return nil, err
 	}
 	return sarama.NewClusterAdmin(pc.brokers, cfg)
+}
+
+// buildSaramaConfig projects the resolved config and, when api_version is
+// unset, detects the broker version first — sarama's ApiVersionsRequest is
+// fire-and-forget and does not adjust the configured version, so an
+// explicit probe is required to match kafka-python's auto-detection
+// (review item D11).
+func (s *Sender) buildSaramaConfig(pc producerConfig) (*sarama.Config, error) {
+	cfg, err := pc.saramaConfig()
+	if err != nil {
+		return nil, err
+	}
+	if pc.apiVersion == nil {
+		ver, err := s.detectVersion(pc.brokers, cfg)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Version = ver
+	}
+	return cfg, nil
+}
+
+// detectBrokerVersion opens each bootstrap broker with the oldest protocol
+// that supports ApiVersions (0.10) and infers the broker release from the
+// advertised API versions. It is the default detectVersion seam.
+func detectBrokerVersion(brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error) {
+	probeCfg := *cfg
+	probeCfg.Version = sarama.V0_10_0_0
+	var lastErr error
+	for _, addr := range brokers {
+		b := sarama.NewBroker(addr)
+		if err := b.Open(&probeCfg); err != nil {
+			lastErr = err
+			_ = b.Close()
+			continue
+		}
+		resp, err := b.ApiVersions(&sarama.ApiVersionsRequest{Version: 0})
+		_ = b.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return inferKafkaVersion(resp), nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no bootstrap brokers to probe")
+	}
+	return sarama.V0_10_0_0, fmt.Errorf("kafka_api_version auto-detection failed: %w", lastErr)
+}
+
+// inferKafkaVersion ports kafka-python's
+// _infer_broker_version_from_api_versions: check the decision list from the
+// newest release down and return the first whose probe API supports the
+// required version. Newer releases than the list are reported as the
+// highest known entry (2.6), exactly as kafka-python does.
+func inferKafkaVersion(resp *sarama.ApiVersionsResponse) sarama.KafkaVersion {
+	type apiRange struct{ min, max int16 }
+	apis := make(map[int16]apiRange, len(resp.ApiKeys))
+	for _, k := range resp.ApiKeys {
+		apis[k.ApiKey] = apiRange{k.MinVersion, k.MaxVersion}
+	}
+	supports := func(key, version int16) bool {
+		r, ok := apis[key]
+		return ok && r.min <= version && version <= r.max
+	}
+	// (sarama version, api key, required max version), newest first.
+	// API keys: Produce=0, Fetch=1, ListOffsets=2, Metadata=3,
+	// OffsetFetch=9, DescribeAcls=29, DescribeClientQuotas=48.
+	cases := []struct {
+		version sarama.KafkaVersion
+		key     int16
+		need    int16
+	}{
+		{sarama.V2_6_0_0, 48, 0},
+		{sarama.V2_5_0_0, 29, 2},
+		{sarama.V2_4_0_0, 0, 8},
+		{sarama.V2_3_0_0, 1, 11},
+		{sarama.V2_2_0_0, 2, 5},
+		{sarama.V2_1_0_0, 1, 10},
+		{sarama.V2_0_0_0, 1, 8},
+		{sarama.V1_1_0_0, 1, 7},
+		{sarama.V1_0_0_0, 3, 5},
+		{sarama.V0_11_0_0, 3, 4},
+		{sarama.V0_10_2_0, 9, 2},
+		{sarama.V0_10_1_0, 3, 2},
+	}
+	for _, c := range cases {
+		if supports(c.key, c.need) {
+			return c.version
+		}
+	}
+	// ApiVersionsResponse only exists on 0.10+, so fall back to it.
+	return sarama.V0_10_0_0
 }
 
 // resolvedProducerConfig parses the raw config once.
@@ -792,6 +925,52 @@ func validSecurityProtocol(name string) bool {
 	default:
 		return false
 	}
+}
+
+// normalizeKafkaVersion maps the version strings kafka-python accepts onto
+// a sarama.KafkaVersion (review item D10). kafka-python treats "auto" as
+// None (broker detection) and otherwise splits the string on "." into an
+// integer tuple, so "2.5" and "0.10.2" are valid. sarama's parser insists
+// on exactly three components for 1.x+ and four for 0.x, so the tuple is
+// zero-padded to that width; a nil result means auto-detection (see
+// saramaConfig).
+func normalizeKafkaVersion(s string) (*sarama.KafkaVersion, error) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" || strings.EqualFold(trimmed, "auto") {
+		return nil, nil
+	}
+	parts := strings.Split(trimmed, ".")
+	nums := make([]int, len(parts))
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("kafka_api_version: %q is not a valid version", s)
+		}
+		nums[i] = n
+	}
+	var normalized string
+	if nums[0] == 0 {
+		for len(nums) < 4 {
+			nums = append(nums, 0)
+		}
+		if len(nums) != 4 {
+			return nil, fmt.Errorf("kafka_api_version: %q is not a valid version", s)
+		}
+		normalized = fmt.Sprintf("%d.%d.%d.%d", nums[0], nums[1], nums[2], nums[3])
+	} else {
+		for len(nums) < 3 {
+			nums = append(nums, 0)
+		}
+		if len(nums) != 3 {
+			return nil, fmt.Errorf("kafka_api_version: %q is not a valid version", s)
+		}
+		normalized = fmt.Sprintf("%d.%d.%d", nums[0], nums[1], nums[2])
+	}
+	ver, err := sarama.ParseKafkaVersion(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("kafka_api_version: %w", err)
+	}
+	return &ver, nil
 }
 
 // defaultKafkaPort is kafka-python's DEFAULT_KAFKA_PORT
