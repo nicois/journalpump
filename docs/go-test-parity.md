@@ -1065,7 +1065,7 @@ the daemon, not just the parent harness):
 | `systest/test_rotation.py` (rotation behavior; Python is in-process/monkeypatched) | Go-idiomatic | `TestGoRotationThirtyMessagesAcrossRotation`, `TestGoRotationBufferLengthBoundaries`, `TestGoRotationBufferBytesBoundaries`, `TestGoRotationCorruptEntrySkip`, `TestGoRotationDeletedFileFdRelease` |
 | `systest/test_reload.py::test_sighup_with_changed_readers_keeps_process_alive` | ported | `TestGoSighupWithChangedReadersKeepsProcessAlive`, plus `TestGoReloadPreservesDeliveryCursors` (journal→file delivery survives a changed-reader SIGHUP with no missing/duplicate message and a correct saved cursor) |
 | `systest/test_sigterm.py` (sitecustomize slow-flush trick is Python-only) | `go-native` (outside the Python parity set; sanctioned deviation D9) | `TestGoSigtermGraceFlushDeliversBufferedTail` asserts the grace-flush window Python does not exhibit; `TestGoCleanShutdownAfterReloads` drives CHANGED-reader reloads with initialized workers and asserts the process still exits 0 within the shutdown timeout. It is a shutdown/hang check, NOT a goroutine-leak check (`os.Exit` abandons goroutines regardless of status); the real join/leak assertion is Go-native: `internal/daemon` `TestReloadJoinsRetiredWorkers` (retired reader + sender `done` channels closed after a changed-reader reload) with negative control `TestJoinedWorkerCheckDetectsUnjoined` |
-| D3 pair (`systest/test_state_file_interop.py` is the Python side) | ported | `TestGoResumesFromPythonStateFile` (Python-written fixture → Go resume → real Python `PumpReader` resume reads no remaining messages), `TestGoCursorSurvivesRestart` (Go→Go restart), `TestPythonToGoToPythonRoundTrip` (Python writes an INTERMEDIATE-cursor state with search counters → Go delivers the remaining messages → Python resumes from Go's end cursor and reads the persisted counters) |
+| D3 pair (`test/test_state_file_interop.py` is the Python side) | ported | `TestGoResumesFromPythonStateFile` (Python-written fixture → Go resume → real Python `PumpReader` resume reads no remaining messages), `TestGoCursorSurvivesRestart` (Go→Go restart), `TestPythonToGoToPythonRoundTrip` (Python writes an INTERMEDIATE-cursor state with search counters → Go delivers the remaining messages → Python resumes from Go's end cursor and reads the persisted counters) |
 
 Boundary granularity: `TestReadMessagesHonorsBufferBoundaries`
 (`internal/daemon`) asserts the exact per-chunk admission count and the
@@ -1087,8 +1087,10 @@ tracing and re-confirmed here; `JOURNALPUMP_BIN=build/journalpump`):
 
 - 9 cases DO spawn the Go binary: `test_reload.py` (1),
   `test_running_config.py` (7), `test_sigterm.py` (1).
-- 6 cases (`test_harness.py`) run a deterministic STUB binary
-  (`systest/data/notify_stub.py`), not Go.
+- 6 cases (all of `test_harness.py`) are harness/unit cases that do NOT
+  drive Go: they exercise the harness itself — command selection and
+  source discovery, exit-code capture, and several different stub
+  binaries (not only `systest/data/notify_stub.py`).
 - 10 cases (`test_rotation.py`, 7 functions/10 collected) run the Python
   journalpump IN PROCESS and ignore `JOURNALPUMP_BIN` entirely; they are
   Python-implementation evidence only and must not be cited as Go
@@ -1099,17 +1101,38 @@ tracing and re-confirmed here; `JOURNALPUMP_BIN=build/journalpump`):
 
 ### Defect fixed (real defect, category 1)
 
-`internal/daemon/pump.go`: on reader recreation the run loop preserved a
-pending INVALIDATE through `maxEvent`, and the first `sd_journal_wait`
-after a fresh open reports INVALIDATE for the open-time file snapshot
-(probe-confirmed) — Python's `register_for_poll` path seeds APPEND and
-never manufactures one (`journalpump.py:1179`). With partial drains this
-repeatedly closed/reopened unchanged journals (reproduced: ~60 s for 30
-messages under a tiny byte buffer). The loop now masks the first
-post-open INVALIDATE (`freshReader`) and the recreate path REPLACES the
-pending event with APPEND instead of maxing it. Regression:
-`TestRunLoopStableJournalIsNotRecreated` (fails on the pre-fix code with
-one spurious invalidation + one extra recreate).
+`internal/reader/sdjournal.go` + `internal/daemon/pump.go`: a freshly
+opened reader's first `sd_journal_wait` reports INVALIDATE for the
+open-time file snapshot (probe-confirmed), so with partial drains the run
+loop repeatedly closed and reopened unchanged journals (reproduced: ~60 s
+for 30 messages under a tiny byte buffer), and on a recreate it preserved
+the stale INVALIDATE through `maxEvent`. Python never sees this: its
+`register_for_poll` path registers the reader via python-systemd's
+`Reader.fileno()`, which calls `sd_journal_get_fd` — and libsystemd's
+`sd_journal_get_fd` runs `sd_journal_process` internally, absorbing the
+open-time INVALIDATE before the pump can observe it
+(`journalpump.py:1177-1179,1090-1100`).
+
+Root-cause fix: `SDJournal.Open` now calls `RegisterForPoll`
+(`sd_journal_get_fd`) as the reader is created, mirroring the Python fd
+registration, and the run loop no longer masks ANY first wait. This is
+strictly better than the earlier blanket mask, which also swallowed a
+GENUINE rotation/deletion occurring before the first wait (the required
+recreation then never happened). The recreate path still REPLACES the
+pending event with APPEND (Python's `buffered_events[reader] =
+journal.APPEND`) and never keeps a stale INVALIDATE.
+
+Regression tests:
+- `internal/reader` `TestOpenAbsorbsInitialNotification` — a freshly
+  opened unchanged fixture's first `Wait(0)` is `EventNOP` (fails, event
+  2, when `RegisterForPoll` is disabled).
+- `internal/reader` `TestPreFirstWaitDeletionReportsInvalidate` — a
+  deletion between the open and the first wait still reports
+  `EventInvalidate`, so the root-cause fix does not hide real rotations
+  (the case the blanket mask broke).
+- `internal/daemon` `TestRunLoopFirstWaitInvalidateRecreates` — a
+  first-wait INVALIDATE drains, invalidates the source and recreates the
+  reader (fails on the blanket-mask code with `invalidated == 0`).
 
 ### Signal-install fix (cosmetic, no §2 entry)
 
