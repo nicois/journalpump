@@ -737,9 +737,12 @@ Python facts pinned:
   directories and files mode (probed). Python's systest harness patches
   the check globally (groundtruth_support.py:77-78); the Go equivalent
   is the package-level `FilesAvailableOverride` hook — nil in
-  production, tests only. **Task 16/18 forward note**: the value-
-  demonstration run and the systest harness will need this override
-  for fixture-based configs, exactly as the Python shim does.
+  production, tests only. **Task 16 resolution**: in-process tests set
+  the hook directly; the launched-binary e2e builds with `-tags systest`
+  so `internal/reader/files_available_systest.go` (systest-only)
+  activates the hook when `JOURNALPUMP_FILES_AVAILABLE=1` is set — the
+  Go analogue of the Python sitecustomize shim. The production binary
+  (untagged) never compiles that file, so the hook stays nil there.
 - `create_journald_reader_if_missing` records the attempt BEFORE the
   attempt (`last_journald_create_attempt = time.monotonic()` first),
   recreations always pass `seek_to=self.cursor`.
@@ -766,12 +769,17 @@ Accepted deviations (to be flagged for review):
 
 Task 16 forward notes from this task:
 
-- **match_value=None guard**: Python's `entry.get(match_key) ==
-  match_value` with an UNSET match_value (None) never matches anything.
-  `CheckMatch("", value)` with an empty matchValue would instead match
-  empty-string fields. The Task 16 wiring must treat an unset
-  match_value as never-match (or not call CheckMatch with one), never
-  as empty-string-match.
+- **match_value=None guard — CORRECTED in Task 16 review**: this note
+  originally claimed an unset (None) match_value "never matches
+  anything"; that was WRONG and has been reversed. Python's
+  `entry.get(match_key) == match_value` compares `None == None` when
+  the key is ABSENT (or explicitly null), so a nil match_value MATCHES
+  entries missing the key; only a present, non-null value is unequal to
+  None. Go's `checkMatch` now returns `matchValue == nil` for an absent
+  key and `PythonEqual(field.Value, matchValue)` for a present one, at
+  both the pump and reader levels (journalpump.py:647-652). The
+  empty-string-field concern was a red herring: an empty string is a
+  present value and equals only an empty-string match_value, never nil.
 - **Read-error handler**: `ReadBatch` ends early on ANY read failure
   (ErrBadMessage, errFieldWithoutEquals, I/O). Task 16's
   read_single_message port must catch ALL of them like Python's broad
@@ -848,33 +856,90 @@ Parity-critical behavior reproduced exactly:
 - The too-large truncation record, cached after truncation, with the
   once-per-handler `journal.read_error` counter.
 
-Recorded deviations:
+Not deviations (reclassified in the Task 16 review):
 
-- One goroutine per reader (plus one per sender loop) replaces Python's
-  single-threaded poll loop; the global idle-refresh gate
-  (`if not lines`) is reproduced with a pump-level atomic counter
-  (`linesRead.Swap(0)`), so the decision stays GLOBAL as in Python.
-- Readers and senders are constructed in sorted-name order (Go map
-  decode loses document order); Python iterates dict insertion order.
-- Search-hits logging merges readers in sorted order and renders the
-  dict with sorted keys (`pythonDictString`) — Python renders insertion
-  order.
+- One goroutine per reader (plus one per sender loop) is the plan's
+  prescribed shape (spec §4.3, plan Task 16) — not a deviation. The
+  global idle-refresh gate (`if not lines`) is reproduced with a
+  pump-level atomic counter (`linesRead.Swap(0)`), so the decision stays
+  GLOBAL as in Python.
 - State save compares typed states with `reflect.DeepEqual` (Python
-  compares the parsed dicts); the writer is Go-native.
+  compares the parsed dicts) — equivalent, not a deviation; the writer
+  is Go-native.
+
+Cosmetic, coordinator-approved changes (rulings recorded with
+rationale — log wording / diagnostic text only):
+
+- Search-hits logging renders the dict with sorted keys
+  (`pythonDictString`) and merges readers in sorted order — Python
+  renders insertion order. Ruling: cosmetic (log wording only).
+- `extra_field_values` non-object warning renders the raw JSON text
+  rather than Python's `%r`. Ruling: cosmetic (diagnostic text only).
+
+Recorded deviations (kept):
+
+- Readers are constructed in sorted-name order (the Go map decode loses
+  document order); Python iterates `new_config.items()`. Senders are
+  NOT affected: `initialize_senders` now iterates the config document
+  order (`ReaderConfig.SenderOrder`), and traversal uses the
+  successful-initialization order, so the shared serialization cache
+  captures the same sender as Python (quirk-lock tests:
+  `TestProcessSenderOrderDecidesCacheKey`, `TestSenderNamesInOrder`).
 - A `journald_filters` dict is a construction error (Python raises
   TypeError mid-run at `add_match`).
 - Unknown `output_type` / `field_filter` / `unit_log_level` / journal
   flag names are construction errors — Python crashes with
   KeyError/ValueError/AttributeError inside `get_reader`.
-- A non-numeric `max_send_interval` is a failed sender (Python reaches
-  the run-loop float comparison and crashes with TypeError).
-- `extra_field_values` non-object warning renders the raw JSON text
-  rather than Python's `%r`; the truncated-preview log renders Go `%q`;
-  `FileNotFoundError` renders as the wrapped Go error text.
+- A non-numeric `max_send_interval` is REJECTED AT LOAD
+  (`config.decodeSenders`, strict-typing-at-load policy) — Python
+  reaches the run-loop float comparison and crashes with TypeError
+  mid-run; previously the port degraded it to a failed sender, which
+  could report the daemon ready.
+- The truncated-preview log renders Go `%q`; `FileNotFoundError`
+  renders as the wrapped Go error text.
 - `Open` closes handles on partial failure (Python can leave a
   partially-initialized reader behind).
 - A truncated-entry preview that is not valid UTF-8 returns an error
   (→ broad handler), where Python's `json.dumps` raises
   UnicodeDecodeError from the same point.
+- File-sender buffering vs Python: steady-state writes are buffered in
+  131072 bytes exactly like Python's `BufferedWriter` (a small batch is
+  not visible on disk). The deviation is the SHUTDOWN FLUSH: Go flushes
+  the buffer on Close inside the D9 grace window, so the tail reaches
+  the file; Python's `BufferedWriter` is never flushed and the daemon
+  thread dies with the tail buffered on SIGTERM. This is exactly the
+  sanctioned D9 deviation (no new §2 entry).
 - `write_running_config` and journald (`logging`) output are deferred
   to Task 17.
+
+Additional parity-critical behavior pinned in this task's review:
+
+- `check_match` with a nil `match_value` MATCHES an absent/null key
+  (Python `entry.get(match_key) == None`); a present non-null value
+  still never equals nil. The Task 15 note claiming the opposite was
+  wrong and is corrected above.
+- Emptiness is checked BEFORE the field filter, and a whitelist that
+  removes every field serializes and enqueues `{}` (advancing that
+  sender's cursor) — `TestProcessWhitelistEmptiesToBraces`.
+- Numeric match equality is exact: distinct int64 values above 2^53
+  never collapse through float64, and int-vs-float equality never
+  rounds (`TestPythonEqualLargeIntegers`).
+- The supervisor uses `errgroup.WithContext` for the readers with
+  separately-controlled sender cancellation; a reader error cancels
+  the other readers and propagates as `Run`'s result, while senders
+  stay alive through the D9 grace window. A STOPPING notification error
+  is preserved as `Run`'s result but never skips cleanup
+  (`TestShutdownCleanupDespiteNotifyError`, `TestPumpRunSupervisor`,
+  `TestPumpRunReaderErrorPropagates`).
+- Cancellation is checked before each read and before opening/
+  initializing readers, so a senderless or filtered chunk cannot be
+  consumed (or advance the saved cursor) after SIGTERM
+  (`TestReadMessagesStopsAtCancellation`).
+- The launched-binary e2e test (`systest-go/TestFileSenderEndToEnd`,
+  `make systest-go`) stages the fixture journals, runs the real binary
+  (built `-tags systest`; the files-available shim activates only via
+  `JOURNALPUMP_FILES_AVAILABLE=1`), drives SIGTERM, and asserts all 40
+  output bytes against the Python fixture, the state file, and exit 0.
+  The file fixture now pins all 40 lines (the capture composes an
+  unbuffered-open shim; the first 10 remain byte-identical to the
+  previously pinned prefix).

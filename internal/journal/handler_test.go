@@ -300,6 +300,38 @@ func TestProcessExtraFieldContamination(t *testing.T) {
 	}
 }
 
+// TestProcessSharedFilterCacheLockedToFirst locks the serialization-cache
+// quirk: two senders sharing one field-filter NAME reuse the first's
+// cached bytes verbatim, so the second's own extra_field_values never
+// reach its payload.
+func TestProcessSharedFilterCacheLockedToFirst(t *testing.T) {
+	ff := filter.NewFieldFilter("shared", config.FieldFilterConfig{
+		Whitelist: true,
+		Fields:    []string{"MESSAGE", "EXTRA"},
+	})
+	a, b := &collector{}, &collector{}
+	h := NewHandler(HandlerConfig{ReaderName: "r"})
+	entry := Entry{Cursor: "c", Fields: []Field{{Key: "MESSAGE", Value: "x"}}}
+	if _, _, _, err := h.Process(entry, []SenderTarget{
+		target(ff, nil, []Field{{Key: "EXTRA", Value: "from-a"}}, a),
+		target(ff, nil, []Field{{Key: "EXTRA", Value: "from-b"}}, b),
+	}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(a.items) != 1 || len(b.items) != 1 {
+		t.Fatalf("items = %d %d, want 1 1", len(a.items), len(b.items))
+	}
+	for name, items := range map[string][][]byte{"a": a.items, "b": b.items} {
+		var parsed map[string]any
+		if err := json.Unmarshal(items[0], &parsed); err != nil {
+			t.Fatalf("%s payload: %v", name, err)
+		}
+		if parsed["EXTRA"] != "from-a" {
+			t.Errorf("%s EXTRA = %v, want from-a (first serialization cached)", name, parsed["EXTRA"])
+		}
+	}
+}
+
 // TestProcessTruncation locks the too-large path: the entry is replaced
 // by the error record, the counter fires once per handler, and the
 // record IS cached for the next sender.
@@ -380,6 +412,7 @@ func TestCheckMatch(t *testing.T) {
 		{"string equality", "SYSLOG_IDENTIFIER", "svc", true},
 		{"string inequality", "SYSLOG_IDENTIFIER", "other", false},
 		{"missing field", "NOPE", "x", false},
+		{"nil value matches missing field", "NOPE", nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -436,5 +469,119 @@ func TestProcessFallbackTimestamp(t *testing.T) {
 	}
 	if got := parsed["timestamp"]; got != "2026-01-02T03:04:05" {
 		t.Errorf("timestamp = %v, want 2026-01-02T03:04:05", got)
+	}
+}
+
+// TestProcessWhitelistEmptiesToBraces locks the ordering that the review
+// corrected: Python checks emptiness BEFORE the field filter, then
+// serializes and enqueues {} when a whitelist removes every field
+// (journalpump.py:777-784).
+func TestProcessWhitelistEmptiesToBraces(t *testing.T) {
+	ff := filter.NewFieldFilter("ff", config.FieldFilterConfig{
+		Whitelist: true,
+		Fields:    []string{"NOT_PRESENT"},
+	})
+	c := &collector{}
+	h := NewHandler(HandlerConfig{ReaderName: "r"})
+	entry := Entry{Cursor: "c", Fields: []Field{
+		{Key: "MESSAGE", Value: "x"},
+		{Key: "PRIORITY", Value: int64(6)},
+	}}
+	hasMore, bytesRead, hasBytes, err := h.Process(entry, []SenderTarget{target(ff, nil, nil, c)})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if !hasMore || !hasBytes {
+		t.Fatalf("got hasMore=%v hasBytes=%v, want true true", hasMore, hasBytes)
+	}
+	if len(c.items) != 1 {
+		t.Fatalf("items = %d, want 1 ({} is enqueued, not dropped)", len(c.items))
+	}
+	if got := string(c.items[0]); got != "{}" {
+		t.Errorf("payload = %s, want {}", got)
+	}
+	if c.cursors[0] != "c" {
+		t.Errorf("cursor = %q, want c (the sender advances)", c.cursors[0])
+	}
+	if bytesRead != 2 {
+		t.Errorf("bytesRead = %d, want 2 (len(\"{}\"))", bytesRead)
+	}
+}
+
+// TestProcessMatchValueNilMatchesAbsent locks the corrected check_match:
+// a nil match_value matches an entry MISSING the key (Python's
+// entry.get(match_key) == None), at both the pump and reader levels.
+func TestProcessMatchValueNilMatchesAbsent(t *testing.T) {
+	pumpC := &collector{}
+	h := NewHandler(HandlerConfig{
+		ReaderName:     "r",
+		PumpMatchKey:   "SYSLOG_IDENTIFIER",
+		PumpMatchValue: nil,
+	})
+	// Entry has NO SYSLOG_IDENTIFIER field.
+	entry := Entry{Cursor: "c", Fields: []Field{{Key: "MESSAGE", Value: "x"}}}
+	hasMore, _, hasBytes, err := h.Process(entry, []SenderTarget{target(nil, nil, nil, pumpC)})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if !hasMore || !hasBytes || len(pumpC.items) != 1 {
+		t.Errorf("pump nil match_value absent key: got hasMore=%v hasBytes=%v items=%d, want true true 1",
+			hasMore, hasBytes, len(pumpC.items))
+	}
+
+	readerC := &collector{}
+	h = NewHandler(HandlerConfig{
+		ReaderName:       "r",
+		ReaderMatchKey:   "SYSLOG_IDENTIFIER",
+		ReaderMatchValue: nil,
+	})
+	hasMore, _, hasBytes, err = h.Process(entry, []SenderTarget{target(nil, nil, nil, readerC)})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if !hasMore || !hasBytes || len(readerC.items) != 1 {
+		t.Errorf("reader nil match_value absent key: got hasMore=%v hasBytes=%v items=%d, want true true 1",
+			hasMore, hasBytes, len(readerC.items))
+	}
+
+	// A present non-null value still never equals nil.
+	readerC2 := &collector{}
+	h = NewHandler(HandlerConfig{
+		ReaderName:       "r",
+		ReaderMatchKey:   "SYSLOG_IDENTIFIER",
+		ReaderMatchValue: nil,
+	})
+	present := Entry{Cursor: "c", Fields: []Field{{Key: "SYSLOG_IDENTIFIER", Value: "svc"}}}
+	if _, _, _, err := h.Process(present, []SenderTarget{target(nil, nil, nil, readerC2)}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(readerC2.items) != 0 {
+		t.Errorf("present value vs nil match_value: items = %d, want 0", len(readerC2.items))
+	}
+}
+
+// TestPythonEqualLargeIntegers locks exact integer matching: adjacent
+// int64 values above 2^53 stay distinct (no float64 collapse), and int
+// vs float equality never rounds.
+func TestPythonEqualLargeIntegers(t *testing.T) {
+	const a = int64(1) << 53 // 9007199254740992
+	const b = a + 1          // 9007199254740993
+	if PythonEqual(a, b) {
+		t.Errorf("PythonEqual(%d, %d) = true, want false (distinct ints above 2^53)", a, b)
+	}
+	if PythonEqual(a, float64(a)) != true {
+		t.Errorf("PythonEqual(%d, float64(%d)) = false, want true", a, a)
+	}
+	// float64(b) rounds to float64(a) == 2^53; Python's int.__eq__ must
+	// not treat b as equal to that float.
+	if PythonEqual(b, float64(b)) {
+		t.Errorf("PythonEqual(%d, float64(%d)) = true, want false (float rounds)", b, b)
+	}
+	// json.Number integer literals compare exactly too.
+	if PythonEqual(json.Number("9007199254740993"), int64(9007199254740993)) != true {
+		t.Error("json.Number int64 literal should equal the same int64")
+	}
+	if PythonEqual(json.Number("9007199254740993"), int64(9007199254740992)) {
+		t.Error("json.Number literal collapsed two distinct large ints")
 	}
 }

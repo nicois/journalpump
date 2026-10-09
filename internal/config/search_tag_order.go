@@ -8,6 +8,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 )
 
 // tagOrders carries the document-order data the token walk captured
@@ -24,6 +25,12 @@ type tagOrders struct {
 	// (internal/journal, Task 16) turns into the Python construction
 	// order the wire format needs.
 	extraFields map[string]map[string]json.RawMessage
+	// senders maps reader name -> the sender names in config document
+	// order. Python iterates configured_senders.items() (insertion
+	// order) in initialize_senders, and that order decides which sender
+	// first populates the per-message serialization cache — observable
+	// through the extra_field_values contamination quirk.
+	senders map[string][]string
 }
 
 // captureTagOrders walks the raw config JSON and returns (a) the
@@ -51,6 +58,7 @@ func captureTagOrders(data []byte) tagOrders {
 		out: tagOrders{
 			readers:     map[string][][]string{},
 			extraFields: map[string]map[string]json.RawMessage{},
+			senders:     map[string][]string{},
 		},
 	}
 	_ = w.walkDocument() // malformed JSON is reported by the main decode
@@ -189,6 +197,7 @@ func (w *tagOrderWalker) walkReader(name string) error {
 	// for a previous occurrence so they do not leak into the kept one.
 	w.out.readers[name] = nil
 	w.out.extraFields[name] = nil
+	w.out.senders[name] = nil
 	defer func() { w.reader, w.searchIndex = previousReader, previousIndex }()
 	d, ok, err := w.openContainer()
 	if err != nil || !ok || d != '{' {
@@ -240,6 +249,12 @@ func (w *tagOrderWalker) walkSenders() error {
 		w.out.extraFields[w.reader] = map[string]json.RawMessage{}
 	}
 	return w.objectEntries(func(senderName string) error {
+		// Document order, first occurrence wins (a duplicate key keeps
+		// its first position in a Python dict while the value is
+		// overwritten).
+		if !slices.Contains(w.out.senders[w.reader], senderName) {
+			w.out.senders[w.reader] = append(w.out.senders[w.reader], senderName)
+		}
 		d, ok, err := w.openContainer()
 		if err != nil || !ok || d != '{' {
 			return err // non-object sender entry: the main decode errors later

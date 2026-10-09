@@ -164,6 +164,12 @@ type ReaderConfig struct {
 	// decodes its own key set (per-sender defaults are applied by the
 	// sender constructors, as in Python).
 	Senders map[string]any
+	// SenderOrder holds the "senders" keys in config document order.
+	// Python iterates configured_senders.items() in initialize_senders,
+	// and that order is observable: the first successfully initialized
+	// sender to claim a field-filter cache key decides which sender's
+	// extra_field_values land in the shared processed entry.
+	SenderOrder []string
 	// ExtraFieldValuesRaw holds, per sender name, the raw JSON of the
 	// sender's extra_field_values subtree, captured with document key
 	// order by the token walk (map decoding discards order, but the

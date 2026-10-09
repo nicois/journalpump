@@ -44,8 +44,8 @@ func fixturePath(parts ...string) string {
 
 // TestFileSenderGoldenPipeline drives the real reader -> handler ->
 // buffer -> file sender pipeline over the Task 11 rotated-log fixture and
-// asserts the first ten output lines byte-for-byte against the captured
-// ground truth, plus the loop's sent count and cursor.
+// asserts ALL 40 output lines byte-for-byte against the captured ground
+// truth, plus the loop's sent count and cursor.
 func TestFileSenderGoldenPipeline(t *testing.T) {
 	rawFixture, err := os.ReadFile(fixturePath("systest-go", "fixtures", "file_sender.json"))
 	if err != nil {
@@ -164,5 +164,61 @@ func TestFileSenderGoldenPipeline(t *testing.T) {
 	}
 	if st.Type != "FileSender" {
 		t.Errorf("state type = %q, want FileSender", st.Type)
+	}
+}
+
+// TestBufferedVisibilityAndFlushOnClose locks Python's BufferedWriter
+// semantics: a small batch stays in the buffer (not visible on disk),
+// and the explicit flush on Close (the D9 deviation) makes it visible.
+func TestBufferedVisibilityAndFlushOnClose(t *testing.T) {
+	outPath := filepath.Join(t.TempDir(), "out.log")
+	inst, err := New(sender.ConstructorArgs{
+		Name:   "s",
+		Config: map[string]any{"output_type": "file", "file_output": outPath},
+		Tags:   tagged.New(nil),
+	})
+	if err != nil {
+		t.Fatalf("file.New: %v", err)
+	}
+	tr, ok := inst.Transport.(*Sender)
+	if !ok {
+		t.Fatalf("transport type %T", inst.Transport)
+	}
+
+	if err := tr.SendMessages(context.Background(), [][]byte{[]byte("a"), []byte("b")}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	// Small writes stay buffered (Python never flushes mid-run).
+	info, err := os.Stat(outPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("size after buffered write = %d, want 0 (not yet flushed)", info.Size())
+	}
+
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(raw); got != "a\nb\n" {
+		t.Errorf("output = %q, want \"a\\nb\\n\"", got)
+	}
+}
+
+// TestNewRejectsNonNumericInterval locks the constructor guard kept as
+// defense-in-depth behind the load-time strict typing: a non-numeric
+// max_send_interval fails initialization.
+func TestNewRejectsNonNumericInterval(t *testing.T) {
+	_, err := New(sender.ConstructorArgs{
+		Name:   "s",
+		Config: map[string]any{"output_type": "file", "file_output": filepath.Join(t.TempDir(), "x"), "max_send_interval": "fast"},
+		Tags:   tagged.New(nil),
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a number") {
+		t.Fatalf("err = %v, want a not-a-number error", err)
 	}
 }

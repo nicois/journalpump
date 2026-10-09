@@ -77,6 +77,22 @@ func TestRunExitCodes(t *testing.T) {
 		}
 	})
 
+	t.Run("non-numeric max_send_interval exits 1 at load", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "journalpump.json")
+		bad := `{"readers": {"r": {"senders": {"s": {"output_type": "file", "file_output": "/tmp/x", "max_send_interval": "fast"}}}}}`
+		if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		code, _, stderr := runInTempDir(t, []string{path})
+		if code != 1 {
+			t.Errorf("exit code = %d, want 1 (rejected at load, never reported ready)", code)
+		}
+		if !bytes.Contains([]byte(stderr), []byte("max_send_interval: must be a number")) {
+			t.Errorf("stderr = %q, want the max_send_interval load error", stderr)
+		}
+	})
+
 	t.Run("existing config file", func(t *testing.T) {
 		t.Parallel()
 		path := filepath.Join(t.TempDir(), "journalpump.json")

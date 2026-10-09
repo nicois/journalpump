@@ -515,6 +515,35 @@ func TestCaptureStatsdTagOrderAbsent(t *testing.T) {
 	}
 }
 
+// TestCaptureSenderOrder: the reader's "senders" keys are captured in
+// config document order, matching Python's configured_senders.items()
+// iteration in initialize_senders.
+func TestCaptureSenderOrder(t *testing.T) {
+	t.Parallel()
+	cfg := mustDecode(t, `{
+        "readers": {"r": {"senders": {
+            "zulu": {"output_type": "file", "file_output": "/tmp/z"},
+            "alpha": {"output_type": "file", "file_output": "/tmp/a"},
+            "mike": {"output_type": "file", "file_output": "/tmp/m"}
+        }}}
+    }`)
+	want := []string{"zulu", "alpha", "mike"}
+	if got := cfg.Readers["r"].SenderOrder; !reflect.DeepEqual(got, want) {
+		t.Errorf("SenderOrder = %v want %v", got, want)
+	}
+	// A duplicate key keeps its first position (Python dict semantics).
+	dup := mustDecode(t, `{
+        "readers": {"r": {"senders": {
+            "b": {"output_type": "file", "file_output": "/tmp/b"},
+            "a": {"output_type": "file", "file_output": "/tmp/a"},
+            "b": {"output_type": "file", "file_output": "/tmp/b2"}
+        }}}
+    }`)
+	if got := dup.Readers["r"].SenderOrder; !reflect.DeepEqual(got, []string{"b", "a"}) {
+		t.Errorf("duplicate SenderOrder = %v want [b a]", got)
+	}
+}
+
 // TestDecodeToleratedValues: values Python accepts without error keep
 // loading with the same semantics.
 func TestDecodeToleratedValues(t *testing.T) {
@@ -585,6 +614,8 @@ func TestDecodeRejectsWrongTypedValues(t *testing.T) {
 		{"threshold wrong type", `{"readers": {"r": {"threshold_for_metric_emit": "10", "senders": {}}}}`, "readers.r.threshold_for_metric_emit: must be an integer"},
 		{"senders wrong type", `{"readers": {"r": {"senders": []}}}`, "readers.r.senders: must be an object"},
 		{"sender wrong type", `{"readers": {"r": {"senders": {"s": "kafka"}}}}`, "readers.r.senders.s: must be an object"},
+		{"max_send_interval non-numeric", `{"readers": {"r": {"senders": {"s": {"output_type": "file", "file_output": "/tmp/x", "max_send_interval": "fast"}}}}}`, "readers.r.senders.s.max_send_interval: must be a number"},
+		{"max_send_interval bool", `{"readers": {"r": {"senders": {"s": {"output_type": "file", "file_output": "/tmp/x", "max_send_interval": true}}}}}`, "readers.r.senders.s.max_send_interval: must be a number"},
 		{"secret_filters not a list", `{"readers": {"r": {"secret_filters": {"pattern": "x"}}}}`, "invalid secret_filters configuration - must be a list"},
 		{"secret_filters not a list (entry)", `{"readers": {"r": {"secret_filters": ["x"]}}}`, "invalid secret_filters configuration - must be a list"},
 		{"secret_filter missing replacement", `{"readers": {"r": {"secret_filters": [{"pattern": "x"}]}}}`, "invalid secret_filters configuration - missing field 'replacement'"},

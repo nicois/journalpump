@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"strings"
 	"time"
@@ -272,10 +273,15 @@ func (h *Handler) getOrGenerateJSON(
 		*data = MergeExtraFields(*data, extraFieldValues)
 	}
 
-	// Python: `if unit_log_levels:` — the object is truthy whenever
-	// configured. A dropped entry returns None and is NOT cached
-	// (journalpump.py:771-779).
+	// Python: `if unit_log_levels:` — a dropped entry freezes the data
+	// to {} (journalpump.py:771-775), which the emptiness check below
+	// turns into None; it is NOT cached.
 	if unitLogLevels != nil && !unitLogLevels.Filter(fieldMap(*data)) {
+		return nil, nil
+	}
+	if len(*data) == 0 {
+		// Python's `if not data: return None` (journalpump.py:777-779)
+		// runs BEFORE the field filter.
 		return nil, nil
 	}
 
@@ -283,18 +289,16 @@ func (h *Handler) getOrGenerateJSON(
 	if fieldFilter != nil {
 		// Python's filter_fields dict comprehension keeps the dict's
 		// (construction) order; the processed slice is exactly that
-		// order, so a Keep sweep reproduces the wire key order.
+		// order, so a Keep sweep reproduces the wire key order. A
+		// whitelist that removes every field yields {} — serialized and
+		// enqueued as "{}", advancing that sender's cursor
+		// (journalpump.py:781-784 has no emptiness re-check).
 		filtered = make([]Field, 0, len(*data))
 		for _, field := range *data {
 			if fieldFilter.Keep(field.Key) {
 				filtered = append(filtered, field)
 			}
 		}
-	}
-	if len(filtered) == 0 {
-		// Python: `if not data: return None` (empty dict — e.g. an empty
-		// entry with no unit levels configured).
-		return nil, nil
 	}
 
 	jsonEntry, err := Serialize(filtered)
@@ -386,39 +390,41 @@ func (h *Handler) truncateLongMessage(jsonEntry []byte, timestamp any) ([]byte, 
 	return Serialize(entry)
 }
 
-// checkMatch ports check_match (journalpump.py:642-653) for the
-// pump- and reader-level match pairs against the processed entry:
+// checkMatch ports check_match (journalpump.py:647-652) for the pump-
+// and reader-level match pairs against the processed entry:
 // `entry.get(match_key) == match_value`. An unset match_key passes
-// everything; an unset match_value (nil — key absent or JSON null)
-// NEVER matches: Python compares against None, which a present field's
-// converted value never equals, and the Task 15 pinned guard wires the
-// absent-key-equals-None corner as never-match too (parity doc).
+// everything. A nil match_value MATCHES when the key is absent (Python's
+// dict.get yields None) or explicitly null — and only then, since a
+// present, non-null value is never == None. (Task 15 pinned the
+// opposite; the Python probe in the Task 16 review disproved it — see
+// the parity doc.)
 func checkMatch(fields []Field, matchKey string, matchValue any) bool {
 	if matchKey == "" {
 		return true
-	}
-	if matchValue == nil {
-		return false
 	}
 	for _, field := range fields {
 		if field.Key == matchKey {
 			return PythonEqual(field.Value, matchValue)
 		}
 	}
-	return false
+	// Key absent: Python's entry.get(match_key) is None.
+	return matchValue == nil
 }
 
 // PythonEqual compares a converted entry value against a config-decoded
 // match_value with Python's == semantics: numbers compare by value
-// across int/float/bool (True == 1), strings by content, None only to
-// None, lists elementwise, dicts key-wise. Bytes never equal strings
-// (Python b"x" == "x" is False), and a structurally different type is
-// unequal like Python's __eq__ default.
+// across int/float/bool (True == 1) with EXACT integer comparison —
+// two distinct int64 values above 2^53 never collapse, and an int
+// equals a float only when the float's exact value is that integer
+// (Python's int.__eq__ never rounds). Strings compare by content, None
+// only to None, lists elementwise, dicts key-wise. Bytes never equal
+// strings (Python b"x" == "x" is False), and a structurally different
+// type is unequal like Python's __eq__ default.
 func PythonEqual(a, b any) bool {
-	numA, okA := asPythonNumberValue(a)
-	numB, okB := asPythonNumberValue(b)
+	numA, okA := asPythonNumber(a)
+	numB, okB := asPythonNumber(b)
 	if okA && okB {
-		return numA == numB
+		return numA.equal(numB)
 	}
 	if okA != okB {
 		return false // Python: a number never equals a string/None/bytes
@@ -460,27 +466,68 @@ func PythonEqual(a, b any) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-// asPythonNumberValue renders the numeric view of a Python == operand:
-// bool/int64/float64/json.Number. Bool maps to 1/0 (Python's bool is an
-// int subclass). json.Number integers keep exact int64 comparison when
-// representable.
-func asPythonNumberValue(v any) (float64, bool) {
+// pyNumber is the numeric view of a Python == operand: ints keep their
+// exact int64 value, floats their float64 (Python's bool is an int
+// subclass, so booleans fold into the integer side).
+type pyNumber struct {
+	isInt bool
+	i     int64
+	f     float64
+}
+
+// equal implements Python's numeric ==: ints compare exactly; an int and
+// a float are equal only when the float's exact value is that integer
+// (never rounding through float64, so distinct ints above 2^53 stay
+// distinct).
+func (n pyNumber) equal(m pyNumber) bool {
+	switch {
+	case n.isInt && m.isInt:
+		return n.i == m.i
+	case n.isInt:
+		return intEqualsFloat(n.i, m.f)
+	case m.isInt:
+		return intEqualsFloat(m.i, n.f)
+	default:
+		return n.f == m.f
+	}
+}
+
+// intEqualsFloat reports i == f without precision loss: f must be finite,
+// integral, in int64 range, and int64(f) must be exactly i.
+func intEqualsFloat(i int64, f float64) bool {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
+		return false
+	}
+	if f < float64(math.MinInt64) || f >= float64(math.MaxInt64) {
+		return false
+	}
+	return int64(f) == i
+}
+
+// asPythonNumber renders the numeric view of a Python == operand:
+// bool/int64/int/float64/json.Number.
+func asPythonNumber(v any) (pyNumber, bool) {
 	switch typed := v.(type) {
 	case bool:
 		if typed {
-			return 1, true
+			return pyNumber{isInt: true, i: 1}, true
 		}
-		return 0, true
+		return pyNumber{isInt: true, i: 0}, true
 	case int64:
-		return float64(typed), true
+		return pyNumber{isInt: true, i: typed}, true
+	case int:
+		return pyNumber{isInt: true, i: int64(typed)}, true
 	case float64:
-		return typed, true
+		return pyNumber{f: typed}, true
 	case json.Number:
+		if i, err := typed.Int64(); err == nil {
+			return pyNumber{isInt: true, i: i}, true
+		}
 		if f, err := typed.Float64(); err == nil {
-			return f, true
+			return pyNumber{f: f}, true
 		}
 	}
-	return 0, false
+	return pyNumber{}, false
 }
 
 // fieldMap renders the fields as a plain map — the view Python's dict

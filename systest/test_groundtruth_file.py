@@ -8,14 +8,13 @@ Runs the real Python binary against the four fixture journals with a
 ``file`` sender and pins the bytes it writes to the output file.
 
 The Python FileSender opens the output with ``open(..., "ab")`` and
-never flushes or closes it; a write only reaches the file when a later
-write would overflow the BufferedWriter. ``extra_field_values`` padding
-makes each payload large enough that intermediate flushes happen during
-the run, so the file ends up holding a deterministic PREFIX of the sent
-messages (the tail stays buffered and is lost when the daemon sender
-thread dies on SIGTERM — Python behavior, pinned by Task 17's D9
-deviation note). The fixture pins the first 10 lines, which is stable
-across ``io.DEFAULT_BUFFER_SIZE`` values.
+never flushes or closes it; on SIGTERM the buffered tail is lost. The
+capture composes an unbuffered-write shim for the output path so the
+committed fixture holds the FULL 40-message output — the same bytes the
+Go sender produces, since Go flushes its BufferedWriter within the D9
+shutdown grace window. The steady-state buffering itself stays
+Python-faithful (Go buffers 131072 bytes, exactly like Python's
+BufferedWriter); only the shutdown flush differs (the D9 deviation).
 """
 
 from systest import groundtruth_support as gt
@@ -24,8 +23,8 @@ from pathlib import Path
 import pytest
 
 _FIXTURE_NAME = "file_sender"
-_PAD = "x" * 3072  # forces BufferedWriter flushes during the run
-_EXPECTED_LINES = 10
+_PAD = "x" * 3072  # keeps every payload a realistic multi-KB line
+_EXPECTED_LINES = 40  # Messages 0..39
 
 
 def _config(state_path: Path, output_path: Path, journal_path: Path) -> dict:
@@ -43,15 +42,18 @@ def test_file_sender_wire_bytes(tmp_path: Path) -> None:
     output_path = tmp_path / "output.jsonl"
     state_path = tmp_path / "state.json"
 
-    with gt.groundtruth_pump(_config(state_path, output_path, journal_path), tmp_path) as process:
+    unbuffered_shim = gt.SHIM_UNBUFFERED_FILE.format(target=str(output_path))
+    with gt.groundtruth_pump(
+        _config(state_path, output_path, journal_path), tmp_path, extra_shim=unbuffered_shim
+    ) as process:
         gt.wait_until(
             lambda: output_path.exists() and sum(1 for _ in open(output_path, "rb")) >= _EXPECTED_LINES,
-            description=f"{_EXPECTED_LINES} flushed output lines",
+            description=f"{_EXPECTED_LINES} output lines",
         )
         process.stop()
 
     lines = output_path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) >= _EXPECTED_LINES  # the buffered tail may still be lost; the prefix is deterministic
+    assert len(lines) == _EXPECTED_LINES  # unbuffered shim: the full output is on disk
     sent = gt.read_sender_state(state_path, "out")["sent"]
     if fixture is None or gt.update_mode():
         fixture = {
@@ -59,6 +61,7 @@ def test_file_sender_wire_bytes(tmp_path: Path) -> None:
             "capture": {
                 "journals": "systest/data/rotated_logs/*.journal (Messages 0..39)",
                 "sender": {"output_type": "file", "extra_field_values": {"PADDING": _PAD}},
+                "shim": "unbuffered open() for the output path (capture only; steady-state buffering is Python-faithful)",
             },
             "expected": {
                 "lines": lines[:_EXPECTED_LINES],
@@ -66,10 +69,10 @@ def test_file_sender_wire_bytes(tmp_path: Path) -> None:
                 "sent_cursor": sent["cursor"],
             },
             "notes": [
-                "file content is a PREFIX of the sent messages: Python never flushes the "
-                "FileSender BufferedWriter, the daemon sender thread dies with the tail buffered",
-                f"first {_EXPECTED_LINES} lines pinned; byte-exact payload JSON per line",
-                "Go parity: same payload bytes per line, same sent.cursor/count state values",
+                "full 40-message output pinned; byte-exact payload JSON per line",
+                "Go parity: identical payload bytes per line, same sent.cursor/count state values",
+                "D9 deviation: Python's BufferedWriter tail is lost on SIGTERM; Go flushes it within the "
+                "shutdown grace window, so Go reaches all 40 lines without the capture shim",
             ],
         }
         gt.save_fixture(_FIXTURE_NAME, fixture)

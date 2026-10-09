@@ -59,7 +59,7 @@ func newConfig(raw map[string]any, orders tagOrders) (*Config, error) {
 	if cfg.UnitLogLevels, err = decodeUnitLogLevels(raw); err != nil {
 		return nil, err
 	}
-	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw, orders.readers, orders.extraFields); err != nil {
+	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw, orders.readers, orders.extraFields, orders.senders); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -253,6 +253,7 @@ func decodeReaders(
 	raw map[string]any,
 	searchTagOrders map[string][][]string,
 	extraFieldValues map[string]map[string]json.RawMessage,
+	senderOrders map[string][]string,
 ) (map[string]ReaderConfig, map[string]any, error) {
 	readers := map[string]ReaderConfig{}
 	value, ok := raw["readers"]
@@ -269,7 +270,7 @@ func decodeReaders(
 		if !ok {
 			return nil, nil, fmt.Errorf("readers.%s: must be an object", name)
 		}
-		reader, err := decodeReader(name, entry, searchTagOrders[name], extraFieldValues[name])
+		reader, err := decodeReader(name, entry, searchTagOrders[name], extraFieldValues[name], senderOrders[name])
 		if err != nil {
 			return nil, nil, err
 		}
@@ -283,6 +284,7 @@ func decodeReader(
 	entry map[string]any,
 	searchTagOrder [][]string,
 	extraFieldValues map[string]json.RawMessage,
+	senderOrder []string,
 ) (ReaderConfig, error) {
 	reader := ReaderConfig{Name: name}
 	var err error
@@ -328,6 +330,7 @@ func decodeReader(
 		return reader, err
 	}
 	reader.ExtraFieldValuesRaw = extraFieldValues
+	reader.SenderOrder = senderOrder
 	return reader, nil
 }
 
@@ -459,11 +462,29 @@ func decodeSenders(entry map[string]any, name string) (map[string]any, error) {
 		return nil, fmt.Errorf("%s.senders: must be an object", readerPath(name))
 	}
 	for senderName, senderValue := range senders {
-		if _, ok := senderValue.(map[string]any); !ok {
+		sender, ok := senderValue.(map[string]any)
+		if !ok {
 			return nil, fmt.Errorf("%s.senders.%s: must be an object", readerPath(name), senderName)
+		}
+		// max_send_interval is consumed by the sender base class as a
+		// float; a non-numeric value reaches the run loop's comparison
+		// and crashes Python with TypeError mid-run. Reject it at load
+		// (strict-typing-at-load, spec §6.1a) instead of degrading the
+		// sender to an initialization failure.
+		if raw, present := sender["max_send_interval"]; present && !isJSONNumber(raw) {
+			return nil, fmt.Errorf("%s.senders.%s.max_send_interval: must be a number", readerPath(name), senderName)
 		}
 	}
 	return senders, nil
+}
+
+// isJSONNumber reports whether a decoded JSON value is a number.
+func isJSONNumber(value any) bool {
+	switch value.(type) {
+	case float64, int64, json.Number:
+		return true
+	}
+	return false
 }
 
 // decodeString decodes a required-to-be-string value (used for values with

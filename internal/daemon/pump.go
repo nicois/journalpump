@@ -41,6 +41,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/state"
 	"github.com/Aiven-Open/journalpump/internal/statsd"
 	"github.com/Aiven-Open/journalpump/internal/tagged"
+	"golang.org/x/sync/errgroup"
 )
 
 // pollInterval mirrors poll_interval_ms (journalpump.py:863): the
@@ -296,8 +297,13 @@ type ReaderRuntime struct {
 	initialised   map[string]struct{}
 	failedSenders int
 	senders       map[string]*senderEntry
-	buffers       []*buffer.SenderBuffer
-	gate          *buffer.Gate
+	// senderOrder is the SUCCESSFUL-initialization order (Python's
+	// self.senders dict order): process iterates it, so a sender that
+	// failed at first open and succeeded later lands after the ones
+	// initialized before it.
+	senderOrder []string
+	buffers     []*buffer.SenderBuffer
+	gate        *buffer.Gate
 
 	// reopener is the ensure/invalidate seam (*reader.Reopener or a
 	// test fake); openFlags and initialPosition feed its OpenConfig.
@@ -463,12 +469,11 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 	// Resolve the senders now (see resolvedSender): unknown output
 	// types, field filters, or unit log levels are Python crashes
 	// (KeyError/ValueError inside get_reader) — fail construction.
-	senderNames := make([]string, 0, len(cfg.Senders))
-	for senderName := range cfg.Senders {
-		senderNames = append(senderNames, senderName)
-	}
-	sort.Strings(senderNames)
-	for _, senderName := range senderNames {
+	// CONFIG DOCUMENT ORDER, matching configured_senders.items(): the
+	// order decides which sender first populates the per-message
+	// serialization cache and therefore whose extra_field_values reach
+	// the other senders sharing a field filter (the contamination quirk).
+	for _, senderName := range senderNamesInOrder(cfg.Senders, cfg.SenderOrder) {
 		resolved, err := rt.resolveSender(senderName, cfg.Senders[senderName])
 		if err != nil {
 			return nil, err
@@ -476,6 +481,31 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 		rt.resolved = append(rt.resolved, resolved)
 	}
 	return rt, nil
+}
+
+// senderNamesInOrder returns the sender config keys in document order,
+// falling back to sorted order for synthetic configs (tests) and
+// appending any key the captured order missed.
+func senderNamesInOrder(senders map[string]any, order []string) []string {
+	out := make([]string, 0, len(senders))
+	seen := make(map[string]bool, len(senders))
+	for _, name := range order {
+		if _, ok := senders[name]; ok && !seen[name] {
+			out = append(out, name)
+			seen[name] = true
+		}
+	}
+	if len(out) != len(senders) {
+		rest := make([]string, 0, len(senders)-len(out))
+		for name := range senders {
+			if !seen[name] {
+				rest = append(rest, name)
+			}
+		}
+		sort.Strings(rest)
+		out = append(out, rest...)
+	}
+	return out
 }
 
 // currentCursor reads the cursor (thread-safe: the supervisor's state
@@ -655,6 +685,7 @@ func (rt *ReaderRuntime) initSenders() {
 		}(entry, sctx)
 		rt.initialised[resolved.name] = struct{}{}
 		rt.senders[resolved.name] = entry
+		rt.senderOrder = append(rt.senderOrder, resolved.name)
 		rt.buffers = append(rt.buffers, buf)
 	}
 	rt.failedSenders = len(rt.resolved) - len(rt.initialised)
@@ -743,6 +774,9 @@ func (rt *ReaderRuntime) run(ctx context.Context) error {
 		if rt.ready() && (rt.pending == reader.EventAppend || rt.pending == reader.EventInvalidate) {
 			exhausted, lines, err := rt.readMessages(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil // shutdown
+				}
 				return err
 			}
 			rt.pump.linesRead.Add(int64(lines))
@@ -764,6 +798,9 @@ func (rt *ReaderRuntime) run(ctx context.Context) error {
 		// reader schedules an APPEND ("Check if there is something to
 		// read in newly created reader", journalpump.py:1177-1179).
 		if err := rt.updateStatus(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil // shutdown
+			}
 			return err
 		}
 
@@ -776,8 +813,13 @@ func (rt *ReaderRuntime) run(ctx context.Context) error {
 // updateStatus ports update_status (journalpump.py:232-250): reader
 // recreation (rate-limited), then the readiness transitions with their
 // two log lines.
-func (rt *ReaderRuntime) updateStatus(_ context.Context) error {
+func (rt *ReaderRuntime) updateStatus(ctx context.Context) error {
 	if rt.journaldReader == nil {
+		if ctx.Err() != nil {
+			// Shutdown: do not open a new reader (or initialize its
+			// senders) past the cancellation point.
+			return ctx.Err()
+		}
 		opened, err := rt.reopener.Ensure()
 		switch {
 		case err != nil && errors.Is(err, reader.ErrFilesNotAvailable):
@@ -793,7 +835,9 @@ func (rt *ReaderRuntime) updateStatus(_ context.Context) error {
 		case opened != nil:
 			rt.journaldReader = opened
 			rt.initialSet = false // journalpump.py:476-478
-			rt.initSenders()      // get_reader tail: initialize_senders LAST
+			if ctx.Err() == nil {
+				rt.initSenders() // get_reader tail: initialize_senders LAST
+			}
 			rt.pending = maxEvent(rt.pending, reader.EventAppend)
 		}
 	}
@@ -822,6 +866,13 @@ func (rt *ReaderRuntime) readMessages(ctx context.Context) (exhausted bool, line
 	limitBytes := rt.writeLimitBytes()
 	limitCount := rt.writeLimitCount()
 	for i := 0; i < buffer.ChunkSize; i++ {
+		// Shutdown check before every read: stats-only readers and
+		// search/match-dropped entries never reach Enqueue's ctx check,
+		// so without this SIGTERM could consume a whole chunk (and
+		// advance the saved cursor) after cancellation.
+		if ctx.Err() != nil {
+			return false, lines, nil
+		}
 		if limitBytes <= 0 {
 			return false, lines, nil
 		}
@@ -903,9 +954,20 @@ func (rt *ReaderRuntime) broadHandler(err error) {
 func (rt *ReaderRuntime) process(ctx context.Context, entry journal.Entry) (bool, int, bool, error) {
 	var enqueueErr error
 	rt.mu.Lock()
-	targets := make([]journal.SenderTarget, 0, len(rt.senders))
+	// Iterate the SUCCESSFUL-initialization order (Python's
+	// self.senders.items()); each resolved entry carries the
+	// construction-time filter/extras lookups.
+	resolvedByName := make(map[string]resolvedSender, len(rt.resolved))
 	for _, resolved := range rt.resolved {
-		live, ok := rt.senders[resolved.name]
+		resolvedByName[resolved.name] = resolved
+	}
+	targets := make([]journal.SenderTarget, 0, len(rt.senders))
+	for _, name := range rt.senderOrder {
+		resolved, ok := resolvedByName[name]
+		if !ok {
+			continue
+		}
+		live, ok := rt.senders[name]
 		if !ok {
 			continue
 		}
@@ -976,6 +1038,14 @@ func (rt *ReaderRuntime) reportSecretFilterMetrics() {
 	rt.secretFilterMatches = 0
 }
 
+// signalNotify / signalStop are seams around os/signal so tests can run
+// Run under synctest (the runtime signal-management goroutine selects on
+// a channel created in the synctest bubble otherwise).
+var (
+	signalNotify = signal.Notify
+	signalStop   = signal.Stop
+)
+
 // Run drives the pump until ctx is done or a component fails: reader
 // goroutines, the per-second housekeeping tick, and the D9 shutdown
 // sequence (spec §4.3): STOPPING notify, reader drain, the sender
@@ -985,30 +1055,44 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 	// handler renders SIGTERM vs SIGINT); the run context already
 	// consumed the signal, so observe it a second time.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(sigCh)
+	signalNotify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signalStop(sigCh)
 
+	// Readers run under an errgroup: a reader error cancels the group
+	// (and thus the other readers) and is surfaced for the supervisor.
+	// Sender cancellation is deliberately SEPARATE (senderRoot-derived,
+	// entry.cancel): senders must stay alive through the D9 grace window
+	// even after the readers are gone.
 	readerCtx, cancelReaders := context.WithCancel(ctx)
 	defer cancelReaders()
-	readerErr := make(chan error, len(p.readers)+1)
-	var readerWG sync.WaitGroup
+	group, groupCtx := errgroup.WithContext(readerCtx)
+	readerErr := make(chan error, len(p.readers))
 	for _, rt := range p.readers {
-		readerWG.Add(1)
-		go func(rt *ReaderRuntime) {
-			defer readerWG.Done()
-			if err := rt.run(readerCtx); err != nil {
+		group.Go(func() error {
+			err := rt.run(groupCtx)
+			if err != nil {
 				select {
 				case readerErr <- err:
 				default:
 				}
 			}
-		}(rt)
+			return err
+		})
+	}
+	// waitReaders joins the reader errgroup exactly once; both the
+	// supervisor loop and the shutdown sequence may need the join.
+	var (
+		readersOnce sync.Once
+		readersErr  error
+	)
+	waitReaders := func() error {
+		readersOnce.Do(func() { readersErr = group.Wait() })
+		return readersErr
 	}
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-	var cause error
-	for cause == nil {
+	for {
 		select {
 		case <-ctx.Done():
 			name := "TERM"
@@ -1022,22 +1106,29 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 			p.log.Printf("Received SIG%s, stopping daemon...", name)
 			// A clean signal-driven shutdown always ends the loop: the
 			// run context stays cancelled, so returning shutdown's
-			// result (nil on success) is the exit.
-			return p.shutdown(cancelReaders, &readerWG)
+			// result (nil on success, the STOPPING notify error
+			// otherwise) is the exit.
+			return p.shutdown(cancelReaders, waitReaders)
 		case err := <-readerErr:
 			// A reader goroutine failed: Python's unhandled exception in
 			// the single-threaded loop would crash the daemon — shut down
 			// (with the grace window) and propagate the error.
 			p.log.Printf("Reader failed, stopping daemon: %v", err)
 			p.log.Printf("Received SIGTERM, stopping daemon...")
-			cause = err
-			_ = p.shutdown(cancelReaders, &readerWG)
+			shutErr := p.shutdown(cancelReaders, waitReaders)
+			if err != nil {
+				return err
+			}
+			return shutErr
 		case <-ticker.C:
 			if err := p.tick(); err != nil {
 				p.log.Printf("Housekeeping failed, stopping daemon: %v", err)
 				p.log.Printf("Received SIGTERM, stopping daemon...")
-				cause = err
-				_ = p.shutdown(cancelReaders, &readerWG)
+				shutErr := p.shutdown(cancelReaders, waitReaders)
+				if shutErr != nil {
+					return shutErr
+				}
+				return err
 			}
 		case <-hup:
 			// SIGHUP is a reload EVENT (daemon.py:72-74); reload is
@@ -1045,7 +1136,6 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 			p.log.Printf("Received SIGHUP")
 		}
 	}
-	return cause
 }
 
 // shutdown ports the exit sequence: STOPPING=1 notify (Python's
@@ -1053,12 +1143,17 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 // drain, the D9 sender grace window (max_send_interval + TickInterval
 // over the LIVE senders), sender cancellation, the final state save,
 // and transport closure.
-func (p *Pump) shutdown(cancelReaders context.CancelFunc, readerWG *sync.WaitGroup) error {
+func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() error) error {
+	// The STOPPING notification error is preserved as Run's result but
+	// must NOT skip cleanup: Python's sigterm handler would crash the
+	// daemon there, which is exactly what the port avoids.
+	var notifyErr error
 	if _, err := p.notifier.Notify(StateStopping); err != nil {
-		return err
+		notifyErr = err
 	}
+
 	cancelReaders()
-	readerWG.Wait()
+	_ = waitReaders()
 
 	grace := p.maxSenderGrace() + sender.TickInterval
 	timer := time.NewTimer(grace)
@@ -1086,7 +1181,7 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, readerWG *sync.WaitGro
 			_ = closer.Close()
 		}
 	}
-	return nil
+	return notifyErr
 }
 
 // maxSenderGrace returns the max over the LIVE senders'

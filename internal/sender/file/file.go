@@ -10,6 +10,7 @@
 package file
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,11 +24,21 @@ import (
 // defaultMaxSendInterval is file.py:7's config.get("max_send_interval", 0.3).
 const defaultMaxSendInterval = 0.3
 
+// pythonBufferSize mirrors io.DEFAULT_BUFFER_SIZE (131072 on this
+// platform): Python's open(path, "ab") returns a BufferedWriter with
+// that buffer, so small batches are not visible on disk until the
+// buffer fills. FileSender never flushes mid-run.
+const pythonBufferSize = 131072
+
 // Sender writes one payload plus a newline per message (file.py:13-18).
 // The handle is opened once at construction and outlives the scope by
-// design — every send writes to it (file.py:9-10).
+// design — every send writes to it (file.py:9-10). Writes go through a
+// BufferedWriter-equivalent buffer (Python's open "ab" semantics); the
+// only explicit flush happens on Close during the D9 shutdown grace
+// window.
 type Sender struct {
 	output *os.File
+	buf    *bufio.Writer
 }
 
 // SendMessages implements sender.Sender: append each message with a
@@ -43,7 +54,7 @@ func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error
 		line := make([]byte, 0, len(msg)+1)
 		line = append(line, msg...)
 		line = append(line, '\n')
-		if _, err := s.output.Write(line); err != nil {
+		if _, err := s.buf.Write(line); err != nil {
 			return fmt.Errorf("file sender: write: %w", err)
 		}
 	}
@@ -54,9 +65,17 @@ func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error
 // none (no base.py override in file.py).
 func (s *Sender) MaintenanceOperations(context.Context) error { return nil }
 
-// Close releases the output handle (Python relies on process exit;
-// the Go supervisor closes transports that implement io.Closer).
-func (s *Sender) Close() error { return s.output.Close() }
+// Close flushes the buffered tail and releases the output handle. The
+// explicit flush is the D9 deviation: Python's BufferedWriter is never
+// flushed and its buffered bytes are lost when the process exits on
+// SIGTERM; Go flushes them within the shutdown grace window.
+func (s *Sender) Close() error {
+	if err := s.buf.Flush(); err != nil {
+		_ = s.output.Close()
+		return err
+	}
+	return s.output.Close()
+}
 
 // New is the wiring-map constructor for output_type "file"
 // (journalpump/senders/__init__.py: "file" → senders.file.FileSender).
@@ -98,7 +117,7 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 		return sender.Instance{}, fmt.Errorf("opening %s: %w", path, err)
 	}
 	return sender.Instance{
-		Transport: &Sender{output: output},
+		Transport: &Sender{output: output, buf: bufio.NewWriterSize(output, pythonBufferSize)},
 		// file.py:8-11 — mark_disconnected() (already disconnected,
 		// no-op) then mark_connected() right after the open.
 		ConnectOnInit:   true,

@@ -82,6 +82,28 @@ import sys as _sys
 _sys.modules["zstandard"] = None
 '''
 
+# Capture-side shim for the file sender: Python's FileSender opens the
+# output with open(path, "ab") — a BufferedWriter that is never flushed,
+# so on SIGTERM the tail is lost and the output file holds only a
+# deterministic PREFIX of the sent messages. To pin the FULL output (the
+# bytes the Go sender produces, since it flushes within the D9 grace
+# window) the capture forces unbuffered writes for that one path.
+SHIM_UNBUFFERED_FILE = '''
+import builtins as _builtins
+
+_open = _builtins.open
+_TARGET = {target!r}
+
+
+def _open_unbuffered(file, mode="r", buffering=-1, *args, **kwargs):
+    if str(file) == _TARGET and buffering == -1 and "a" in mode:
+        buffering = 0
+    return _open(file, mode, buffering, *args, **kwargs)
+
+
+_builtins.open = _open_unbuffered
+'''
+
 
 def update_mode() -> bool:
     """True when GROUNDTRUTH_UPDATE=1: regenerate the committed fixtures."""
@@ -104,10 +126,11 @@ def save_fixture(name: str, data: dict[str, Any]) -> None:
     fixture_path(name).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def build_shim(directory: Path) -> Path:
-    """Write the storage-origin shim and return the PYTHONPATH entry."""
+def build_shim(directory: Path, extra_shim: str = "") -> Path:
+    """Write the storage-origin shim (plus any capture-specific extra
+    snippet) and return the PYTHONPATH entry."""
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "sitecustomize.py").write_text(SHIM_SITECUSTOMIZE, encoding="utf-8")
+    (directory / "sitecustomize.py").write_text(SHIM_SITECUSTOMIZE + extra_shim, encoding="utf-8")
     return directory
 
 
@@ -143,15 +166,16 @@ def base_reader_config(journal_path: Path, senders: dict[str, dict[str, Any]]) -
 
 
 @contextmanager
-def groundtruth_pump(config: dict[str, Any], tmp_path: Path) -> Iterator[JournalpumpProcess]:
+def groundtruth_pump(config: dict[str, Any], tmp_path: Path, extra_shim: str = "") -> Iterator[JournalpumpProcess]:
     """Start the REAL Python binary through the Task 10 harness.
 
     JOURNALPUMP_BIN is forced to "" (the Python module) regardless of
     the surrounding environment: ground truth must be captured from the
     Python implementation. The storage-origin shim is injected through
-    PYTHONPATH (see the module docstring).
+    PYTHONPATH (see the module docstring); extra_shim appends
+    capture-specific snippets (e.g. the unbuffered file-output shim).
     """
-    shim_dir = build_shim(tmp_path / "shim")
+    shim_dir = build_shim(tmp_path / "shim", extra_shim)
     config_path = tmp_path / "journalpump.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     with JournalpumpProcess() as process:
