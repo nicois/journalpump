@@ -437,6 +437,18 @@ Round-3 additions (2026-10-10, third changes-required verdict — closing):
   Warningf, so it survives a WARNING threshold instead of emitting at
   INFO and vanishing.
 
+Round-4 additions (2026-10-10, fourth changes-required verdict):
+- The file sender records a pending boundary repair explicitly. A failed
+  discard leaves the partial line on disk; Finalize (SIGTERM/shutdown)
+  and Close now retry the truncation, and Close refuses to release an
+  unrepaired handle. This closes the shutdown-with-no-following-reload
+  hole where an empty buffer let Finalize flush nothing and Close release
+  a corrupt handle.
+- The repair tests write real data (a complete line plus a partial next
+  line), inject the truncation failure, and assert the retry/Finalize
+  removes exactly the partial bytes, preserves complete lines, and allows
+  a valid-JSONL replay.
+
 ### Task 18. Core systest suites (Milestone A)
 Files: `systest-go/`. Rotation suite as a **Go-native test** (thread C3:
 `systest/test_rotation.py` is in-process/monkeypatched in Python — port

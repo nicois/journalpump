@@ -1016,9 +1016,13 @@ Parity-critical behavior reproduced exactly:
   (the earlier "delete then clean up" ordering let a second changed-ctime
   reload find nothing to retire and start a replacement writer on the
   unrepaired partial line). On the file side, a failed discard leaves the
-  output handle OPEN so the retried CloseDiscarding can actually truncate
-  the partial line; a successful retry releases the handle and the reload
-  proceeds.
+  output handle OPEN and records a pending repair, so the retried
+  CloseDiscarding can actually truncate the partial line; a successful
+  retry releases the handle and the reload proceeds. If no reload follows,
+  shutdown's Finalize and Close retry the pending truncation too, and Close
+  returns the error rather than releasing an unrepaired handle — a SIGTERM
+  after a failed cleanup cannot let the corrupt prefix survive into the
+  next run.
 - The reader's "Bad message" arm (`CorruptedEntry`,
   `journalpump.py:392-397`) logs at WARNING, not INFO: it routes through
   the level-aware Warningf so the line survives a WARNING threshold
