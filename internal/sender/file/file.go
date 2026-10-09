@@ -65,10 +65,18 @@ func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error
 // none (no base.py override in file.py).
 func (s *Sender) MaintenanceOperations(context.Context) error { return nil }
 
-// Close flushes the buffered tail and releases the output handle. The
-// explicit flush is the D9 deviation: Python's BufferedWriter is never
-// flushed and its buffered bytes are lost when the process exits on
-// SIGTERM; Go flushes them within the shutdown grace window.
+// Finalize flushes the buffered tail without releasing the handle. The
+// supervisor calls it at shutdown BEFORE the final state save (the D9
+// deviation: Python's BufferedWriter is never flushed and its buffered
+// bytes are lost when the process exits on SIGTERM; Go flushes them
+// within the shutdown grace window) so a failed flush is surfaced and
+// the persisted sent cursor is rolled back rather than claiming the
+// buffered bytes were delivered.
+func (s *Sender) Finalize() error {
+	return s.buf.Flush()
+}
+
+// Close flushes the buffered tail and releases the output handle.
 func (s *Sender) Close() error {
 	if err := s.buf.Flush(); err != nil {
 		_ = s.output.Close()

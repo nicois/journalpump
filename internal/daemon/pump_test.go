@@ -25,6 +25,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/reader"
 	"github.com/Aiven-Open/journalpump/internal/sender"
+	"github.com/Aiven-Open/journalpump/internal/state"
 )
 
 // ---------------------------------------------------------------------------
@@ -110,8 +111,65 @@ func registerFakeSenders() {
 		sender.Register("failinit", func(sender.ConstructorArgs) (sender.Instance, error) {
 			return sender.Instance{}, errors.New("constructor exploded")
 		})
+		// flaky fails its first construction attempt and succeeds on the
+		// retry, so a test can exercise late successful initialization.
+		sender.Register("flaky", func(sender.ConstructorArgs) (sender.Instance, error) {
+			flakyAttemptsMu.Lock()
+			flakyAttempts++
+			attempt := flakyAttempts
+			flakyAttemptsMu.Unlock()
+			if attempt == 1 {
+				return sender.Instance{}, errors.New("first attempt fails")
+			}
+			return sender.Instance{
+				Transport:       &fakeTransport{},
+				MaxSendInterval: 50 * time.Millisecond,
+				Type:            "FlakySender",
+				ConnectOnInit:   true,
+			}, nil
+		})
+		// flushfail acks every batch into a buffer and fails the final
+		// flush, so a test can lock the flush-ordering/state-rollback.
+		sender.Register("flushfail", func(sender.ConstructorArgs) (sender.Instance, error) {
+			return sender.Instance{
+				Transport:       &flushFailTransport{},
+				MaxSendInterval: 50 * time.Millisecond,
+				Type:            "FlushFailSender",
+				ConnectOnInit:   true,
+			}, nil
+		})
 	})
 }
+
+// flakyAttempts counts flaky-sender construction attempts; reset per
+// test that uses it.
+var (
+	flakyAttemptsMu sync.Mutex
+	flakyAttempts   int
+)
+
+func resetFlakyAttempts() {
+	flakyAttemptsMu.Lock()
+	flakyAttempts = 0
+	flakyAttemptsMu.Unlock()
+}
+
+// flushFailTransport accepts and buffers batches, then fails Finalize.
+type flushFailTransport struct {
+	mu       sync.Mutex
+	messages int
+}
+
+func (f *flushFailTransport) SendMessages(_ context.Context, batch [][]byte, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.messages += len(batch)
+	return nil
+}
+
+func (f *flushFailTransport) MaintenanceOperations(context.Context) error { return nil }
+
+func (f *flushFailTransport) Finalize() error { return errors.New("final flush boom") }
 
 // captureLog records the pump's log lines for assertion.
 type captureLog struct {
@@ -139,14 +197,34 @@ func (c *captureLog) contains(substr string) bool {
 // fakeReader serves a fixed entry list; Wait returns one append event then
 // blocks until cancellation.
 type fakeReader struct {
-	entries   []journal.Entry
-	idx       int
-	readErr   error
-	firstWait bool
-	closed    bool
+	mu      sync.Mutex
+	entries []journal.Entry
+	idx     int
+	readErr error
+	// firstWait returns one append event once, then blocks; repeatAppend
+	// keeps returning appends (paced by the fake clock) until the entries
+	// are consumed, so the reader loop keeps draining like a real journal.
+	firstWait    bool
+	repeatAppend bool
+	closed       bool
 }
 
 func (r *fakeReader) Wait(ctx context.Context, _ time.Duration) (reader.Event, error) {
+	if r.repeatAppend {
+		r.mu.Lock()
+		done := r.idx >= len(r.entries)
+		r.mu.Unlock()
+		if !done {
+			select {
+			case <-time.After(20 * time.Millisecond):
+				return reader.EventAppend, nil
+			case <-ctx.Done():
+				return reader.EventNOP, ctx.Err()
+			}
+		}
+		<-ctx.Done()
+		return reader.EventNOP, ctx.Err()
+	}
 	if r.firstWait {
 		r.firstWait = false
 		return reader.EventAppend, nil
@@ -156,6 +234,8 @@ func (r *fakeReader) Wait(ctx context.Context, _ time.Duration) (reader.Event, e
 }
 
 func (r *fakeReader) ReadBatch(n int) ([]journal.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.readErr != nil {
 		return nil, r.readErr
 	}
@@ -169,6 +249,13 @@ func (r *fakeReader) ReadBatch(n int) ([]journal.Entry, error) {
 	out := r.entries[r.idx:end]
 	r.idx = end
 	return out, nil
+}
+
+// readCount reports how many entries have been served.
+func (r *fakeReader) readCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.idx
 }
 
 func (r *fakeReader) Seek(string) error { return nil }
@@ -245,7 +332,7 @@ func stopSenders(t *testing.T, p *Pump) {
 		for _, entry := range entries {
 			entry.cancel()
 		}
-		p.senderWG.Wait()
+		_ = p.senderGroup.Wait()
 	})
 }
 
@@ -716,6 +803,127 @@ func TestProcessSenderOrderDecidesCacheKey(t *testing.T) {
 	}
 }
 
+// TestSenderOrderFollowsDelayedInitialization locks the successful-init
+// ordering through DELAYED initialization: the flaky sender fails its
+// first construction and succeeds on the reader's next open, so it lands
+// AFTER alpha in senderOrder (and process follows that order).
+func TestSenderOrderFollowsDelayedInitialization(t *testing.T) {
+	registerFakeSenders()
+	resetFlakyAttempts()
+	rc := fakeReaderConfig(map[string]any{
+		"zulu":  map[string]any{"output_type": "flaky"},
+		"alpha": fakeSenderConfig(),
+	})
+	rc.SenderOrder = []string{"zulu", "alpha"}
+	rc.ExtraFieldValuesRaw = map[string]json.RawMessage{
+		"zulu":  json.RawMessage(`{"EXTRA":"from-zulu"}`),
+		"alpha": json.RawMessage(`{"EXTRA":"from-alpha"}`),
+	}
+	cfg := testPumpConfig(map[string]config.ReaderConfig{"r": rc})
+	log := &captureLog{}
+	p, rt := newTestRuntime(t, cfg, log)
+	rt.reopener = &fakeSource{reader: &fakeReader{firstWait: true}}
+
+	if err := rt.updateStatus(context.Background()); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	if got := rt.senderOrder; !reflect.DeepEqual(got, []string{"alpha"}) {
+		t.Fatalf("senderOrder after first init = %v, want [alpha] (zulu failed)", got)
+	}
+	if !log.contains(`Sender "zulu" failed to initialize`) {
+		t.Errorf("missing failed-init log; got %v", log.lines)
+	}
+
+	// Recreate the reader: the retried constructor succeeds and zulu
+	// lands after alpha.
+	rt.journaldReader = nil
+	if err := rt.updateStatus(context.Background()); err != nil {
+		t.Fatalf("updateStatus (reopen): %v", err)
+	}
+	if got := rt.senderOrder; !reflect.DeepEqual(got, []string{"alpha", "zulu"}) {
+		t.Fatalf("senderOrder after retry = %v, want [alpha zulu]", got)
+	}
+	stopSenders(t, p)
+
+	// process follows the successful-init order: alpha captures the
+	// shared serialization first, so zulu inherits alpha's EXTRA.
+	entry := journal.Entry{Cursor: "c", Fields: []journal.Field{{Key: "MESSAGE", Value: "x"}}}
+	if _, _, _, err := rt.process(context.Background(), entry); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	rt.mu.Lock()
+	zb, ab := rt.senders["zulu"].buffer, rt.senders["alpha"].buffer
+	rt.mu.Unlock()
+	extra := func(b *buffer.SenderBuffer) string {
+		t.Helper()
+		select {
+		case item := <-b.Chan():
+			var parsed map[string]any
+			if err := json.Unmarshal(item.Payload, &parsed); err != nil {
+				t.Fatalf("payload: %v", err)
+			}
+			value, _ := parsed["EXTRA"].(string)
+			return value
+		default:
+			t.Fatal("no enqueued item")
+			return ""
+		}
+	}
+	if got := extra(ab); got != "from-alpha" {
+		t.Errorf("alpha EXTRA = %q, want from-alpha", got)
+	}
+	if got := extra(zb); got != "from-alpha" {
+		t.Errorf("zulu EXTRA = %q, want from-alpha (shares alpha's cached bytes)", got)
+	}
+}
+
+// TestFilterCaptureQuirkLock locks the construction-time filter capture:
+// senders sharing a field-filter NAME share the ONE *filter.FieldFilter
+// instance captured at resolve time, and process applies it byte-for-byte
+// to both.
+func TestFilterCaptureQuirkLock(t *testing.T) {
+	cfg := testPumpConfig(map[string]config.ReaderConfig{
+		"r": fakeReaderConfig(map[string]any{
+			"a": map[string]any{"output_type": "fake", "field_filter": "shared"},
+			"b": map[string]any{"output_type": "fake", "field_filter": "shared"},
+		}),
+	})
+	cfg.FieldFilters = map[string]config.FieldFilterConfig{
+		"shared": {Name: "shared", Whitelist: true, Fields: []string{"MESSAGE"}},
+	}
+	p, rt := newTestRuntime(t, cfg, &captureLog{})
+	if len(rt.resolved) != 2 {
+		t.Fatalf("resolved senders = %d, want 2", len(rt.resolved))
+	}
+	shared := rt.pump.fieldFilters["shared"]
+	for _, r := range rt.resolved {
+		if r.fieldFilter == nil || r.fieldFilter != shared {
+			t.Errorf("sender %s did not capture the pump-level filter pointer", r.name)
+		}
+	}
+
+	rt.initSenders()
+	stopSenders(t, p)
+	entry := journal.Entry{Cursor: "c", Fields: []journal.Field{
+		{Key: "MESSAGE", Value: "hi"},
+		{Key: "SECRETVALUE", Value: "nope"},
+	}}
+	if _, _, _, err := rt.process(context.Background(), entry); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	rt.mu.Lock()
+	ab, bb := rt.senders["a"].buffer, rt.senders["b"].buffer
+	rt.mu.Unlock()
+	pa := (<-ab.Chan()).Payload
+	pb := (<-bb.Chan()).Payload
+	if string(pa) != string(pb) {
+		t.Errorf("payloads differ despite the shared filter: %s vs %s", pa, pb)
+	}
+	if strings.Contains(string(pa), "SECRETVALUE") || strings.Contains(string(pa), "nope") {
+		t.Errorf("whitelist filter not applied: %s", pa)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // cancellation / shutdown
 
@@ -815,8 +1023,94 @@ func TestShutdownCleanupDespiteNotifyError(t *testing.T) {
 	})
 }
 
+// TestFailedFinalFlushRollsBackState locks the flush ordering (major 2):
+// the buffered transport is finalized BEFORE the final state save; a
+// failed final flush is surfaced as an error and the sender's sent
+// cursor is rolled back, so the state file never records undelivered
+// messages as sent (no silent exit 0).
+func TestFailedFinalFlushRollsBackState(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{
+			"r": fakeReaderConfig(map[string]any{"s": map[string]any{"output_type": "flushfail"}}),
+		})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfg.JSONStateFilePath = statePath
+		p, rt := newTestRuntime(t, cfg, &captureLog{})
+		p.statePath = statePath
+		rt.initSenders()
+
+		fr := &fakeReader{}
+		rt.journaldReader = fr
+		entries := []journal.Entry{
+			{Cursor: "c1", Fields: []journal.Field{{Key: "MESSAGE", Value: "a"}}},
+			{Cursor: "c2", Fields: []journal.Field{{Key: "MESSAGE", Value: "b"}}},
+		}
+		for _, entry := range entries {
+			if _, _, _, err := rt.process(context.Background(), entry); err != nil {
+				t.Fatalf("process: %v", err)
+			}
+		}
+
+		err := p.shutdown(func() {}, func() error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "final flush boom") {
+			t.Fatalf("shutdown err = %v, want the final-flush error", err)
+		}
+
+		st, readErr := state.Read(statePath)
+		if readErr != nil {
+			t.Fatalf("read state: %v", readErr)
+		}
+		rs := st.Readers["r"]
+		if rs == nil || len(rs.Senders) != 1 {
+			t.Fatalf("state senders = %+v", rs)
+		}
+		if got := rs.Senders[0].State.Sent.Count; got != 0 {
+			t.Errorf("persisted sent count = %d, want 0 (rolled back after the failed flush)", got)
+		}
+		if got := rs.Senders[0].State.Sent.Cursor; got != nil {
+			t.Errorf("persisted sent cursor = %v, want nil", got)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Pump.Run supervisor
+
+// TestSenderErrorPropagatesViaErrgroup locks the sender errgroup
+// composition (major 1): a sender loop failure is joined at shutdown and
+// propagated as Run's result instead of being discarded.
+func TestSenderErrorPropagatesViaErrgroup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		disableSignals(t)
+		orig := runSenderLoop
+		runSenderLoop = func(*sender.Loop, context.Context) error { return errors.New("sender boom") }
+		t.Cleanup(func() { runSenderLoop = orig })
+
+		cfg := testPumpConfig(map[string]config.ReaderConfig{
+			"r": fakeReaderConfig(map[string]any{"s": fakeSenderConfig()}),
+		})
+		p, rt := newTestRuntime(t, cfg, &captureLog{})
+		p.notifier = &fakeNotifier{}
+		rt.reopener = &fakeSource{reader: &fakeReader{firstWait: true}}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- p.Run(ctx, make(chan os.Signal)) }()
+
+		synctest.Wait()
+		time.Sleep(2 * pollInterval)
+		synctest.Wait()
+		cancel()
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "sender boom") {
+				t.Fatalf("Run = %v, want the sender error", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run did not return after cancellation")
+		}
+	})
+}
 
 // TestPumpRunSupervisor drives Pump.Run itself: readers, the sender grace
 // flush, the STOPPING notify, and the final state save.
@@ -901,17 +1195,36 @@ func TestPumpRunReaderErrorPropagates(t *testing.T) {
 // ---------------------------------------------------------------------------
 // backpressure (composed) and byte budgets
 
-var slowRelease = make(chan struct{})
+// slowReleaseMu guards slowReleaseCh so each test invocation gets its
+// own release channel; a package-global channel closed by one run would
+// panic the next under -count=2.
+var (
+	slowReleaseMu sync.Mutex
+	slowReleaseCh = make(chan struct{})
+)
+
+func setSlowRelease(ch chan struct{}) {
+	slowReleaseMu.Lock()
+	slowReleaseCh = ch
+	slowReleaseMu.Unlock()
+}
+
+func currentSlowRelease() <-chan struct{} {
+	slowReleaseMu.Lock()
+	defer slowReleaseMu.Unlock()
+	return slowReleaseCh
+}
 
 // registerSlowSender wires the blocking sender once: its
-// MaintenanceOperations blocks until slowRelease is closed, so the loop
-// never reaches its drain and the channel fills like a slow consumer.
+// MaintenanceOperations blocks until its release channel is closed, so
+// the loop never reaches its drain and the channel fills like a slow
+// consumer. Each constructor call snapshots the current release channel.
 func registerSlowSender() {
 	registerFakeSenders()
 	registerSlowOnce.Do(func() {
 		sender.Register("slowblock", func(sender.ConstructorArgs) (sender.Instance, error) {
 			return sender.Instance{
-				Transport:       &slowTransport{},
+				Transport:       &slowTransport{release: currentSlowRelease()},
 				MaxSendInterval: 50 * time.Millisecond,
 				Type:            "SlowSender",
 			}, nil
@@ -921,23 +1234,26 @@ func registerSlowSender() {
 
 var registerSlowOnce sync.Once
 
-type slowTransport struct{}
+type slowTransport struct{ release <-chan struct{} }
 
 func (s *slowTransport) SendMessages(context.Context, [][]byte, string) error { return nil }
 func (s *slowTransport) MaintenanceOperations(ctx context.Context) error {
 	select {
-	case <-slowRelease:
+	case <-s.release:
 	case <-ctx.Done():
 	}
 	return nil
 }
 
-// TestComposedBackpressure locks the fill/pause/drain/resume cycle: a
-// full sender buffer pauses the reader (readiness false + pause log);
-// once the sender drains, readiness returns (resume log).
+// TestComposedBackpressure drives the READER LOOP (not a manual enqueue):
+// the slow sender's full channel makes the reader stop consuming entries
+// (readiness false + pause log); once the sender drains, reads resume
+// (readiness true + resume log).
 func TestComposedBackpressure(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		registerSlowSender()
+		release := make(chan struct{})
+		setSlowRelease(release)
 		cfg := testPumpConfig(map[string]config.ReaderConfig{
 			"r": fakeReaderConfig(map[string]any{
 				"slow": map[string]any{"output_type": "slowblock"},
@@ -945,89 +1261,134 @@ func TestComposedBackpressure(t *testing.T) {
 			}),
 		})
 		cfg.MsgBufferMaxLength = 3
-		cfg.MsgBufferMaxBytes = 0 // disable the byte budget; count gates
+		cfg.MsgBufferMaxBytes = 1 << 20 // count gates; keep the byte budget out of the way
 		log := &captureLog{}
 		p, rt := newTestRuntime(t, cfg, log)
-		rt.reopener = &fakeSource{reader: &fakeReader{}}
-		if err := rt.updateStatus(context.Background()); err != nil {
-			t.Fatalf("updateStatus: %v", err)
+
+		entries := make([]journal.Entry, 40)
+		for i := range entries {
+			entries[i] = journal.Entry{Cursor: fmt.Sprintf("c%d", i), Fields: []journal.Field{{Key: "MESSAGE", Value: "x"}}}
 		}
+		fr := &fakeReader{repeatAppend: true, entries: entries}
+		rt.reopener = &fakeSource{reader: fr}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- rt.run(ctx) }()
 		t.Cleanup(func() {
-			p.senderMu.Lock()
-			var entries []*senderEntry
-			for _, es := range p.senders {
-				entries = append(entries, es...)
-			}
-			p.senderMu.Unlock()
-			for _, e := range entries {
-				e.cancel()
-			}
-			p.senderWG.Wait()
+			cancel()
+			<-done
+			stopSenders(t, p)
 		})
 
-		rt.mu.Lock()
-		slow := rt.senders["slow"]
-		rt.mu.Unlock()
-		if slow == nil {
-			t.Fatal("slow sender not initialized")
-		}
-		ctx := context.Background()
-		for i := 0; i < 3; i++ {
-			if err := slow.buffer.Enqueue(ctx, sender.Item{Payload: []byte("x"), Cursor: "c"}); err != nil {
-				t.Fatalf("enqueue: %v", err)
-			}
-		}
-		if err := rt.updateStatus(ctx); err != nil {
-			t.Fatalf("updateStatus: %v", err)
-		}
+		// Let the loop fill the slow sender's channel and pause.
+		time.Sleep(20 * pollInterval)
+		synctest.Wait()
 		if rt.readyFlag {
-			t.Error("readyFlag = true, want paused with the slow sender full")
+			t.Fatal("readyFlag = true, want paused with the slow sender full")
 		}
 		if !log.contains("pause processing journal for \"r\"") {
 			t.Errorf("missing pause log; got %v", log.lines)
 		}
-
-		// Drain: release the slow sender and let its loop run.
-		close(slowRelease)
-		time.Sleep(2 * time.Second)
-		synctest.Wait()
-		if err := rt.updateStatus(ctx); err != nil {
-			t.Fatalf("updateStatus: %v", err)
+		pausedAt := fr.readCount()
+		if pausedAt == 0 {
+			t.Fatal("reader consumed nothing before pausing")
 		}
+		if pausedAt >= len(entries) {
+			t.Fatalf("reader consumed all %d entries despite the pause", len(entries))
+		}
+
+		// The pause must actually stop reads: no further consumption.
+		time.Sleep(20 * pollInterval)
+		synctest.Wait()
+		if got := fr.readCount(); got != pausedAt {
+			t.Errorf("reads continued while paused: %d -> %d", pausedAt, got)
+		}
+
+		// Drain: release the slow sender; reads resume.
+		close(release)
+		time.Sleep(20 * pollInterval)
+		synctest.Wait()
 		if !rt.readyFlag {
 			t.Error("readyFlag = false, want resumed after the drain")
 		}
 		if !log.contains("ready to process journal for \"r\"") {
 			t.Errorf("missing resume log; got %v", log.lines)
 		}
+		if got := fr.readCount(); got <= pausedAt {
+			t.Errorf("reads did not resume: %d, paused at %d", got, pausedAt)
+		}
 	})
 }
 
-// TestByteBudgetPausesReader locks the multi-sender maximum-byte budget:
-// one sender's payload bytes over msg_buffer_max_bytes pause the reader
-// even with the other sender empty.
-func TestByteBudgetPausesReader(t *testing.T) {
-	cfg := testPumpConfig(map[string]config.ReaderConfig{
-		"r": fakeReaderConfig(map[string]any{"a": fakeSenderConfig(), "b": fakeSenderConfig()}),
-	})
+// TestReadMessagesDecrementsByMaxSerializedSize locks the byte-budget
+// decrement composed THROUGH readMessages: the count/byte budgets are
+// decremented by the MAX serialized size across the sender targets, not
+// the min, so a budget set between the two stops the chunk after one
+// message.
+func TestReadMessagesDecrementsByMaxSerializedSize(t *testing.T) {
+	newEntry := func(cursor string) journal.Entry {
+		return journal.Entry{Cursor: cursor, Fields: []journal.Field{
+			{Key: "MESSAGE", Value: "hi"},
+			{Key: "VALUE", Value: strings.Repeat("v", 200)},
+		}}
+	}
+	filtered := map[string]any{"output_type": "fake", "field_filter": "m"}
+
+	// Measure the serialized size the handler reports for each sender
+	// alone (separate runtimes avoid the shared serialization cache).
+	measure := func(senderName string, cfgSender map[string]any) int {
+		rc := fakeReaderConfig(map[string]any{senderName: cfgSender})
+		rc.SenderOrder = []string{senderName}
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": rc})
+		cfg.MsgBufferMaxLength = 50000
+		cfg.MsgBufferMaxBytes = 1 << 20
+		cfg.FieldFilters = map[string]config.FieldFilterConfig{"m": {Name: "m", Whitelist: true, Fields: []string{"MESSAGE"}}}
+		p, rt := newTestRuntime(t, cfg, &captureLog{})
+		rt.initSenders()
+		stopSenders(t, p)
+		_, bytesRead, hasBytes, err := rt.process(context.Background(), newEntry("c"))
+		if err != nil {
+			t.Fatalf("process: %v", err)
+		}
+		if !hasBytes || bytesRead <= 0 {
+			t.Fatalf("sender %s: bytesRead = %d", senderName, bytesRead)
+		}
+		return bytesRead
+	}
+	sizeA := measure("a", fakeSenderConfig()) // no filter: MESSAGE + VALUE
+	sizeB := measure("b", filtered)           // whitelist: MESSAGE only
+	if sizeA < sizeB+2 {
+		t.Fatalf("serialized sizes not distinct enough: a=%d b=%d", sizeA, sizeB)
+	}
+
+	// Budget strictly between the two: if the loop decremented by the
+	// MIN size it would keep reading; by the MAX it stops after one.
+	maxBytes := sizeB + 1
+	rc := fakeReaderConfig(map[string]any{"a": fakeSenderConfig(), "b": filtered})
+	rc.SenderOrder = []string{"a", "b"}
+	cfg := testPumpConfig(map[string]config.ReaderConfig{"r": rc})
 	cfg.MsgBufferMaxLength = 50000
-	cfg.MsgBufferMaxBytes = 100
+	cfg.MsgBufferMaxBytes = int64(maxBytes)
+	cfg.FieldFilters = map[string]config.FieldFilterConfig{"m": {Name: "m", Whitelist: true, Fields: []string{"MESSAGE"}}}
 	p, rt := newTestRuntime(t, cfg, &captureLog{})
 	rt.initSenders()
 	stopSenders(t, p)
 
-	rt.mu.Lock()
-	a := rt.senders["a"]
-	rt.mu.Unlock()
-	payload := strings.Repeat("x", 200)
-	if err := a.buffer.Enqueue(context.Background(), sender.Item{Payload: []byte(payload), Cursor: "c"}); err != nil {
-		t.Fatalf("enqueue: %v", err)
+	fr := &fakeReader{entries: []journal.Entry{newEntry("c1"), newEntry("c2"), newEntry("c3")}}
+	rt.journaldReader = fr
+	_, lines, err := rt.readMessages(context.Background())
+	if err != nil {
+		t.Fatalf("readMessages: %v", err)
+	}
+	if lines != 1 {
+		t.Errorf("lines = %d, want 1 (budget decremented by the max serialized size %d, not the min %d)", lines, sizeA, sizeB)
+	}
+	if got := fr.readCount(); got != 1 {
+		t.Errorf("read %d entries, want 1", got)
 	}
 	if got := rt.writeLimitBytes(); got > 0 {
-		t.Errorf("writeLimitBytes = %d, want <= 0 with 200 bytes over a 100-byte budget", got)
-	}
-	if got := rt.writeLimitCount(); got <= 0 {
-		t.Errorf("writeLimitCount = %d, want > 0 (count budget untouched)", got)
+		t.Errorf("writeLimitBytes = %d, want <= 0 after the max-size decrement", got)
 	}
 }
 
@@ -1066,22 +1427,35 @@ func (c *udpCapture) read(t *testing.T) string {
 	return string(buf[:n])
 }
 
-// TestBroadHandlerDelayAndTags locks read_single_message's except-arm:
-// the unexpected_exception counter fires with where=mainloop and
-// app=journalpump, and the handler sleeps 500 ms.
+// TestBroadHandlerDelayAndTags locks read_single_message's except-arm
+// through the ENTRY POINT: a read failure routes into the broad handler,
+// which logs, emits unexpected_exception with where=mainloop and
+// app=journalpump, sleeps 500 ms (asserted on the fake clock), and
+// returns hasMore=false.
 func TestBroadHandlerDelayAndTags(t *testing.T) {
 	capture := newUDPCapture(t)
 	host, port := capture.addr()
-	cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
-	cfg.Statsd = config.StatsdConfig{Host: &host, Port: &port, Tags: map[string]string{}}
 	log := &captureLog{}
-	_, rt := newTestRuntime(t, cfg, log)
 
-	start := time.Now()
-	rt.broadHandler(errors.New("boom"))
-	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
-		t.Errorf("broadHandler delay = %v, want >= 500ms", elapsed)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+		cfg.Statsd = config.StatsdConfig{Host: &host, Port: &port, Tags: map[string]string{}}
+		_, rt := newTestRuntime(t, cfg, log)
+		rt.journaldReader = &fakeReader{readErr: errors.New("boom")}
+
+		start := time.Now()
+		hasMore, bytesRead, hasBytes, err := rt.readSingleMessage(context.Background())
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("readSingleMessage: %v", err)
+		}
+		if hasMore || hasBytes || bytesRead != 0 {
+			t.Errorf("got (%v,%d,%v), want (false,0,false)", hasMore, bytesRead, hasBytes)
+		}
+		if elapsed < 500*time.Millisecond {
+			t.Errorf("broad-handler delay = %v, want >= 500ms", elapsed)
+		}
+	})
 	if !log.contains("Unexpected exception while handling entry for r") {
 		t.Errorf("missing broad-handler log; got %v", log.lines)
 	}

@@ -47,10 +47,17 @@ type stateFile struct {
 }
 
 // TestFileSenderEndToEnd is the committed value demonstration: it
-// stages the fixture journals, launches the REAL Go binary (production
-// reader path, no FilesAvailableOverride), drives it with SIGTERM, and
-// asserts the full 40-message output bytes, the state file, and the
-// exit status.
+// stages the fixture journals, launches the REAL Go binary built with
+// the systest tag, drives it with SIGTERM, and asserts the full
+// 40-message output bytes, the state file, and the exit status.
+//
+// Test-shim path: arbitrary fixture directories do not carry the
+// persistent/runtime journal files libsystemd probes, so this systest
+// binary activates the files-available override via
+// JOURNALPUMP_FILES_AVAILABLE=1 (internal/reader/files_available_systest.go,
+// the analog of the Python ground-truth sitecustomize patch). This is
+// shim evidence, not a production-binary demonstration: a production
+// build has no such override and gates on the real libsystemd probe.
 func TestFileSenderEndToEnd(t *testing.T) {
 	repoRoot, err := filepath.Abs("..")
 	if err != nil {

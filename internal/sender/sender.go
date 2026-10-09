@@ -68,6 +68,16 @@ type Sender interface {
 	MaintenanceOperations(ctx context.Context) error
 }
 
+// Finalizer is an OPTIONAL transport capability: flush any buffered
+// output and report failure. The supervisor calls it at shutdown,
+// after the sender grace window but BEFORE the final state save, so a
+// failed final delivery is surfaced on the result and its sent cursor
+// is not persisted as successfully delivered. Transports that write
+// straight through (or expose io.Closer) need not implement it.
+type Finalizer interface {
+	Finalize() error
+}
+
 // Classifier is the per-sender retriable(error) seam — the Go
 // equivalent of Python's per-sender except-clauses
 // (e.g. kafka_sender's KAFKA_CONN_ERRORS set). The loop routes a

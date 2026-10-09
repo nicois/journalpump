@@ -117,7 +117,12 @@ type Pump struct {
 	senderMu   sync.Mutex
 	senderRoot context.Context
 	senders    map[string][]*senderEntry // reader name -> entries
-	senderWG   sync.WaitGroup
+	// senderGroup joins the sender goroutines and surfaces the first
+	// sender-loop error (errogroup composition, mirroring the reader
+	// group). The group has no context of its own: senders are cancelled
+	// SEPARATELY (entry.cancel, after the D9 grace window), never by a
+	// reader failure.
+	senderGroup errgroup.Group
 
 	// linesRead accumulates entries processed since the last supervisor
 	// tick — the global `lines` counter of journalpump.py:1124/1195 (the
@@ -678,11 +683,9 @@ func (rt *ReaderRuntime) initSenders() {
 		rt.pump.senderMu.Lock()
 		rt.pump.senders[rt.name] = append(rt.pump.senders[rt.name], entry)
 		rt.pump.senderMu.Unlock()
-		rt.pump.senderWG.Add(1)
-		go func(e *senderEntry, ctx context.Context) {
-			defer rt.pump.senderWG.Done()
-			_ = e.loop.Run(ctx)
-		}(entry, sctx)
+		rt.pump.senderGroup.Go(func() error {
+			return runSenderLoop(entry.loop, sctx)
+		})
 		rt.initialised[resolved.name] = struct{}{}
 		rt.senders[resolved.name] = entry
 		rt.senderOrder = append(rt.senderOrder, resolved.name)
@@ -1046,6 +1049,13 @@ var (
 	signalStop   = signal.Stop
 )
 
+// runSenderLoop is a seam around (*sender.Loop).Run. Loop.Run always
+// returns nil in production (cancellation is the normal exit path) and
+// whatever it returns is the sender errgroup's result, so a sender
+// failure propagates out of shutdown instead of being discarded; tests
+// inject a failure here to exercise that path.
+var runSenderLoop = func(l *sender.Loop, ctx context.Context) error { return l.Run(ctx) }
+
 // Run drives the pump until ctx is done or a component fails: reader
 // goroutines, the per-second housekeeping tick, and the D9 shutdown
 // sequence (spec §4.3): STOPPING notify, reader drain, the sender
@@ -1141,8 +1151,16 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 // shutdown ports the exit sequence: STOPPING=1 notify (Python's
 // sigterm handler — an OSError there crashes the daemon), the reader
 // drain, the D9 sender grace window (max_send_interval + TickInterval
-// over the LIVE senders), sender cancellation, the final state save,
-// and transport closure.
+// over the LIVE senders), sender cancellation, the buffered-transport
+// finalization, the final state save, and transport closure.
+//
+// Every failure is preserved on the result: the STOPPING notify error
+// (Python's sigterm handler would crash there), the joined reader
+// errors (a cancellation must not mask a reader failure), the joined
+// sender errors, and a failed final flush. A failed final delivery is
+// surfaced as an error and its sent cursor is rolled back to the last
+// persisted state, so the state file never claims undelivered bytes
+// were delivered (see the flush ordering below).
 func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() error) error {
 	// The STOPPING notification error is preserved as Run's result but
 	// must NOT skip cleanup: Python's sigterm handler would crash the
@@ -1153,35 +1171,110 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 	}
 
 	cancelReaders()
-	_ = waitReaders()
+	// Preserve the joined reader errors: a cancellation racing a reader
+	// failure must not report success.
+	readerErr := waitReaders()
 
 	grace := p.maxSenderGrace() + sender.TickInterval
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	<-timer.C
 
+	// liveSender remembers which reader owns each entry so a flush
+	// rollback can address the persisted state.
+	type liveSender struct {
+		reader string
+		entry  *senderEntry
+	}
 	p.senderMu.Lock()
-	entries := make([]*senderEntry, 0, len(p.senders))
-	for _, readerEntries := range p.senders {
-		entries = append(entries, readerEntries...)
+	live := make([]liveSender, 0, len(p.senders))
+	for readerName, readerEntries := range p.senders {
+		for _, entry := range readerEntries {
+			live = append(live, liveSender{reader: readerName, entry: entry})
+		}
 	}
 	p.senderMu.Unlock()
-	for _, entry := range entries {
-		entry.cancel()
+
+	// Cancellation of the senders is SEPARATE from the readers and
+	// happens only after the grace window.
+	for _, l := range live {
+		l.entry.cancel()
 	}
-	p.senderWG.Wait()
+	senderErr := p.senderGroup.Wait()
+
+	// Finalize buffered transports BEFORE the final state save: the
+	// bytes a sender buffered (e.g. the file sender's BufferedWriter)
+	// are only durable once flushed here. A failed flush is surfaced
+	// and the affected sender's sent cursor is rolled back below.
+	var flushErr error
+	type flushFailure struct {
+		reader string
+		name   string
+	}
+	var flushFailures []flushFailure
+	for _, l := range live {
+		finalizer, ok := l.entry.inst.Transport.(sender.Finalizer)
+		if !ok {
+			continue
+		}
+		if err := finalizer.Finalize(); err != nil {
+			p.log.Printf("Final delivery failed for sender %q: %v", l.entry.name, err)
+			l.entry.loop.MarkDisconnected(err)
+			flushErr = errors.Join(flushErr, fmt.Errorf("sender %q final flush: %w", l.entry.name, err))
+			flushFailures = append(flushFailures, flushFailure{reader: l.reader, name: l.entry.name})
+		}
+	}
 
 	// Python shutdown: save_state in a broad try ("Saving state at
-	// shutdown failed").
-	if err := p.saveState(); err != nil {
+	// shutdown failed"). A failed final delivery must not be recorded as
+	// successfully completed, so the rolled-back state is what gets
+	// written.
+	st := p.buildState()
+	for _, f := range flushFailures {
+		rollbackSent(st, p.previousState, f.reader, f.name)
+	}
+	if err := p.persistState(st); err != nil {
 		p.log.Printf("Saving state at shutdown failed: %v", err)
 	}
-	for _, entry := range entries {
-		if closer, ok := entry.inst.Transport.(io.Closer); ok {
+	for _, l := range live {
+		if closer, ok := l.entry.inst.Transport.(io.Closer); ok {
 			_ = closer.Close()
 		}
 	}
-	return notifyErr
+	return errors.Join(notifyErr, readerErr, senderErr, flushErr)
+}
+
+// rollbackSent restores the persisted state's sent cursor/count/bytes
+// for one sender to the last successfully saved value (zero when there
+// is no previous state), so a failed final flush does not record
+// undelivered messages as sent.
+func rollbackSent(st, prev *state.State, reader, senderName string) {
+	rs := st.Readers[reader]
+	if rs == nil {
+		return
+	}
+	var prevSent *state.SentState
+	if prev != nil {
+		if prs := prev.Readers[reader]; prs != nil {
+			for i := range prs.Senders {
+				if prs.Senders[i].Name == senderName {
+					prevSent = &prs.Senders[i].State.Sent
+					break
+				}
+			}
+		}
+	}
+	for i := range rs.Senders {
+		if rs.Senders[i].Name != senderName {
+			continue
+		}
+		if prevSent != nil {
+			rs.Senders[i].State.Sent = *prevSent
+		} else {
+			rs.Senders[i].State.Sent = state.SentState{}
+		}
+		return
+	}
 }
 
 // maxSenderGrace returns the max over the LIVE senders'
@@ -1305,10 +1398,14 @@ func pythonDictString(hits map[string]int64) string {
 // (Python compares the parsed dicts — Go compares the typed states
 // with reflect.DeepEqual, the sanctioned equivalent).
 func (p *Pump) saveState() error {
+	return p.persistState(p.buildState())
+}
+
+// persistState writes st when it differs from the last persisted state.
+func (p *Pump) persistState(st *state.State) error {
 	if p.statePath == "" {
 		return nil
 	}
-	st := p.buildState()
 	if p.previousState != nil && reflect.DeepEqual(st, p.previousState) {
 		return nil
 	}
