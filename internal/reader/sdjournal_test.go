@@ -6,6 +6,7 @@
 package reader
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -331,5 +332,42 @@ func TestIncLineStats(t *testing.T) {
 	stats.NoteCursor()
 	if ago := stats.LastJournalMsgAgo(); ago > time.Second {
 		t.Fatalf("last_read_ago after NoteCursor = %v", ago)
+	}
+}
+
+// TestStepFromRc pins the sd_journal_next/previous INT ABI handling:
+// a negative errno must surface as an error, never as "entry present"
+// (a uint64 reading of the ABI would zero-extend -74 into a huge
+// positive and mask journal errors).
+func TestStepFromRc(t *testing.T) {
+	if present, err := stepFromRc(1); !present || err != nil {
+		t.Fatalf("stepFromRc(1) = %v, %v; want true, nil", present, err)
+	}
+	if present, err := stepFromRc(0); present || err != nil {
+		t.Fatalf("stepFromRc(0) = %v, %v; want false, nil", present, err)
+	}
+	present, err := stepFromRc(-74)
+	if present || !errors.Is(err, ErrBadMessage) {
+		t.Fatalf("stepFromRc(-74) = %v, %v; want false, ErrBadMessage", present, err)
+	}
+	present, err = stepFromRc(-2)
+	if present || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stepFromRc(-2) = %v, %v; want false, ENOENT", present, err)
+	}
+}
+
+// TestWaitImmediatePoll pins wait(0): an immediate non-blocking poll
+// (Python wait(0)) — it must return without waiting for the timeout
+// machinery.
+func TestWaitImmediatePoll(t *testing.T) {
+	r := openFixture(t, "rotated_logs", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	if _, err := r.Wait(ctx, 0); err != nil {
+		t.Fatalf("Wait(0): %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("Wait(0) took %v, want an immediate poll", elapsed)
 	}
 }

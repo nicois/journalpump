@@ -82,12 +82,14 @@ var flagNames = map[string]int{
 // FlagsFromNames resolves the journal_flags config list to the OR of
 // the named constants. nil (config journal_flags absent or not a
 // list) yields 0 — Python passes None through to python-systemd, whose
-// C layer opens with flags 0 (probed: LOCAL_ONLY would make
-// journal_path opening fail with "Opening the journal failed"). An
-// empty list is also 0 here (Python's reduce over [] would raise
-// TypeError, unreachable through config decoding). Unknown names are
-// an error — Python's getattr would raise AttributeError at reader
-// construction.
+// journal.py:168-174 then defaults to LOCAL_ONLY for plain and
+// namespace opens (Open reproduces that default; a path or files
+// opening passes the zero through, because open_directory rejects
+// LOCAL_ONLY with EINVAL and Python fails identically with "Opening
+// the journal failed"). An empty list is also 0 here (Python's reduce
+// over [] would raise TypeError, unreachable through config decoding).
+// Unknown names are an error — Python's getattr would raise
+// AttributeError at reader construction.
 func FlagsFromNames(names []string) (int, error) {
 	if len(names) == 0 {
 		return 0, nil
@@ -131,7 +133,9 @@ func (discardLogger) Printf(_ string, _ ...any) {}
 type Reader interface {
 	// Wait blocks until the journal changes, the timeout elapses, or
 	// ctx is done, then reports what changed (Python's
-	// journal.wait(timeout)).
+	// journal.wait(timeout)). Timeout semantics: timeout < 0 blocks
+	// indefinitely (Python wait(None)); timeout == 0 is an immediate
+	// non-blocking poll of the current state (Python wait(0)).
 	Wait(ctx context.Context, timeout time.Duration) (Event, error)
 	// ReadBatch returns up to n entries starting at the reader's
 	// position, advancing it. Fewer entries mean the journal is
@@ -155,6 +159,12 @@ type Reader interface {
 // a string can match (an int 6 never equals "6" in Python). This is
 // entry-level equality — it is NOT an sd_journal add_match, which
 // would filter at the journal level.
+//
+// match_value=None in Python compares equal to nothing
+// (entry.get(key) is never None for a present field). The Go "" value
+// would match empty-string fields — a divergence the Task 16 wiring
+// must guard: an UNSET match_value (config key absent) must be wired
+// as never-match, not as empty-string-match (parity doc, Task 15).
 func CheckMatch(fields []journal.Field, matchKey, matchValue string) bool {
 	if matchKey == "" {
 		return true

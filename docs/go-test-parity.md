@@ -684,10 +684,18 @@ Structure:
 
 Python facts pinned:
 
-- Flags pass through verbatim; `flags=None` in Python ≡ `0` in Go
-  (empirically probed: LOCAL_ONLY=1 passed to `sd_journal_open_directory`
-  fails with EINVAL / Python "Opening the journal failed" — there is
-  NO masking in python-systemd, so none here either).
+- Flags pass through verbatim. Python's `flags=None` defaults to
+  LOCAL_ONLY(1) for plain and namespace opens
+  (python-systemd journal.py:168-174 — applies only when path AND
+  files are both None); `Open` reproduces that default
+  (`cfg.Flags==0 && Path=="" && len(Files)==0 → FlagLocalOnly`), so a
+  bare config (including the namespace case) runs LOCAL_ONLY in both.
+  A path or files opening passes the zero through: probed,
+  `sd_journal_open_directory` rejects LOCAL_ONLY with EINVAL and
+  Python fails identically ("Opening the journal failed") — there is
+  no masking in python-systemd, so none here either. (Review round 1
+  corrected an earlier false claim that Python had no LOCAL_ONLY
+  default at all.)
 - **libsystemd does not export `sd_journal_add_file`** — files mode is
   `sd_journal_open_files` (NULL-terminated argv-style path array).
 - `seek_monotonic` resolves the current boot via `sd_id128_get_boot`
@@ -755,3 +763,51 @@ Accepted deviations (to be flagged for review):
 - `persistent_gauges` live in `statsd.PersistentGauges` (Task 7);
   reader.Stats owns one via its `Gauges` field. The test_stats.py
   parity test is `statsd.TestPersistentGauge` (already green).
+
+Task 16 forward notes from this task:
+
+- **match_value=None guard**: Python's `entry.get(match_key) ==
+  match_value` with an UNSET match_value (None) never matches anything.
+  `CheckMatch("", value)` with an empty matchValue would instead match
+  empty-string fields. The Task 16 wiring must treat an unset
+  match_value as never-match (or not call CheckMatch with one), never
+  as empty-string-match.
+- **Read-error handler**: `ReadBatch` ends early on ANY read failure
+  (ErrBadMessage, errFieldWithoutEquals, I/O). Task 16's
+  read_single_message port must catch ALL of them like Python's broad
+  except: ErrBadMessage → journal.corrupted_log_entry + warn
+  (read_next parity); everything else → log.exception +
+  stats.unexpected_exception(where="mainloop", app=journalpump) +
+  0.5 s sleep + has_more=False (journalpump.py:1005-1017).
+
+Review notes from the Task 15 round (3 majors fixed):
+
+- **FFI ABI (major)**: sd_journal_next/previous return an INT
+  (negative = -errno), not uint64 — an earlier draft's uint64 wrapper
+  zero-extended -74 into 4294967222 and silently treated errors as
+  "entry present". The typedef is now `int`, and `stepFromRc` folds the
+  rc (pinned by `TestStepFromRc`).
+- **Match/seek order (major)**: matches are added AFTER the initial
+  position, in Python's order (journalpump.py:479-481). With
+  match-then-seek the resume skip consumed the first MATCHING entry
+  after the cursor and silently lost it whenever the cursor entry did
+  not match the current filters.
+- **LOCAL_ONLY default (major)**: python-systemd journal.py:168-174
+  defaults flags=None → LOCAL_ONLY when path AND files are both None;
+  reproduced in Open (see the flags bullet above).
+- **Wait semantics (minor)**: timeout < 0 = Python wait(None)
+  (indefinite); timeout == 0 = Python wait(0) — an immediate
+  non-blocking poll (`TestWaitImmediatePoll`); timeout > 0 bounded in
+  100 ms slices so ctx cancellation is honored.
+- **Symbol-resolution errors (minor)**: infrastructure failures
+  (dlopen/dlsym) are returned as Go errors naming the missing
+  symbol/library, never folded into an rc that would render as errno 1
+  ("operation not permitted"). Every ffi method now returns
+  (result, rc, err) with err reserved for infrastructure.
+- **Mid-open failure divergence (minor)**: Python's get_reader can
+  leave a partially-initialized reader behind when a mid-open step
+  fails; Go closes the handle and returns the error — cleaner, noted
+  divergence (the pump-level outcome is the same: no reader this
+  round).
+- The files-available gate sits before the position block, matching
+  Python's get_reader order (journalpump.py:432 before :448).

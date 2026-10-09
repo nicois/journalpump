@@ -22,6 +22,12 @@ package reader
 // The prototypes are hand-declared from the sd-journal ABI, which is
 // stable: negative return values are -errno, and the constants
 // (flags, wait events) are pinned in reader.go.
+//
+// Error channeling: every method returns (result..., rc, err) where
+// err is non-nil ONLY for infrastructure failures (dlopen/dlsym —
+// reported verbatim, naming the missing symbol), and rc carries the
+// raw libsystemd return (negative = -errno) for the sdjournal layer to
+// classify. A zero rc with a non-nil err is never a successful call.
 
 /*
 #cgo LDFLAGS: -ldl
@@ -41,7 +47,7 @@ typedef int      (*fn_open_namespace)(sd_journal**, const char*, int);
 typedef int      (*fn_open_directory)(sd_journal**, const char*, int);
 typedef int      (*fn_open_files)(sd_journal**, const char**, int);
 typedef int      (*fn_add_match)(sd_journal*, const void*, unsigned);
-typedef uint64_t (*fn_step)(sd_journal*);
+typedef int      (*fn_step)(sd_journal*);
 typedef int      (*fn_seek_head)(sd_journal*);
 typedef int      (*fn_seek_tail)(sd_journal*);
 typedef int      (*fn_seek_cursor)(sd_journal*, const char*);
@@ -81,8 +87,12 @@ static int call_open_files(void* f, sd_journal** out, int flags, int nfiles, cha
 	return rc;
 }
 static int call_add_match(void* f, sd_journal* j, const void* data, unsigned len) { return ((fn_add_match)f)(j, data, len); }
-static uint64_t call_next(void* f, sd_journal* j) { return ((fn_step)f)(j); }
-static uint64_t call_previous(void* f, sd_journal* j) { return ((fn_step)f)(j); }
+
+// sd_journal_next/previous return an INT: >0 the read position moved,
+// 0 the end was reached, negative -errno. Declaring them uint64 (as an
+// earlier draft did) zero-extends a negative rc into a huge positive
+// and silently turns errors into "entry present".
+static int call_step(void* f, sd_journal* j) { return ((fn_step)f)(j); }
 static int call_seek_head(void* f, sd_journal* j) { return ((fn_seek_head)f)(j); }
 static int call_seek_tail(void* f, sd_journal* j) { return ((fn_seek_tail)f)(j); }
 static int call_seek_cursor(void* f, sd_journal* j, const char* c) { return ((fn_seek_cursor)f)(j, c); }
@@ -168,58 +178,60 @@ func ffiSymbol(name string) (unsafe.Pointer, error) {
 }
 
 // ffiJournal wraps one sd_journal handle. Methods return the raw
-// libsystemd negative-errno codes; the sdjournal layer classifies them.
+// libsystemd return code alongside an infrastructure error (see the
+// package comment); the sdjournal layer classifies negative rc values
+// via sdErr.
 type ffiJournal struct {
 	j *C.sd_journal
 }
 
-func ffiOpen(flags int) (*ffiJournal, int) {
+func ffiOpen(flags int) (*ffiJournal, int, error) {
 	f, err := ffiSymbol("sd_journal_open")
 	if err != nil {
-		return nil, -1 // symbol errors surface as the caller's error path
+		return nil, 0, err
 	}
 	var j *C.sd_journal
 	rc := C.call_open(f, &j, C.int(flags)) //nolint:gocritic // false positive on cgo-generated pointer check
 	if rc != 0 {
-		return nil, int(rc)
+		return nil, int(rc), nil
 	}
-	return &ffiJournal{j: j}, 0
+	return &ffiJournal{j: j}, 0, nil
 }
 
-func ffiOpenNamespace(namespace string, flags int) (*ffiJournal, int) {
+func ffiOpenNamespace(namespace string, flags int) (*ffiJournal, int, error) {
 	f, err := ffiSymbol("sd_journal_open_namespace")
 	if err != nil {
-		return nil, -1
+		return nil, 0, err
 	}
 	cns := C.CString(namespace)
 	defer C.free(unsafe.Pointer(cns))
 	var j *C.sd_journal
 	rc := C.call_open_namespace(f, &j, cns, C.int(flags)) //nolint:gocritic // false positive on cgo-generated pointer check
 	if rc != 0 {
-		return nil, int(rc)
+		return nil, int(rc), nil
 	}
-	return &ffiJournal{j: j}, 0
+	return &ffiJournal{j: j}, 0, nil
 }
 
-func ffiOpenDirectory(path string, flags int) (*ffiJournal, int) {
+func ffiOpenDirectory(path string, flags int) (*ffiJournal, int, error) {
 	f, err := ffiSymbol("sd_journal_open_directory")
 	if err != nil {
-		return nil, -1
+		return nil, 0, err
 	}
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
 	var j *C.sd_journal
 	rc := C.call_open_directory(f, &j, cpath, C.int(flags)) //nolint:gocritic // false positive on cgo-generated pointer check
 	if rc != 0 {
-		return nil, int(rc)
+		return nil, int(rc), nil
 	}
-	return &ffiJournal{j: j}, 0
+	return &ffiJournal{j: j}, 0, nil
 }
 
-func ffiOpenFiles(files []string, flags int) (*ffiJournal, int) {
+func ffiOpenFiles(files []string, flags int) (*ffiJournal, int, error) {
 	f, err := ffiSymbol("sd_journal_open_files")
 	if err != nil {
-		return nil, -1
+		return nil, 0, err
 	}
 	var argv []*C.char
 	for _, file := range files {
@@ -234,91 +246,94 @@ func ffiOpenFiles(files []string, flags int) (*ffiJournal, int) {
 	}
 	rc := int(C.call_open_files(f, &j, C.int(flags), C.int(len(argv)), argvPtr)) //nolint:gocritic // false positive on cgo-generated pointer check
 	if rc != 0 {
-		return nil, rc
+		return nil, rc, nil
 	}
-	return &ffiJournal{j: j}, 0
+	return &ffiJournal{j: j}, 0, nil
 }
 
-func (h *ffiJournal) addMatch(match string) int {
+func (h *ffiJournal) addMatch(match string) (int, error) {
 	f, err := ffiSymbol("sd_journal_add_match")
 	if err != nil {
-		return -1
+		return 0, err
 	}
 	cdata := C.CBytes([]byte(match))
 	defer C.free(cdata)
-	return int(C.call_add_match(f, h.j, cdata, C.uint(len(match))))
+	return int(C.call_add_match(f, h.j, cdata, C.uint(len(match)))), nil
 }
 
-func (h *ffiJournal) next() uint64 {
+// next steps to the next entry: rc > 0 the position moved, rc == 0 the
+// end was reached, rc < 0 -errno (int ABI — see call_step).
+func (h *ffiJournal) next() (int, error) {
 	f, err := ffiSymbol("sd_journal_next")
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return uint64(C.call_next(f, h.j))
+	return int(C.call_step(f, h.j)), nil
 }
 
-func (h *ffiJournal) previous() uint64 {
+func (h *ffiJournal) previous() (int, error) {
 	f, err := ffiSymbol("sd_journal_previous")
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return uint64(C.call_previous(f, h.j))
+	return int(C.call_step(f, h.j)), nil
 }
 
-func (h *ffiJournal) seekHead() int {
+func (h *ffiJournal) seekHead() (int, error) {
 	f, err := ffiSymbol("sd_journal_seek_head")
 	if err != nil {
-		return -1
+		return 0, err
 	}
-	return int(C.call_seek_head(f, h.j))
+	return int(C.call_seek_head(f, h.j)), nil
 }
 
-func (h *ffiJournal) seekTail() int {
+func (h *ffiJournal) seekTail() (int, error) {
 	f, err := ffiSymbol("sd_journal_seek_tail")
 	if err != nil {
-		return -1
+		return 0, err
 	}
-	return int(C.call_seek_tail(f, h.j))
+	return int(C.call_seek_tail(f, h.j)), nil
 }
 
-func (h *ffiJournal) seekCursor(cursor string) int {
+func (h *ffiJournal) seekCursor(cursor string) (int, error) {
 	f, err := ffiSymbol("sd_journal_seek_cursor")
 	if err != nil {
-		return -1
+		return 0, err
 	}
 	cc := C.CString(cursor)
 	defer C.free(unsafe.Pointer(cc))
-	return int(C.call_seek_cursor(f, h.j, cc))
+	return int(C.call_seek_cursor(f, h.j, cc)), nil
 }
 
 // id128 mirrors sd_id128_t for by-value ABI passing.
 type id128 struct{ q0, q1 uint64 }
 
-func (h *ffiJournal) seekMonotonicUsec(boot id128, usec uint64) int {
+func (h *ffiJournal) seekMonotonicUsec(boot id128, usec uint64) (int, error) {
 	f, err := ffiSymbol("sd_journal_seek_monotonic_usec")
 	if err != nil {
-		return -1
+		return 0, err
 	}
-	return int(C.call_seek_monotonic(f, h.j, C.go_id128_t{q0: C.uint64_t(boot.q0), q1: C.uint64_t(boot.q1)}, C.uint64_t(usec)))
+	return int(C.call_seek_monotonic(f, h.j, C.go_id128_t{q0: C.uint64_t(boot.q0), q1: C.uint64_t(boot.q1)}, C.uint64_t(usec))), nil
 }
 
-func bootID() (id128, int) {
+func bootID() (id128, int, error) {
 	f, err := ffiSymbol("sd_id128_get_boot")
 	if err != nil {
-		return id128{}, -1
+		return id128{}, 0, err
 	}
 	var out C.go_id128_t
 	rc := C.call_id128_get_boot(f, &out)
-	return id128{q0: uint64(out.q0), q1: uint64(out.q1)}, int(rc)
+	return id128{q0: uint64(out.q0), q1: uint64(out.q1)}, int(rc), nil
 }
 
 // waitUsec blocks up to timeoutUsec; (1<<63)-1 waits indefinitely.
-func (h *ffiJournal) waitUsec(timeoutUsec uint64) int {
+// Returns SD_JOURNAL_NOP/APPEND/INVALIDATE.
+func (h *ffiJournal) waitUsec(timeoutUsec uint64) (int, error) {
 	f, err := ffiSymbol("sd_journal_wait")
 	if err != nil {
-		return -1
+		return 0, err
 	}
-	return int(C.call_wait(f, h.j, C.uint64_t(timeoutUsec)))
+	return int(C.call_wait(f, h.j, C.uint64_t(timeoutUsec))), nil
 }
 
 // enumBufPool backs enumerateData: the C copy target (1 MiB, twice the
@@ -330,61 +345,61 @@ var enumBufPool = sync.Pool{
 
 // enumerateData returns the next data tuple of the current entry; rc
 // is 1 on success, 0 at the end of the enumeration, or -errno.
-func (h *ffiJournal) enumerateData() (data []byte, rc int) {
+func (h *ffiJournal) enumerateData() ([]byte, int, error) {
 	f, err := ffiSymbol("sd_journal_enumerate_data")
 	if err != nil {
-		return nil, -1
+		return nil, 0, err
 	}
 	bufPtr := enumBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer func() { enumBufPool.Put(bufPtr) }()
 	var length C.size_t
-	rc = int(C.call_enumerate_data(f, h.j, unsafe.Pointer(&buf[0]), C.size_t(len(buf)), &length))
+	rc := int(C.call_enumerate_data(f, h.j, unsafe.Pointer(&buf[0]), C.size_t(len(buf)), &length))
 	if rc != 1 {
-		return nil, rc
+		return nil, rc, nil
 	}
-	return append([]byte(nil), buf[:length]...), rc
+	return append([]byte(nil), buf[:length]...), rc, nil
 }
 
-func (h *ffiJournal) getCursor() (string, int) {
+func (h *ffiJournal) getCursor() (string, int, error) {
 	f, err := ffiSymbol("sd_journal_get_cursor")
 	if err != nil {
-		return "", -1
+		return "", 0, err
 	}
 	var out *C.char
 	rc := int(C.call_get_cursor(f, h.j, &out)) //nolint:gocritic // false positive on cgo-generated pointer check
 	if rc != 0 {
-		return "", rc
+		return "", rc, nil
 	}
 	s := C.GoString(out)
 	C.free(unsafe.Pointer(out))
-	return s, 0
+	return s, 0, nil
 }
 
-func (h *ffiJournal) realtimeUsec() (uint64, int) {
+func (h *ffiJournal) realtimeUsec() (uint64, int, error) {
 	f, err := ffiSymbol("sd_journal_get_realtime_usec")
 	if err != nil {
-		return 0, -1
+		return 0, 0, err
 	}
 	var out C.uint64_t
 	rc := int(C.call_get_realtime(f, h.j, &out))
-	return uint64(out), rc
+	return uint64(out), rc, nil
 }
 
-func (h *ffiJournal) hasPersistentFiles() int {
+func (h *ffiJournal) hasPersistentFiles() (int, error) {
 	f, err := ffiSymbol("sd_journal_has_persistent_files")
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return int(C.call_has_persistent(f, h.j))
+	return int(C.call_has_persistent(f, h.j)), nil
 }
 
-func (h *ffiJournal) hasRuntimeFiles() int {
+func (h *ffiJournal) hasRuntimeFiles() (int, error) {
 	f, err := ffiSymbol("sd_journal_has_runtime_files")
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return int(C.call_has_runtime(f, h.j))
+	return int(C.call_has_runtime(f, h.j)), nil
 }
 
 func (h *ffiJournal) close() {

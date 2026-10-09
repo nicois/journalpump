@@ -55,8 +55,9 @@ type InitialPosition struct {
 // (journalpump.py:409-481). At most one of Path / Files / Namespace is
 // meaningful, like Python's reader_kwargs.
 type OpenConfig struct {
-	// Flags is the OR of Flag* constants (journal_flags); 0 means the
-	// python-systemd default (LOCAL_ONLY).
+	// Flags is the OR of Flag* constants (journal_flags). Zero means
+	// Python's flags=None; Open applies python-systemd's default
+	// (LOCAL_ONLY) for plain and namespace opens — see Open.
 	Flags int
 	Path  string   // journal_path — open the journal directory
 	Files []string // journal_files — open individual files
@@ -64,7 +65,8 @@ type OpenConfig struct {
 	Namespace string
 	// Matches are the add_match constraints: units_to_match entries
 	// become _SYSTEMD_UNIT=<unit> matches, journald_filters entries are
-	// field/value pairs (journalpump.py:479-481).
+	// field/value pairs (journalpump.py:479-481). They are added AFTER
+	// the initial position, in Python's order.
 	Matches []Match
 	// ResumeCursor is the seek_to cursor: seek_cursor + the one-entry
 	// skip so the last sent entry is not delivered twice. On reader
@@ -89,9 +91,9 @@ var ErrFilesNotAvailable = errors.New("journal files not yet available")
 
 // FilesAvailableOverride is the fixture/test escape hatch for the
 // files-available gate: when non-nil, it replaces the
-// has_persistent_files/has_runtime_files gate result. Nil (the
-// default) uses the real libsystemd semantics. The Python systest
-// harness patches the identical check on the python class
+// has_persistent_files/has_runtime_files result. Nil (the default)
+// uses the real libsystemd semantics. The Python systest harness
+// patches the identical check on the python class
 // (systest/groundtruth_support.py:77-78) because arbitrary fixture
 // directories are never "journal directories" to libsystemd; the Go
 // test harness needs the same escape hatch. Production wiring must
@@ -116,29 +118,56 @@ func sdErr(what string, rc int) error {
 	}
 }
 
+// stepFromRc converts an sd_journal_next/previous return (INT ABI):
+// rc > 0 the read position moved onto an entry, rc == 0 the end was
+// reached, rc < 0 an error. Separated out because a naive
+// nonzero-means-success reading silently turns a negative errno into
+// "entry present" once zero-extension is involved.
+func stepFromRc(rc int) (present bool, err error) {
+	if rc < 0 {
+		return false, sdErr("step", rc)
+	}
+	return rc > 0, nil
+}
+
 // Open builds a reader per cfg, including the files-available gate and
 // the initial position application — the full get_reader sequence
 // minus the pump-owned bookkeeping (initial_position clearing and the
 // recreate cadence live in the Task 16 pump).
 //
-// Flag semantics follow the probed python-systemd surface: flags pass
-// through verbatim to the matching sd_journal_open* call, where 0 is
-// the None default. Note LOCAL_ONLY/RUNTIME_ONLY are rejected by
-// sd_journal_open_directory with EINVAL — Python fails identically
-// (ValueError "Opening the journal failed"), so no masking.
+// Flag semantics follow python-systemd's journal.py:168-174: flags
+// pass through verbatim, and flags=None (Go zero) means LOCAL_ONLY for
+// plain and namespace opens. When a path or files list is given, the
+// zero passes through unchanged — probed: sd_journal_open_directory
+// rejects LOCAL_ONLY with EINVAL (Python fails identically with
+// "Opening the journal failed"), so no masking there.
+//
+// Order parity note: Python leaves a partially-initialized reader
+// behind when a mid-open step fails (its get_reader resets
+// journald_reader only on some paths); Go closes the handle and
+// returns the error — recorded in the parity doc as a divergence.
 func Open(cfg OpenConfig) (*SDJournal, error) {
 	flags := cfg.Flags
+	if flags == 0 && cfg.Path == "" && len(cfg.Files) == 0 {
+		// python-systemd's default: LOCAL_ONLY for plain and
+		// namespace opens when flags is None (journal.py:168-174).
+		flags = FlagLocalOnly
+	}
 	var h *ffiJournal
 	var rc int
+	var err error
 	switch {
 	case cfg.Namespace != "":
-		h, rc = ffiOpenNamespace(cfg.Namespace, flags)
+		h, rc, err = ffiOpenNamespace(cfg.Namespace, flags)
 	case cfg.Path != "":
-		h, rc = ffiOpenDirectory(cfg.Path, flags)
+		h, rc, err = ffiOpenDirectory(cfg.Path, flags)
 	case len(cfg.Files) > 0:
-		h, rc = ffiOpenFiles(cfg.Files, flags)
+		h, rc, err = ffiOpenFiles(cfg.Files, flags)
 	default:
-		h, rc = ffiOpen(flags)
+		h, rc, err = ffiOpen(flags)
+	}
+	if err != nil {
+		return nil, err
 	}
 	if rc < 0 {
 		return nil, sdErr("open journal", rc)
@@ -148,14 +177,15 @@ func Open(cfg OpenConfig) (*SDJournal, error) {
 		_ = s.Close()
 		return nil, err
 	}
-	for _, m := range cfg.Matches {
-		if rc := s.h.addMatch(m.Field + "=" + m.Value); rc < 0 {
-			return fail(sdErr("add match", rc))
-		}
-	}
 
-	hasPersistent := s.h.hasPersistentFiles()
-	hasRuntime := s.h.hasRuntimeFiles()
+	hasPersistent, err := s.h.hasPersistentFiles()
+	if err != nil {
+		return fail(err)
+	}
+	hasRuntime, err := s.h.hasRuntimeFiles()
+	if err != nil {
+		return fail(err)
+	}
 	available := hasPersistent != 0 || hasRuntime != 0
 	if FilesAvailableOverride != nil {
 		available = FilesAvailableOverride(hasPersistent != 0, hasRuntime != 0)
@@ -170,6 +200,18 @@ func Open(cfg OpenConfig) (*SDJournal, error) {
 
 	if err := s.applyInitial(cfg); err != nil {
 		return fail(err)
+	}
+	// Matches are added AFTER the initial position, in Python's order
+	// (journalpump.py:479-481): with match-then-seek the skip would
+	// consume the first MATCHING entry after the resume cursor and
+	// silently lose it whenever the cursor entry does not match the
+	// current filters.
+	for _, m := range cfg.Matches {
+		if rc, err := s.h.addMatch(m.Field + "=" + m.Value); err != nil {
+			return fail(err)
+		} else if rc < 0 {
+			return fail(sdErr("add match", rc))
+		}
 	}
 	return s, nil
 }
@@ -201,10 +243,20 @@ func (s *SDJournal) applyInitial(cfg OpenConfig) error {
 		// sd_journal_next is not allowed immediately after
 		// sd_journal_seek_tail: land on the last entry first, then
 		// step past it.
-		if rc := s.h.seekTail(); rc < 0 {
+		if rc, err := s.h.seekTail(); err != nil {
+			return err
+		} else if rc < 0 {
 			return sdErr("seek tail", rc)
 		}
-		if s.h.previous() == 0 {
+		prevRc, err := s.h.previous()
+		if err != nil {
+			return err
+		}
+		present, err := stepFromRc(prevRc)
+		if err != nil {
+			return err
+		}
+		if !present {
 			return nil // empty journal
 		}
 		// Materializing the last entry can hit "Bad message"; the
@@ -226,7 +278,9 @@ func (s *SDJournal) applyInitial(cfg OpenConfig) error {
 			return err
 		}
 	case PositionHead:
-		if rc := s.h.seekHead(); rc < 0 {
+		if rc, err := s.h.seekHead(); err != nil {
+			return err
+		} else if rc < 0 {
 			return sdErr("seek head", rc)
 		}
 	case PositionSeconds:
@@ -242,22 +296,46 @@ func (s *SDJournal) applyInitial(cfg OpenConfig) error {
 // python-systemd resolves the current boot id and converts seconds to
 // microseconds.
 func (s *SDJournal) SeekMonotonicSeconds(seconds int) error {
-	boot, rc := bootID()
+	boot, rc, err := bootID()
+	if err != nil {
+		return err
+	}
 	if rc < 0 {
 		return sdErr("get boot id", rc)
 	}
-	if rc := s.h.seekMonotonicUsec(boot, uint64(seconds)*1_000_000); rc < 0 {
+	rc, err = s.h.seekMonotonicUsec(boot, uint64(seconds)*1_000_000)
+	if err != nil {
+		return err
+	}
+	if rc < 0 {
 		return sdErr("seek monotonic", rc)
 	}
 	return nil
 }
 
-// Wait implements Reader.Wait. sd_journal_wait blocks in C and cannot
-// be interrupted, so the wait runs in slices (cancellation is honored
-// within one 100 ms slice; event wakeups return immediately).
+// Wait implements Reader.Wait. Timeout semantics follow
+// python-systemd's wait(): timeout < 0 blocks indefinitely (Python
+// wait(None)), timeout == 0 is an immediate non-blocking poll of the
+// current state (Python wait(0)), timeout > 0 waits at most that long.
+// sd_journal_wait blocks in C and cannot be interrupted, so the
+// bounded waits run in slices (cancellation is honored within one
+// 100 ms slice; event wakeups return immediately).
 func (s *SDJournal) Wait(ctx context.Context, timeout time.Duration) (Event, error) {
 	const slice = 100 * time.Millisecond
-	deadline := time.Now().Add(timeout)
+	if timeout == 0 {
+		rc, err := s.h.waitUsec(0)
+		if err != nil {
+			return EventNOP, err
+		}
+		if rc < 0 {
+			return EventNOP, sdErr("journal wait", rc)
+		}
+		return Event(rc), nil
+	}
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return EventNOP, err
@@ -270,7 +348,10 @@ func (s *SDJournal) Wait(ctx context.Context, timeout time.Duration) (Event, err
 			}
 			usec = uint64(min(remaining, slice) / time.Microsecond)
 		}
-		rc := s.h.waitUsec(usec)
+		rc, err := s.h.waitUsec(usec)
+		if err != nil {
+			return EventNOP, err
+		}
 		if rc < 0 {
 			return EventNOP, sdErr("journal wait", rc)
 		}
@@ -282,9 +363,10 @@ func (s *SDJournal) Wait(ctx context.Context, timeout time.Duration) (Event, err
 
 // ReadBatch implements Reader.ReadBatch: up to n entries from the
 // current position. It returns the entries read so far together with
-// ErrBadMessage when the batch ended on a corrupt entry (the caller
-// counts it — Python's read_next), and fewer entries than requested
-// when the journal is exhausted.
+// the failure when the batch ended on one (ErrBadMessage for corrupt
+// data the caller counts, errFieldWithoutEquals and others for the
+// Task 16 broad handler), and fewer entries than requested when the
+// journal is exhausted.
 func (s *SDJournal) ReadBatch(n int) ([]journal.Entry, error) {
 	out := make([]journal.Entry, 0, n)
 	for i := 0; i < n; i++ {
@@ -302,7 +384,11 @@ func (s *SDJournal) ReadBatch(n int) ([]journal.Entry, error) {
 
 // Seek implements Reader.Seek.
 func (s *SDJournal) Seek(cursor string) error {
-	return sdErr("seek cursor", s.h.seekCursor(cursor))
+	rc, err := s.h.seekCursor(cursor)
+	if err != nil {
+		return err
+	}
+	return sdErr("seek cursor", rc)
 }
 
 // Close implements Reader.Close.
@@ -319,7 +405,15 @@ func (s *SDJournal) Close() error {
 // and __SEQNUM, convert. ok is false at the end of the journal or when
 // the entry has no fields (Python's falsy-entry skip).
 func (s *SDJournal) readNext() (journal.Entry, bool, error) {
-	if s.h.next() == 0 {
+	rc, err := s.h.next()
+	if err != nil {
+		return journal.Entry{}, false, err
+	}
+	present, err := stepFromRc(rc)
+	if err != nil {
+		return journal.Entry{}, false, err
+	}
+	if !present {
 		return journal.Entry{}, false, nil
 	}
 	fields, err := s.materialize()
@@ -329,12 +423,18 @@ func (s *SDJournal) readNext() (journal.Entry, bool, error) {
 	if len(fields) == 0 {
 		return journal.Entry{}, false, nil
 	}
-	usec, rc := s.h.realtimeUsec()
+	usec, rc, err := s.h.realtimeUsec()
+	if err != nil {
+		return journal.Entry{}, false, err
+	}
 	if rc < 0 {
 		return journal.Entry{}, false, sdErr("get realtime", rc)
 	}
 	fields = journal.SetField(fields, "__REALTIME_TIMESTAMP", int64(usec))
-	cursor, rc := s.h.getCursor()
+	cursor, rc, err := s.h.getCursor()
+	if err != nil {
+		return journal.Entry{}, false, err
+	}
 	if rc < 0 {
 		return journal.Entry{}, false, sdErr("get cursor", rc)
 	}
@@ -359,7 +459,10 @@ var errFieldWithoutEquals = errors.New("journal gave us a field without '='")
 func (s *SDJournal) materialize() ([]journal.Field, error) {
 	var fields []journal.Field
 	for {
-		data, rc := s.h.enumerateData()
+		data, rc, err := s.h.enumerateData()
+		if err != nil {
+			return nil, err
+		}
 		if rc == 0 {
 			return fields, nil
 		}
