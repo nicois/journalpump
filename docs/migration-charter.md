@@ -208,6 +208,18 @@ NEWS entry — plan Task 28):
 - Logplex framing: Go emits the clean RFC frame format; Python's
   accidental f-string bytes-repr wire framing bug is not reproduced
   (user decision, 2026-10-09; see the governing principle above).
+- Fail-fast on sender panic: a panic inside a sender's transport call
+  is NOT recovered — it crashes the process, where Python's blind
+  per-thread except (senders/base.py:117 daemon threads) silently
+  froze a crashed sender thread while the process stayed "healthy"
+  (no is_alive monitoring, reader wedged on backpressure).
+  Coordinator-ruled 2026-10-09 (Task 13 review) under the §2 "Python
+  is incorrect" clause, independently confirmed by review.
+  Trade-off recorded: a deterministic panic (poison entry)
+  crash-loops the whole daemon and stalls all senders, where Python
+  degraded to one wedged sender — accepted because senders must
+  return errors rather than panic and the systemd restart is
+  self-resetting with state-file resume. NEWS-recorded (Task 28).
 
 ## 3. Resolved decisions (spec §9, user-confirmed 2026-10-09)
 
@@ -457,7 +469,7 @@ from git log alone.
 | 10 | Implementation-agnostic systest harness + running-config/reload suites | done | d773674 + 0d7c1ba | approved (Go harness deferral recorded: systest-go/journalpump_process.go deferred to Task 18; Python-side harness rework (JOURNALPUMP_BIN selection) delivered in Task 10 and is the mechanism both implementations use; running-config/reload suites pass against the Python binary unchanged; harness unit tests for notify socket + exit-code capture) |
 | 11 | Python ground-truth e2e: file/logplex/ES/websocket/state/replay fixtures | done | 4e9985b + 0d4bac5 | changes-required (2 majors + 4 minors) FIXED in 0d4bac5: logplex bytes-repr framing reclassified as a sanctioned deviation (charter §2/D6) — Python ground truth only, content parity via the repr-stripped frame list (parity doc, support docstring, plan Task 21/11/28 aligned); ES content-length assertion moved into the per-run loop; ordered non-alias request sequence persisted in the fixture; per-entry JSON-cache quirk now CAPTURED with two concurrent filterless senders; replay count literal derived. Confirmation pass added: request_sequence fixture value built as lists (GROUNDTRUTH_UPDATE=1 worked end-to-end) |
 | 12 | Kafka ground truth via real broker / recording proxy | done | 6e0c765 + eaee3cf | approved after one review round (5 minors fixed in eaee3cf; explicit skips: _free_port TOCTOU, base64 payload pinning — ASCII fail-loud guard instead): podman Kafka 4.0 KRaft captures (auto-create + manual-create/2-partitions), 40 payloads per run byte-reproducible (fixture sha1 48d65e4b), payload/key/partition/offsets/sent-cursor asserted, snappy pinned via zstandard-blocking shim (deployment-faithful; zstd-preference fact recorded in fixture notes for Task 22) |
-| 13 | Sender framework (error contract, wiring map, synctest) | not-started | - | - |
+| 13 | Sender framework (error contract, wiring map, synctest) | done | 8b3e164 + 6e32971 | approved after one review round (5 minors fixed in 6e32971: post-jitter backoff log, per-route app-tag routing, %r-style quote parity, parity-doc forward notes). Fail-fast divergence independently verified by review: Python = silent unrecoverable sender wedge (base.py:117 daemon thread, no is_alive monitoring) while watchdog keeps passing — now a sanctioned deviation (§2) |
 | 14 | Per-sender buffer + reader backpressure (admission gate) | not-started | - | - |
 | 15 | sdjournal reader (consumer-side seam, stats, match_key/value in handler) | not-started | - | - |
 | 16 | Run loop + per-sender pipeline + file sender | not-started | - | - |
