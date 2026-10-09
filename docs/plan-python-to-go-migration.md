@@ -309,7 +309,8 @@ here too: `inc_line_stats` / `set_persistent_gauge` emit-on-change, 10 s
 per-reader throttle, gauges `journal.read_lines`, `journal.read_bytes`,
 `journal.last_read_ago` (`journalpump.py:350-383`).
 Acceptance: reads the binary `.journal` fixtures from `systest/data/`
-identically to Python (same 30 messages).
+identically to Python (same 40 messages — probed twice and confirmed
+by review; the original "30" figure was wrong).
 Tests: unit tests with the fake reader seam; fixture-driven tests for
 initial-position modes and bad-message data (`systest/data/bad_msg/`);
 reader-stats tests (parity: `test/unit/reader/test_stats.py`); `testing/
@@ -327,6 +328,16 @@ filter objects captured at construction (reload corollary); file sender
 against the Task 11 file fixture**.
 Acceptance: a running Go binary tails a journal to a file with output
 byte-identical to the captured Python fixture.
+**Value-demonstration checkpoint (user decision, 2026-10-09 — charter §6
+last-value-demonstration metric)**: before Task 17 begins, the Go binary
+must demonstrably run end-to-end — reading real journald entries through
+the Task 15 reader, applying filters and serialization, and delivering
+via the file sender to a real output file, driven by a config in the
+production `journalpump.json` format. Record how the run was executed
+and what was observed in the ledger's "last value demonstration" line
+(charter §6; ledger edits are builder-only charter commits per
+charter §5). This is a mid-course checkpoint, NOT a replacement for
+acceptance: the Task 18 systest sweep remains the full gate (Milestone A).
 Tests: unit tests for the serialization pipeline (filter/unit-log-level/
 search combinations); file sender golden test vs Task 11 fixture;
 quirk-lock test for filter capture at construction.
@@ -609,8 +620,10 @@ Depends on: Task 18.
   10 (these three frontload all ground-truth fixtures).
 - Task 13 depends on 7, 8; Task 15 depends on 4; 16 depends on 3, 4, 5,
   6, 9, 13, 14, 15, 11; 17 depends on 16; 18 depends on 17, 10, 11.
-  **Milestone A** after 18: journal→file with cursors surviving
-  restart/reload/Python-state handover.
+  Task 16 carries the first end-to-end value-demonstration checkpoint
+  (charter §6). **Milestone A** after 18: journal→file with cursors
+  surviving restart/reload/Python-state handover — the full acceptance
+  gate; the Task 16 checkpoint is a mid-course demonstration only.
 - 19→20→21 (Phase 2; 21 also needs 11). **Milestone B** after 20:
   journal→rsyslogd byte parity.
 - 22 (needs 12, 13, 14) / 23 (needs 11) / 24 (needs 11) parallelizable.

@@ -205,6 +205,17 @@ NEWS entry — plan Task 28):
   value and uses the same abstract-socket mechanism — the deviation is
   the failure-shape parity and the Notifier seam, not the wire
   mechanics). NEWS-recorded (Task 28).
+- Native libsystemd journal binding: the sd-journal interop is a
+  hand-written dlopen binding (`internal/reader/ffi.go`, cgo with only
+  dlfcn/stdlib/stdint/string; all symbols resolved at runtime) instead
+  of the spec §4.4 coreos/go-systemd/v22 (sdjournal) library row.
+  Reviewer-verified 2026-10-09 (Task 15 review): go-systemd's sdjournal
+  needs the systemd development headers at build time (absent on the
+  build host; no package install available) and lacks
+  `sd_journal_open_namespace` entirely, while the binding needs only
+  libdl and probes libsystemd.so.0 at runtime — the identical runtime
+  dependency python-systemd has today (precedent: the D10 native
+  sd_notify client). NEWS-recorded (Task 28).
 - Logplex framing: Go emits the clean RFC frame format; Python's
   accidental f-string bytes-repr wire framing bug is not reproduced
   (user decision, 2026-10-09; see the governing principle above).
@@ -498,7 +509,7 @@ end-to-end (update when Task 16/18 produces the first run).
 | 12 | Kafka ground truth via real broker / recording proxy | done | 6e0c765 + eaee3cf | approved after one review round (5 minors fixed in eaee3cf; explicit skips: _free_port TOCTOU, base64 payload pinning — ASCII fail-loud guard instead): podman Kafka 4.0 KRaft captures (auto-create + manual-create/2-partitions), 40 payloads per run byte-reproducible (fixture sha1 48d65e4b), payload/key/partition/offsets/sent-cursor asserted, snappy pinned via zstandard-blocking shim (deployment-faithful; zstd-preference fact recorded in fixture notes for Task 22) | 1 | 5 |
 | 13 | Sender framework (error contract, wiring map, synctest) | done | 8b3e164 + 6e32971 | approved after one review round (5 minors fixed in 6e32971: post-jitter backoff log, per-route app-tag routing, %r-style quote parity, parity-doc forward notes). Fail-fast divergence independently verified by review: Python = silent unrecoverable sender wedge (base.py:117 daemon thread, no is_alive monitoring) while watchdog keeps passing — now a sanctioned deviation (§2) | 1 | 5 |
 | 14 | Per-sender buffer + reader backpressure (admission gate) | done | 08ad213 + 3ed7609 | approved after one review round (4 minors fixed in 3ed7609: budget passthrough for the msg_buffer_max_length=0 corner, runtime Attach guard, Task 16 forward note on the bytes_read measure; getsizeof byte budget ruled cosmetic with coordinator+reviewer concurrence) | 1 | 4 |
-| 15 | sdjournal reader (consumer-side seam, stats, match_key/value in handler) | not-started | - | - |
+| 15 | sdjournal reader (consumer-side seam, stats, match_key/value in handler) | done | 0fabf21 + 56f217a | changes-required → FIXED in 56f217a (one review round: 3 majors + 4 minors): FFI step ABI (sd_journal_next/previous return int — a uint64 wrapper zero-extended -errno into "entry present"; stepFromRc + test pin), match-add moved after the initial seek (Python order — match-then-seek silently lost the first matching entry after the resume cursor), LOCAL_ONLY default for plain/namespace opens restored (python-systemd journal.py:168-174; earlier false "no masking" probe claim corrected in the parity doc); minors: Wait timeout semantics (<0 indefinite, 0 non-blocking poll), symbol-resolution errors surfaced as named errors, match_value=None wiring guard + mid-open-failure divergence pinned in the parity doc. Native libsystemd dlopen binding deviation sanctioned (§2). Fixture acceptance: rotated_logs reproduces Python's probed ground truth (40 entries, entry-0 fields/types/key order); bad_msg corruption taxonomy probed (field-without-= vs Bad message layering) | 1 | 4 |
 | 16 | Run loop + per-sender pipeline + file sender | not-started | - | - |
 | 17 | Reload, resume, state save, shutdown (errgroup lifecycle) | not-started | - | - |
 | 18 | Core systest suites (rotation/sigterm Go-native, interop) | not-started | - | - |
