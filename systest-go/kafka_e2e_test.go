@@ -119,7 +119,7 @@ func TestKafkaSenderEndToEnd(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			topic := fmt.Sprintf("journalpump-go-e2e-%s", strings.ReplaceAll(tc.name, "-", ""))
+			topic := fmt.Sprintf("journalpump-go-e2e-%s-%d", strings.ReplaceAll(tc.name, "-", ""), time.Now().UnixNano())
 			runKafkaScenario(t, broker, repoRoot, logsDir, topic, tc.key, tc.topicConfig, tc.partition, tc.numPartition, tc.payloads, tc.sentCount, tc.sentCursor)
 		})
 	}
@@ -276,6 +276,13 @@ func consumeKafka(t *testing.T, broker, topic string, partitions, want int) ([]k
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V2_5_0_0
 	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	// CRITICAL: the consumer's metadata requests must NOT auto-create the
+	// topic. On an auto-create broker, a subscribe/metadata request for a
+	// not-yet-existing topic creates it with the DEFAULT partition count
+	// and would race (and beat) the sender's own admin create_topics — the
+	// exact race the Task 12 harness documents. With this disabled the
+	// consumer waits for the sender's topic (and its partition count).
+	cfg.Metadata.AllowAutoTopicCreation = false
 	consumer, err := sarama.NewConsumer([]string{broker}, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("new consumer: %w", err)
