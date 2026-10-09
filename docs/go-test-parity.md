@@ -1158,8 +1158,8 @@ RFC3164 / CUSTOM formatters, `_generate_format` (the rsyslog-%token% →
 brace-placeholder tokenizer), the PRI computation, the RFC3164 date
 reformat, the RFC6587 octet-counted / non-transparent framing with
 `max_message_size` truncation and `escape_newlines`, and the TCP+TLS
-client with SNI and the one-shot EPIPE/ECONNRESET/ETIMEDOUT/SSLEOF send
-retry. Acceptance is byte-identical wire output to `SyslogTcpClient`.
+client with SNI and the one-shot EPIPE/ECONNRESET/ETIMEDOUT send retry.
+Acceptance is byte-identical wire output to `SyslogTcpClient`.
 Task 20 (the rsyslog sender) consumes this package; it adds no sender
 wiring of its own.
 
@@ -1174,12 +1174,17 @@ Parity coverage:
   and the parametrized 1/4/8/16/32 self-consistency table), 3
   escape_newlines.
 - `testdata/logline_groundtruth.json` is a Python-ORACLE capture
-  (generated from the real `SyslogTcpClient`, not hand-written): 37
+  (generated from the real `SyslogTcpClient`, not hand-written): 50
   wire-byte cases spanning RFC5424/RFC3164/CUSTOM, PRI in and out of
   range (→13), the RFC3164 date reformat across timestamp shapes,
   NILVALUE defaults for hostname/program/pid=0/msgid/msg, structured-data
-  nil/""/present, and escape_newlines off/on. `TestLogMatchesPythonGroundtruth`
-  replays it exactly.
+  nil/""/present (both the RFC5424 `[..]` block and the CUSTOM
+  `%structured-data%` rendering), `max_msg` edge values (see below), and
+  escape_newlines off/on. `TestLogMatchesPythonGroundtruth` replays it
+  exactly, and `test/test_rsyslog_groundtruth.py` is the committed
+  reproducible capture harness (`GROUNDTRUTH_UPDATE=1 pytest
+  test/test_rsyslog_groundtruth.py` regenerates the file; the default
+  run re-captures and fails if the committed fixture has drifted).
 - `FuzzFramingSelfConsistent` fuzzes the framer: an octet frame's
   advertised length always equals the bytes framed (never desyncs), and
   a non-transparent frame is body-verbatim when it fits or
@@ -1187,9 +1192,54 @@ Parity coverage:
 
 Client deviations to watch (none observed in the framing tests; the
 real-socket/TLS paths are exercised by Task 20's rsyslogd systest):
-`shouldRetry` matches Python's `ssl.SSLEOFError` via `io.ErrUnexpectedEOF`
-(a third-party crypto/tls behavior difference would be flagged for
-adjudication rather than accommodated); `connect` uses Go's `net.Dial`
+`connect` uses Go's `net.Dial`
 (Happy-Eyeballs family selection) where Python iterates
 `getaddrinfo` — the dial order is not part of the wire-parity contract.
-Zero `max_msg` normalizes to 2048 (`max_msg or 2048`, rsyslog.py:118).
+
+### Task 19 review round 1 (changes-required)
+
+- **Retry classification — Python-exact (not a Python-bug fix).** Core
+  ruling: reproduce Python's actual `_should_retry` (rsyslog.py:211-216)
+  rather than "fixing" the suspected bug. Python checks
+  `isinstance(ex, OSError)` FIRST and returns
+  `errno in (EPIPE, ECONNRESET, ETIMEDOUT)`; the `ssl.SSLEOFError`
+  branch after it is unreachable, because `ssl.SSLEOFError` IS an
+  `OSError` subclass and its errno is not one of the three. So Python
+  does NOT retry an SSLEOFError. `shouldRetry` therefore matches only
+  EPIPE / ECONNRESET / ETIMEDOUT; the earlier SSLEOF-via-
+  `io.ErrUnexpectedEOF` mapping was wrong and removed.
+  `TestShouldRetryMatchesPython` and the retry/no-retry write-count
+  tests pin this.
+- **CUSTOM `%structured-data%` nil → `"None"`.** Python's
+  `str.format(**kwargs)` renders a `None` value as the four characters
+  `None`, while `""` renders empty. `customSD` reproduces that; the
+  fixture now carries CUSTOM sd nil/""/present oracle cases.
+- **`max_msg` edge values.** Only the falsy `0` falls back to 2048
+  (`max_msg or 2048`); negatives are preserved and applied as Python
+  negative slice indices (`message[:-k]`). `pySliceEnd` implements the
+  Python semantics for both framings and for the `len(message) >=
+  max_msg` truncation test. Fixture cases and
+  `TestFramingNegativeAndZeroMaxMsg` pin it (non-vacuity proven by
+  clamping negatives to 0).
+- **UTF-8 replacement.** The formatters emit
+  `s.encode("utf-8", "replace")` over journal bytes decoded with
+  surrogateescape: each byte that is not valid UTF-8 becomes ONE `?`
+  (a valid U+FFFD passes through). `encodeUTF8Replace` implements this
+  and runs BEFORE framing, so a replaced byte counts once toward
+  truncation byte-length (`TestEncodeUTF8Replace`,
+  `TestLogInvalidUTF8AffectsByteCount`; non-vacuity proven).
+- **TLS handshake before the client is published.** `NewClient`
+  completes the TLS handshake in `connect` (Python's
+  `ssl.wrap_socket`/`connect` does so inside `_connect`), so a bad
+  certificate, hostname mismatch or untrusted chain is reported by the
+  constructor and never surfaces later as a half-open "connected"
+  client. SNI defaults to `Server`. Tests: trusted+SNI, untrusted cert,
+  hostname mismatch.
+- **Context/deadline threading.** `NewClient`, `Send` and `Log` take a
+  `context.Context`; the dial uses `DialContext`, the handshake uses
+  `HandshakeContext`, and a stalled write is unblocked by forcing the
+  socket write deadline when ctx is canceled (`writeWithContext` +
+  `context.AfterFunc`). `TestSendCancellationUnblocksStalledWrite`
+  proves a worker terminates promptly on cancellation.
+- **Zero `max_msg` normalizes to 2048** (`max_msg or 2048`,
+  rsyslog.py:118); negatives preserved (see above).
