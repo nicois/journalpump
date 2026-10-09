@@ -964,6 +964,15 @@ Parity-critical behavior reproduced exactly:
   pump (`self.pump.stats`, `self.pump.make_tags()`,
   `self.pump.check_match`); only genuinely reader-owned settings stay
   captured at construction.
+- The statsd client split follows Python exactly, in BOTH directions:
+  sender initialization (`journalpump.py:294 stats=self.stats`) and
+  secret-filter metrics (`:346 self.stats`) use the reader's CAPTURED
+  client (`reader.Stats.Client()`), while the supervisor's periodic
+  persistent-gauge refresh uses the LIVE pump client
+  (`:1102-1108 self.stats`, ported as `PersistentGauges.RefreshNonZeroTo`).
+  A statsd-only reload with an unchanged readers blob therefore keeps the
+  reader-owned metrics on the old endpoint and moves the gauge refresh to
+  the new one.
 - `statePath` is re-read from the parsed config on reload
   (`get_state_file_path()` parity), with both unchanged and replaced
   readers.
@@ -973,15 +982,31 @@ Parity-critical behavior reproduced exactly:
   formatter otherwise; Python level→PRIORITY mapping
   (`systemd.journal.JournalHandler.map_priority`: DEBUG→7, INFO→6,
   WARNING→4, ERROR→3, CRITICAL→2, higher→ALERT 1); `log_level` filtering
-  at startup and on reload; LOGGER/SYSLOG_IDENTIFIER and the
-  `LOG_FORMAT_JOURNAL`-style MESSAGE (`"%(name)-20s  %(levelname)-8s  %(message)s"`).
+  at startup and on reload; severity routing (INFO/WARNING/ERROR) applied
+  to every Python log.error/log.warning/log.exception call site — sender
+  maintenance and send failures, the broad entry handler, running-config
+  and state-save failures; SYSLOG_IDENTIFIER fixed at the daemon name
+  while LOGGER/%(name)s carry the per-component name
+  (`JournalReader:<name>`, `LogSender:<reader>`, `JournalObjectHandler`,
+  `journalpump`) exactly as Python's `logging.getLogger(name)` calls do.
+  The journal MESSAGE uses the MULTI-THREAD format
+  (`LOG_FORMAT_JOURNAL_MULTI_THREAD`, journalpump.py:858 constructs
+  JournalPump with multi_threaded=True):
+  `"%(name)-20s  %(threadName)-15s %(levelname)-8s  %(message)s"`.
 - Multi-line journald field values use the native binary field form —
   `NAME\n` + 8-byte little-endian value length + value + `\n` — asserted
   byte-exact.
 - The D9/D3 delivery-checkpoint contract (charter §2): the persisted
   cursor never claims bytes not durably on disk; a failed flush or a
   reload retire truncates back to the last complete-line boundary before
-  state is saved.
+  state is saved. All byte counters are RUN-relative, so an absolute
+  truncate is the file's initial append offset plus the run-relative
+  boundary — reopening an existing output and retiring before any new
+  flush preserves every previously delivered line.
+- A reload whose reader retirement fails to restore an output's
+  complete-line boundary (a failed CloseDiscarding) is ABORTED before
+  starting the replacement reader, so no replacement writer can append
+  replay onto a corrupt prefix.
 - The readerErr channel carries at least one buffer slot regardless of
   the initial reader count, so the first reader failure always reaches
   `Run` (Python's reader threads surface via the errgroup-equivalent).
@@ -991,6 +1016,14 @@ Sanctioned deviations (charter §2): construct-before-retire safe abort
 architecture (spec §4.5 mentioned slog); the D9 grace flush and the
 delivery-checkpoint correctness contract (Python's cursor is the last
 SENT, not flushed, position).
+
+Adjudicated cosmetic logging difference: the multi-thread format's
+`%(threadName)s` is Python's runtime thread name (the reader/main loop
+renders "MainThread"; sender threads render platform names like
+"Thread-2"). Go has no per-record thread name and emits the stable
+literal "MainThread" for every line. The FORMAT is matched (field width
+and separators); the thread-name VALUE for sender-goroutine lines is not
+a parity claim.
 
 Deferred: none — the Task 16 "journald output deferred to Task 17" note
 is resolved here.

@@ -399,6 +399,28 @@ full records in charter §2):
   buffered with at least one slot so the first reader failure is
   delivered even from a zero-reader start.
 
+Round-2 additions (2026-10-10, second changes-required verdict):
+- The file-sender byte counters are RUN-relative, so an absolute truncate
+  is initialAppendOffset + run-relative boundary: reopening an existing
+  output and retiring before any new flush preserves every previously
+  delivered line (previously the run-relative boundary was applied as an
+  absolute offset and could delete historical lines).
+- A reload whose reader retirement fails to restore a complete-line
+  boundary is refused before starting the replacement reader (propagated
+  CloseDiscarding errors), so no replacement writer appends onto a
+  corrupt prefix.
+- The statsd client split is now correct in BOTH directions: sender
+  init + secret-filter metrics use the reader's CAPTURED client; the
+  periodic persistent-gauge refresh uses the LIVE pump client.
+- Every Python log.error/log.warning/log.exception call site routes
+  through the severity methods (sender maintenance/send failures, broad
+  handler, running-config/state-save failures), not Printf.
+- Per-component logger context (`JournalReader:<name>`,
+  `LogSender:<reader>`, `JournalObjectHandler`) and the multi-thread
+  journal format (LOG_FORMAT_JOURNAL_MULTI_THREAD, since JournalPump is
+  constructed multi_threaded=True); the thread-name VALUE is adjudicated
+  in the parity doc (Go emits "MainThread").
+
 ### Task 18. Core systest suites (Milestone A)
 Files: `systest-go/`. Rotation suite as a **Go-native test** (thread C3:
 `systest/test_rotation.py` is in-process/monkeypatched in Python — port
