@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -63,9 +64,10 @@ type Search struct {
 	// synthetic documents.
 	tags []searchTag
 	// hits mirrors search["hits"] (journalpump.py:639): a mutable
-	// counter used by the state file. Only the reader's goroutine
-	// touches it.
-	hits int64
+	// counter used by the state file. PerformSearches increments it on
+	// the reader goroutine while the state/stats paths read it
+	// concurrently, so it is atomic (a plain int64 raced under -race).
+	hits atomic.Int64
 }
 
 type searchField struct {
@@ -257,7 +259,7 @@ func (s *Search) Name() string {
 // Hits returns the accumulated match count (Python: search["hits"],
 // persisted in the state file as {search name: hits}).
 func (s *Search) Hits() int64 {
-	return s.hits
+	return s.hits.Load()
 }
 
 // Stats is the subset of the statsd client perform_searches uses
@@ -382,7 +384,7 @@ func (s *Searcher) PerformSearches(entry map[string]any) bool {
 		if s.stats != nil {
 			s.stats.Increase(search.name, 1, s.tagged.MakeTags(tags))
 		}
-		search.hits++
+		search.hits.Add(1)
 		matched = true
 	}
 	return matched

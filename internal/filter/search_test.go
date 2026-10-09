@@ -7,6 +7,7 @@ package filter_test
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -426,5 +427,39 @@ func TestNewSearchesTagFunctionAccepted(t *testing.T) {
 	}
 	if searches[0].Name() != "s" {
 		t.Errorf("name = %q", searches[0].Name())
+	}
+}
+
+// TestHitsConcurrentWithPerformSearches is the gate-integrity regression for
+// the data race between the reader goroutine's PerformSearches and the
+// state/stats path's Hits() read (a plain int64 counter failed under -race;
+// the counter is atomic). Run with -race.
+func TestHitsConcurrentWithPerformSearches(t *testing.T) {
+	searcher := newTestSearcher(t, []any{
+		map[string]any{"name": "s", "fields": map[string]any{"MESSAGE": "hit"}},
+	}, nil)
+	entry := map[string]any{"MESSAGE": "hit"}
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				searcher.PerformSearches(entry)
+			}
+		}
+	}()
+	var sink int64
+	for i := 0; i < 200000; i++ {
+		sink += searcher.Searches()[0].Hits()
+	}
+	close(stop)
+	wg.Wait()
+	if sink < 1 {
+		t.Fatalf("Hits() never observed an increment (sink=%d)", sink)
 	}
 }
