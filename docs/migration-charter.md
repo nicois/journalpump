@@ -416,6 +416,13 @@ diff and test output.
   quirk-locks from sanctioned deviations)?
 - **Docs updates**: spec/plan changes go through architect + cross-review,
   same as code.
+- **Charter sections change only via dedicated docs commits**: the §2
+  sanctioned-deviations list and the §6 progress ledger never ride along
+  inside a code-task commit. Motivation (real incident, 2026-10-09):
+  commit 1773ebb folded an uncommitted §2 restructure into a code
+  commit and silently wiped the §6 ledger (Tasks 1–10 done rows) and
+  five §2 bullets; both were restored from git history in f3e1f24 and
+  the restoration was confirmed by both reviewers.
 - **Review-round record**: the pre-implementation Go-idiom review of
   spec+plan (thread A), the mock-strategy decision (thread B, D11), and
   the e2e-frontloading decision (thread C, D12) are folded into the spec
