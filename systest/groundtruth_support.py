@@ -65,11 +65,21 @@ SHIM_SITECUSTOMIZE = '''"""Test-environment shim: fixture journal files are not 
 storage, so python-systemd's storage-origin check reports False; the
 real binary would then never start the reader (it retries forever).
 The rotation systest mocks these same methods in-process; here the
-shim reaches the spawned binary through PYTHONPATH/sitecustomize."""
+shim reaches the spawned binary through PYTHONPATH/sitecustomize.
+
+Also mirrors the deployment dependency set for the Kafka sender: this
+dev box has a system-wide ``zstandard``, which the real deployment
+(requirements.txt: python-snappy, no zstandard) does not ship — without
+the block the sender would silently pick zstd instead of snappy
+(kafka_sender.py prefers zstd whenever importable)."""
 import systemd.journal as _journal
 
 _journal.Reader.has_persistent_files = lambda self: True
 _journal.Reader.has_runtime_files = lambda self: True
+
+import sys as _sys
+
+_sys.modules["zstandard"] = None
 '''
 
 
