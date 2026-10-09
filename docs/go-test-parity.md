@@ -65,3 +65,54 @@ as ordered `[]Field` (document order) and the serializer refuses
 unordered `map[string]any`, so nested key order cannot silently change
 on the wire; config decoding captures document order when the extras are
 wired in plan Task 16.
+## Task 5 — filters (field filters, unit log levels, secret filters, searches) and tag sanitization
+
+Source: `test/test_journalpump.py` (TestFieldFilter, TestSecretFilter,
+TestUnitLogLevels, the test_log_level_filtering sweep) and
+`test/unit/senders/test_base.py` (test_tagged). The glob engine is
+verified against Python-generated data: `internal/filter/testdata/
+generate_golden.py` runs the real `fnmatch.fnmatchcase` (the exact call
+of `journalpump.py:694`) over a (glob, string) battery →
+`glob_match_matrix.json`, asserted exhaustively by
+`TestTranslateGlobPatternMatchesPython`.
+
+| Python test | Status | Go counterpart |
+|---|---|---|
+| TestFieldFilter.test_whitelist / test_blacklist | ported | `TestFieldFilter` (leading-underscore trim + lowercasing, input map untouched) |
+| TestSecretFilter 8 behavior tests (simple + complex modes, multi-secret, restructure, no secret, empty filters) | ported | `TestApplySecretFilters` (applied at the MESSAGE field, which is what the process() pipeline hands to `_apply_secret_filters`) |
+| test_ex_no_pattern / test_ex_no_replacement / test_ex_invalid_regex | ported | `TestNewSecretFilterErrors` (Python's exact messages; replacement-before-pattern order is enforced in config decode) |
+| TestUnitLogLevels (9 methods) | ported | `TestUnitLogLevels` (all rows, incl. falsy `PRIORITY` 0 kept as-is) |
+| most-restrictive-wins semantics (journalpump.py:691-696) | Go-native quirk lock | `TestUnitLogLevels` rows "most restrictive wins/*" — a second matching glob drops even when the first matched permissively, in both orders |
+| test_log_level_filtering (severity sweep) | ported | `TestUnitLogLevelSeveritySweep` (all 8 severities against a configured level) |
+| test_tagged (6 param cases) | ported | `TestTaggedMakeTags` + CPython-verified quirk locks (unicode `\w` names kept, runs collapse to one `_`, `strip("_")`, `"___"` → empty) |
+| (no Python unit test) | Go-native | `TestTranslateReplacementGolden` / `TestTranslateReplacementErrors` — the Python replacement-template rules verified against CPython 3.14 (`\g<name>`, octal `\0`-`\377` escapes with the `\0`-branch masking, three-octal-digit rule for `\1`-`\9`, kept backslash before non-letters, `$$` escaping, group validation) |
+| (no Python unit test) | Go-native | `TestNewSecretFiltersUnsupported` — RE2-unsupported Python-valid constructs (backrefs, lookarounds, atomic groups, possessive quantifiers, `{,n}`, `\Z`, `(?#)`, `(?x)`/`(?L)`, conditionals) disable the filter with a startup warning; RE2-invalid patterns raise Python's `invalid secret_filters configuration - invalid regex` |
+| (no Python unit test) | Go-native | `TestPerformSearches*` — sorted non-MESSAGE-then-MESSAGE field order, per-entry bytes decode cache, `str()` quirks (`True`/`False`), named-group tags (static tags overwrite), sanitization before `stats.increase`, per-search `hits` counters, `journal.perform_search_regex_duration` gauge with an injectable clock, `if self.stats:` guards |
+
+Deviations and notes:
+- **Sanctioned strict-at-load**: search/secret-filter construction errors
+  that Python raises lazily (replacement-template compile at first
+  substitution, unknown `unit_log_levels` severity names — Python KeyError
+  at filter time) are rejected at construction with Python-equivalent
+  messages.
+- **Warn-and-disable**: patterns using RE2-unsupported constructs are
+  Python-valid, so they cannot be rejected; the filter is disabled with a
+  startup warning. RE2-invalid patterns keep Python's hard error.
+- **Unmatched named groups** in searches: Python's `groupdict` yields
+  `None` and `make_tags` drops them; Go's RE2 cannot distinguish an
+  unmatched group from a matched-empty one, so empty values are omitted
+  (matched-empty groups are kept — the metrics-visible difference is
+  limited to optional groups that did not participate).
+- **Non-string truthy MESSAGE / non-numeric PRIORITY / non-string unit**:
+  Python raises TypeError mid-run; Go treats them as untouched / kept
+  (crash-free deviation, spec §6.1a family).
+- **`search.setdefault` mutation**: Python mutates the parsed config
+  (running-config dump gains empty `"tags"`/`"fields"` keys on
+  searches lacking them); Go does not mutate the parsed document.
+- **Regex engine semantics**: RE2 ASCII `\w`/`\s`/`\d`/`\b` in user
+  patterns (spec §5 sanctions stdlib RE2 semantics); the Tagged
+  sanitization classes ARE exact (`\w` ≡ `[\pL\pN_]`, `\s` ≡
+  `[\t-\r\x1c-\x1f\x85\pZ]`, both verified by a full-codepoint
+  differential test).
+- Python's `lru_cache` on `_unit_match_level_glob` is pure memoization
+  and is not reproduced.
