@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 )
 
-// tagOrders carries the document-order tag keys the token walk captured
+// tagOrders carries the document-order data the token walk captured
 // from the raw config JSON.
 type tagOrders struct {
 	// readers maps reader name -> per-search tag key lists, aligned with
@@ -18,11 +18,19 @@ type tagOrders struct {
 	readers map[string][][]string
 	// statsdTags holds the top-level statsd.tags keys in document order.
 	statsdTags []string
+	// extraFields maps reader name -> sender name -> the raw JSON of the
+	// sender's extra_field_values subtree. The raw form preserves the
+	// nested object key order too, which the ordered extras decoder
+	// (internal/journal, Task 16) turns into the Python construction
+	// order the wire format needs.
+	extraFields map[string]map[string]json.RawMessage
 }
 
-// captureTagOrders walks the raw config JSON and returns the
-// document-order key lists of (a) each search's "tags" object, per
-// reader, and (b) the top-level statsd.tags object.
+// captureTagOrders walks the raw config JSON and returns (a) the
+// document-order key lists of each search's "tags" object, per reader,
+// (b) the top-level statsd.tags key order, and (c) each sender's
+// extra_field_values raw subtree per reader (the Task 16 wiring needs
+// the nested document order for the serialization key order).
 //
 // Why: encoding/json decodes objects into maps, which discards key
 // order — but Python's json.load preserves it, and the order is
@@ -40,7 +48,10 @@ type tagOrders struct {
 func captureTagOrders(data []byte) tagOrders {
 	w := &tagOrderWalker{
 		dec: json.NewDecoder(bytes.NewReader(data)),
-		out: tagOrders{readers: map[string][][]string{}},
+		out: tagOrders{
+			readers:     map[string][][]string{},
+			extraFields: map[string]map[string]json.RawMessage{},
+		},
 	}
 	_ = w.walkDocument() // malformed JSON is reported by the main decode
 	return w.out
@@ -177,33 +188,76 @@ func (w *tagOrderWalker) walkReader(name string) error {
 	// decode keeps only the LAST occurrence; truncate the rows captured
 	// for a previous occurrence so they do not leak into the kept one.
 	w.out.readers[name] = nil
+	w.out.extraFields[name] = nil
 	defer func() { w.reader, w.searchIndex = previousReader, previousIndex }()
 	d, ok, err := w.openContainer()
 	if err != nil || !ok || d != '{' {
 		return err // non-object reader entry: the main decode errors later
 	}
 	return w.objectEntries(func(key string) error {
-		if key != "searches" {
+		switch key {
+		case "searches":
+			return w.walkSearches()
+		case "senders":
+			return w.walkSenders()
+		default:
 			return w.skipValue()
 		}
-		d, ok, err := w.openContainer()
-		if err != nil || !ok || d != '[' {
-			return err // non-array searches: the main decode errors later
+	})
+}
+
+// walkSearches consumes the reader's "searches" array for the per-search
+// tags key order.
+func (w *tagOrderWalker) walkSearches() error {
+	d, ok, err := w.openContainer()
+	if err != nil || !ok || d != '[' {
+		return err // non-array searches: the main decode errors later
+	}
+	// A duplicate "searches" key visits this branch twice while the
+	// map decode keeps only the LAST array; restart the index AND
+	// truncate the rows captured so far, so the rows align with
+	// whichever array the decode kept.
+	w.searchIndex = 0
+	w.out.readers[w.reader] = nil
+	for w.dec.More() {
+		if err := w.walkSearch(); err != nil {
+			return err
 		}
-		// A duplicate "searches" key visits this branch twice while the
-		// map decode keeps only the LAST array; restart the index AND
-		// truncate the rows captured so far, so the rows align with
-		// whichever array the decode kept.
-		w.searchIndex = 0
-		w.out.readers[w.reader] = nil
-		for w.dec.More() {
-			if err := w.walkSearch(); err != nil {
+		w.searchIndex++
+	}
+	_, err = w.dec.Token() // closing ]
+	return err
+}
+
+// walkSenders consumes the reader's "senders" object, capturing each
+// sender's extra_field_values raw subtree.
+func (w *tagOrderWalker) walkSenders() error {
+	d, ok, err := w.openContainer()
+	if err != nil || !ok || d != '{' {
+		return err // non-object senders: the main decode errors later
+	}
+	if w.out.extraFields[w.reader] == nil {
+		w.out.extraFields[w.reader] = map[string]json.RawMessage{}
+	}
+	return w.objectEntries(func(senderName string) error {
+		d, ok, err := w.openContainer()
+		if err != nil || !ok || d != '{' {
+			return err // non-object sender entry: the main decode errors later
+		}
+		return w.objectEntries(func(key string) error {
+			if key != "extra_field_values" {
+				return w.skipValue()
+			}
+			// Decode consumes exactly one complete value; RawMessage
+			// keeps the subtree verbatim (nested key order included).
+			var raw json.RawMessage
+			if err := w.dec.Decode(&raw); err != nil {
 				return err
 			}
-			w.searchIndex++
-		}
-		_, err = w.dec.Token() // closing ]
-		return err
+			// Duplicate sender or key: last wins, like the map decode.
+			w.out.extraFields[w.reader][senderName] = raw
+			return nil
+		})
 	})
 }
 

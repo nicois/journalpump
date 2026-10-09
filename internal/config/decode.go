@@ -6,6 +6,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 )
 
@@ -58,7 +59,7 @@ func newConfig(raw map[string]any, orders tagOrders) (*Config, error) {
 	if cfg.UnitLogLevels, err = decodeUnitLogLevels(raw); err != nil {
 		return nil, err
 	}
-	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw, orders.readers); err != nil {
+	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw, orders.readers, orders.extraFields); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -248,7 +249,11 @@ func decodeUnitLogLevels(raw map[string]any) (map[string][]UnitLogLevelEntry, er
 	return levels, nil
 }
 
-func decodeReaders(raw map[string]any, searchTagOrders map[string][][]string) (map[string]ReaderConfig, map[string]any, error) {
+func decodeReaders(
+	raw map[string]any,
+	searchTagOrders map[string][][]string,
+	extraFieldValues map[string]map[string]json.RawMessage,
+) (map[string]ReaderConfig, map[string]any, error) {
 	readers := map[string]ReaderConfig{}
 	value, ok := raw["readers"]
 	if !ok {
@@ -264,7 +269,7 @@ func decodeReaders(raw map[string]any, searchTagOrders map[string][][]string) (m
 		if !ok {
 			return nil, nil, fmt.Errorf("readers.%s: must be an object", name)
 		}
-		reader, err := decodeReader(name, entry, searchTagOrders[name])
+		reader, err := decodeReader(name, entry, searchTagOrders[name], extraFieldValues[name])
 		if err != nil {
 			return nil, nil, err
 		}
@@ -273,7 +278,12 @@ func decodeReaders(raw map[string]any, searchTagOrders map[string][][]string) (m
 	return readers, blob, nil
 }
 
-func decodeReader(name string, entry map[string]any, searchTagOrder [][]string) (ReaderConfig, error) {
+func decodeReader(
+	name string,
+	entry map[string]any,
+	searchTagOrder [][]string,
+	extraFieldValues map[string]json.RawMessage,
+) (ReaderConfig, error) {
 	reader := ReaderConfig{Name: name}
 	var err error
 	if reader.JournalFlagNames, reader.JournalFlagsInt, err = decodeJournalFlags(entry, name); err != nil {
@@ -317,6 +327,7 @@ func decodeReader(name string, entry map[string]any, searchTagOrder [][]string) 
 	if reader.Senders, err = decodeSenders(entry, name); err != nil {
 		return reader, err
 	}
+	reader.ExtraFieldValuesRaw = extraFieldValues
 	return reader, nil
 }
 

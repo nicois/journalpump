@@ -195,6 +195,11 @@ type Instance struct {
 	// Type is the state-file "type" string (Python: the sender class
 	// name, e.g. "KafkaSender").
 	Type string
+	// ConnectOnInit marks senders that call mark_connected() at
+	// construction (the file sender opens its output and connects
+	// immediately, file.py:8-11). The supervisor calls Loop.MarkConnected
+	// after NewLoop when set; every other sender starts disconnected.
+	ConnectOnInit bool
 }
 
 // Loop is the shared flush/backoff loop wrapping one transport — the
@@ -248,6 +253,11 @@ type Loop struct {
 	// reset. Set before Run; loop-goroutine only.
 	onDequeue func([]Item)
 }
+
+// MaxSendInterval reports the sender's configured idle-flush interval
+// (Python max_send_interval). The supervisor's shutdown grace window
+// (D9) is the max over the live senders' intervals plus TickInterval.
+func (l *Loop) MaxSendInterval() time.Duration { return l.inst.MaxSendInterval }
 
 // SetDequeueObserver registers a callback invoked from the loop
 // goroutine with every non-empty batch of items taken out of the

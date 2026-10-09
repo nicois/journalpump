@@ -164,6 +164,13 @@ type ReaderConfig struct {
 	// decodes its own key set (per-sender defaults are applied by the
 	// sender constructors, as in Python).
 	Senders map[string]any
+	// ExtraFieldValuesRaw holds, per sender name, the raw JSON of the
+	// sender's extra_field_values subtree, captured with document key
+	// order by the token walk (map decoding discards order, but the
+	// order determines the serialized key order on the wire). Absent
+	// senders have no entry; the wiring decodes the raw form into the
+	// ordered extras (internal/journal).
+	ExtraFieldValuesRaw map[string]json.RawMessage
 }
 
 // Config is the typed view of a parsed journalpump.json document.

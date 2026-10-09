@@ -726,3 +726,33 @@ func TestDecodeLogLevelAliases(t *testing.T) {
 		})
 	}
 }
+
+// TestCaptureExtraFieldValuesRaw locks the extra_field_values subtree
+// capture: the raw JSON keeps the document key order (map decoding
+// discards it, but the wire key order and the sender-side extras merge
+// depend on it), senders without the key have no entry, and a non-object
+// value is captured verbatim so the wiring can warn on it.
+func TestCaptureExtraFieldValuesRaw(t *testing.T) {
+	t.Parallel()
+	cfg := mustDecode(t, `{
+        "readers": {
+            "r": {
+                "senders": {
+                    "ordered": {"output_type": "file", "extra_field_values": {"zeta": 1, "alpha": "a", "mid": true}},
+                    "none": {"output_type": "file"},
+                    "wrong": {"output_type": "file", "extra_field_values": [1, 2]}
+                }
+            }
+        }
+    }`)
+	raw := cfg.Readers["r"].ExtraFieldValuesRaw
+	if got := string(raw["ordered"]); got != `{"zeta": 1, "alpha": "a", "mid": true}` {
+		t.Errorf("ordered extras = %s, want the document-order JSON", got)
+	}
+	if _, present := raw["none"]; present {
+		t.Errorf("none has an extras entry: %s", raw["none"])
+	}
+	if got := string(raw["wrong"]); got != `[1, 2]` {
+		t.Errorf("wrong extras = %s, want [1, 2]", got)
+	}
+}

@@ -1,0 +1,1261 @@
+// Copyright 2026, Aiven, https://aiven.io/
+//
+// This file is under the Apache License, Version 2.0.
+// See the file `LICENSE` for details.
+
+// Package daemon is the pump supervisor and reader run loop — the port of
+// JournalPump.run
+// and JournalReader's runtime half (journalpump.py:136-655, 1005-1208)
+// plus the handle_new_config construction (950-970). Spec §4.3
+// concurrency model: one goroutine per reader drives its journal
+// (Python's single-threaded poll loop is decomposed per reader — the
+// recorded shape change), one goroutine per sender flush loop, and the
+// supervisor ticks the per-second housekeeping (watchdog ping, search
+// hit stats, state saves) and owns the D9 shutdown sequence.
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/Aiven-Open/journalpump/internal/buffer"
+	"github.com/Aiven-Open/journalpump/internal/config"
+	"github.com/Aiven-Open/journalpump/internal/filter"
+	"github.com/Aiven-Open/journalpump/internal/geoip"
+	"github.com/Aiven-Open/journalpump/internal/journal"
+	"github.com/Aiven-Open/journalpump/internal/reader"
+	"github.com/Aiven-Open/journalpump/internal/sender"
+	"github.com/Aiven-Open/journalpump/internal/state"
+	"github.com/Aiven-Open/journalpump/internal/statsd"
+	"github.com/Aiven-Open/journalpump/internal/tagged"
+)
+
+// pollInterval mirrors poll_interval_ms (journalpump.py:863): the
+// per-iteration housekeeping cadence and the idle wait when no journal
+// reader exists.
+const pollInterval = time.Second
+
+// Logger is the pump's logging seam; the standard library *log.Logger
+// satisfies it (same seam as internal/sender).
+type Logger interface {
+	Printf(format string, args ...any)
+}
+
+type discardLogger struct{}
+
+func (discardLogger) Printf(_ string, _ ...any) {}
+
+// PumpDeps carries the injectable seams of NewPump; nils select the
+// production defaults.
+type PumpDeps struct {
+	// Log receives the pump logs; nil discards.
+	Log Logger
+	// Notifier is the sd_notify client; nil selects SocketNotifier.
+	Notifier Notifier
+	// Now is the clock seam for tests; nil = time.Now.
+	Now func() time.Time
+	// ReadState replaces state.Read (tests); nil = state.Read.
+	ReadState func(path string) (*state.State, error)
+}
+
+// senderEntry is one live sender the pump supervises: its loop, the
+// buffer it drains, and the context its goroutine runs under.
+type senderEntry struct {
+	name   string
+	loop   *sender.Loop
+	buffer *buffer.SenderBuffer
+	inst   sender.Instance
+	cancel context.CancelFunc
+	grace  time.Duration // inst.MaxSendInterval, captured for the D9 window
+}
+
+// ReaderSource is the reader-opening seam (ensure/invalidate) —
+// *reader.Reopener in production, a fake in tests.
+type ReaderSource interface {
+	Ensure() (reader.Reader, error)
+	Invalidate()
+}
+
+// Pump is the supervisor: the port of JournalPump's construction
+// (handle_new_config) plus the per-second housekeeping loop and the
+// shutdown sequence.
+type Pump struct {
+	log       Logger
+	notifier  Notifier
+	now       func() time.Time
+	readState func(path string) (*state.State, error)
+
+	cfg           *config.Config
+	stats         *statsd.Client
+	tags          *tagged.Tagged // pump-level base tags (Python self._tags)
+	geoip         *geoip.DB
+	fieldFilters  map[string]*filter.FieldFilter
+	unitLogLevels map[string]*filter.UnitLogLevel
+
+	readers []*ReaderRuntime
+
+	startTimeStr string
+
+	// Sender lifecycle: senders initialize lazily inside reader
+	// goroutines, so the registry is mutex-guarded. The root context is
+	// deliberately NOT the run context: senders must outlive the readers
+	// for the D9 grace window (spec §4.3).
+	senderMu   sync.Mutex
+	senderRoot context.Context
+	senders    map[string][]*senderEntry // reader name -> entries
+	senderWG   sync.WaitGroup
+
+	// linesRead accumulates entries processed since the last supervisor
+	// tick — the global `lines` counter of journalpump.py:1124/1195 (the
+	// idle-refresh gate stays GLOBAL, matching Python).
+	linesRead atomic.Int64
+
+	// hits holds the merged per-search hit counters (Python's `hits`
+	// dict, journalpump.py:1114/1184-1187).
+	hitsMu     sync.Mutex
+	hits       map[string]int64
+	lastHitsAt time.Time
+
+	// state bookkeeping (journalpump.py:1057-1072, 1190-1193).
+	previousState *state.State
+	statePath     string
+	lastStateSave time.Time
+}
+
+// NewPump builds the supervisor from a loaded config — the port of
+// JournalPump.__init__ + handle_new_config (journalpump.py:845-970).
+// Construction errors (unknown sender type, unknown field filter or
+// unit log level name, bad search/tag configuration, unreadable state
+// file) correspond to Python's startup crashes: the caller reports and
+// exits 1.
+func NewPump(cfg *config.Config, deps PumpDeps) (*Pump, error) {
+	log := deps.Log
+	if log == nil {
+		log = discardLogger{}
+	}
+	notifier := deps.Notifier
+	if notifier == nil {
+		notifier = SocketNotifier{}
+	}
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	readState := deps.ReadState
+	if readState == nil {
+		readState = state.Read
+	}
+
+	// Python handle_new_config: the stats client and the base tags.
+	stats := statsd.New(cfg.Statsd.Host, cfg.Statsd.Port, cfg.Statsd.Tags, cfg.Statsd.TagOrder, cfg.Statsd.Prefix, log)
+	pump := &Pump{
+		log:           log,
+		notifier:      notifier,
+		now:           now,
+		readState:     readState,
+		cfg:           cfg,
+		stats:         stats,
+		tags:          tagged.New(cfg.Tags),
+		senderRoot:    context.Background(),
+		senders:       map[string][]*senderEntry{},
+		hits:          map[string]int64{},
+		statePath:     cfg.JSONStateFilePath,
+		startTimeStr:  startTimeString(now()),
+		lastStateSave: now(),
+	}
+
+	// Python loads geoip AFTER the stats client; a failure crashes the
+	// daemon (the import guard or the geoip2 open error) — propagate as
+	// a construction error.
+	if cfg.GeoipDatabase != "" {
+		log.Printf("Loading GeoIP data from %q", cfg.GeoipDatabase)
+		db, err := geoip.Open(cfg.GeoipDatabase)
+		if err != nil {
+			return nil, err
+		}
+		pump.geoip = db
+	}
+
+	// configure_field_filters / configure_unit_log_levels: construction
+	// errors (bad glob, unknown severity) are Python startup crashes.
+	pump.fieldFilters = make(map[string]*filter.FieldFilter, len(cfg.FieldFilters))
+	for name, fcfg := range cfg.FieldFilters {
+		pump.fieldFilters[name] = filter.NewFieldFilter(name, fcfg)
+	}
+	pump.unitLogLevels = make(map[string]*filter.UnitLogLevel, len(cfg.UnitLogLevels))
+	for name, entries := range cfg.UnitLogLevels {
+		ull, err := filter.NewUnitLogLevel(name, entries)
+		if err != nil {
+			return nil, err
+		}
+		pump.unitLogLevels[name] = ull
+	}
+
+	// configure_readers (first load): the resume cursors come from the
+	// state file. Python reads it with json.load — a parse error crashes
+	// at startup; state.Read propagates non-missing errors alike.
+	var loaded *state.State
+	if cfg.JSONStateFilePath != "" {
+		var err error
+		loaded, err = readState(cfg.JSONStateFilePath)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		loaded = &state.State{Readers: map[string]*state.ReaderState{}}
+	}
+
+	// Python iterates new_config.items() (document order); Go's map
+	// decode loses it, so readers construct in sorted-name order — a
+	// cosmetic deviation recorded in the parity doc.
+	names := make([]string, 0, len(cfg.Readers))
+	for name := range cfg.Readers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		rt, err := pump.newReaderRuntime(name, cfg.Readers[name], loaded.Readers[name], log)
+		if err != nil {
+			return nil, err
+		}
+		pump.readers = append(pump.readers, rt)
+	}
+	return pump, nil
+}
+
+// startTimeString ports start_time_str (journalpump.py:859):
+// datetime.now(UTC).replace(tzinfo=None).isoformat().
+func startTimeString(t time.Time) string {
+	t = t.UTC().Truncate(time.Microsecond)
+	if t.Nanosecond()/1000 == 0 {
+		return t.Format("2006-01-02T15:04:05")
+	}
+	return t.Format("2006-01-02T15:04:05.000000")
+}
+
+// resolvedSender is one sender config resolved against the pump-level
+// filter registries at construction time — the lookups Python performs
+// at initialize_senders inside get_reader, where a KeyError/ValueError
+// crashes the daemon (output_type, field_filter and unit_log_level are
+// all unguarded there). Resolving up front keeps the crash at startup;
+// CONSTRUCTOR failures (open errors and the like) stay lazy and
+// retried, exactly like Python's initialize_senders try/except.
+type resolvedSender struct {
+	name             string
+	config           map[string]any
+	ctor             sender.Constructor
+	fieldFilter      *filter.FieldFilter
+	unitLogLevels    *filter.UnitLogLevel
+	extraFieldValues []journal.Field
+}
+
+// ReaderRuntime is the runtime half of JournalReader (journalpump.py
+// 136-655): reader recreation, the readiness gate, sender construction,
+// and the per-entry pipeline. One goroutine drives it; the fields the
+// supervisor or the stats refresh closure touch (senders, buffers) are
+// mutex-guarded.
+type ReaderRuntime struct {
+	pump *Pump
+	name string
+	log  Logger
+
+	cfg  config.ReaderConfig
+	tags *tagged.Tagged // reader-level base tags (Python reader.make_tags())
+
+	stats *reader.Stats
+
+	searcher *filter.Searcher
+
+	secretFilters       []*filter.SecretFilter
+	secretFilterMetrics bool
+	secretFilterMatches int64
+
+	matchKey   string
+	matchValue any
+
+	msgBufferMaxLength int
+	msgBufferMaxBytes  int
+
+	// resolved senders: construction-time lookup results (see
+	// resolvedSender). The live set, buffers and gate are guarded by mu.
+	mu            sync.Mutex
+	resolved      []resolvedSender
+	initialised   map[string]struct{}
+	failedSenders int
+	senders       map[string]*senderEntry
+	buffers       []*buffer.SenderBuffer
+	gate          *buffer.Gate
+
+	// reopener is the ensure/invalidate seam (*reader.Reopener or a
+	// test fake); openFlags and initialPosition feed its OpenConfig.
+	reopener   ReaderSource
+	openFlags  int
+	initial    reader.InitialPosition
+	initialSet bool
+
+	// run state (single goroutine).
+	journaldReader reader.Reader
+	pending        reader.Event
+	readyFlag      bool // Python _is_ready
+
+	muCursor sync.Mutex
+	cursor   string // "" = Python None
+
+	// hitsDirty marks the read_messages recording points for the
+	// supervisor's merge (Python's `hits` dict, journalpump.py:1046-1047).
+	hitsDirty atomic.Bool
+}
+
+// newReaderRuntime builds one reader runtime: the port of
+// JournalReader.__init__ plus the construction-time sender resolution.
+func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.ReaderState, log Logger) (*ReaderRuntime, error) {
+	if st == nil {
+		st = &state.ReaderState{}
+	}
+
+	// Resume cursor (journalpump.py:889-909): ResumeCursor performs the
+	// sender walk and emits the per-reader resuming line for EVERY
+	// configured reader, exactly where Python logs it.
+	resume, err := state.ResumeCursor(st, name, log)
+	if err != nil {
+		return nil, err
+	}
+	cursor := ""
+	if resume != nil {
+		cursor = *resume
+	}
+
+	// Reader-level tags: JournalReader(Tagged) receives the pump's
+	// make_tags() and adds reader=<name> RAW via the Tagged kwargs
+	// (base.py:42-63) — no sanitization until make_tags.
+	readerTags := p.tags.Tags()
+	readerTags["reader"] = name
+	taggedReader := tagged.New(readerTags)
+
+	// Searches (Task 5): compile with the reader's tag-order rows and
+	// the reader-tagged searcher context.
+	searches, err := filter.NewSearches(cfg.Searches, cfg.SearchTagOrder...)
+	if err != nil {
+		return nil, err
+	}
+	searcher, err := filter.NewSearcher(
+		searches, float64(cfg.ThresholdForMetricEmit), p.stats, taggedReader, log,
+		map[string]filter.TagFunc{"ip_to_geohash": p.geoip.IPToGeohash},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	secretFilters, warnings, err := filter.NewSecretFilters(cfg.SecretFilters)
+	if err != nil {
+		return nil, err
+	}
+	for _, warning := range warnings {
+		log.Printf("%s", warning)
+	}
+
+	rt := &ReaderRuntime{
+		pump:                p,
+		name:                name,
+		log:                 log,
+		cfg:                 cfg,
+		tags:                taggedReader,
+		searcher:            searcher,
+		secretFilters:       secretFilters,
+		secretFilterMetrics: cfg.SecretFilterMetrics,
+		matchKey:            cfg.MatchKey,
+		matchValue:          cfg.MatchValue,
+		msgBufferMaxLength:  int(p.cfg.MsgBufferMaxLength),
+		msgBufferMaxBytes:   int(p.cfg.MsgBufferMaxBytes),
+		initialised:         map[string]struct{}{},
+		senders:             map[string]*senderEntry{},
+		resolved:            make([]resolvedSender, 0, len(cfg.Senders)),
+		readyFlag:           true, // journalpump.py:186
+		cursor:              cursor,
+	}
+
+	rt.stats = reader.NewStats(name, taggedReader.MakeTags(nil), p.stats, log, func() {
+		// inc_line_stats' refresh_stats per sender (journalpump.py:381).
+		rt.mu.Lock()
+		entries := make([]*senderEntry, 0, len(rt.senders))
+		for _, entry := range rt.senders {
+			entries = append(entries, entry)
+		}
+		rt.mu.Unlock()
+		for _, entry := range entries {
+			entry.loop.RefreshStats()
+		}
+	})
+
+	// journal_flags: names resolve against the journal constants here —
+	// Python's getattr inside get_reader raises AttributeError on an
+	// unknown name (a crash); construction fails instead.
+	flags := 0
+	if cfg.JournalFlagNames != nil {
+		flags, err = reader.FlagsFromNames(cfg.JournalFlagNames)
+		if err != nil {
+			return nil, err
+		}
+	} else if cfg.JournalFlagsInt != nil {
+		flags = int(*cfg.JournalFlagsInt)
+	}
+	rt.openFlags = flags
+
+	// initial_position: "head"/"tail", int seconds-from-boot; any other
+	// string falls through Python's elif chain untouched (PositionNone).
+	switch v := cfg.InitialPosition.(type) {
+	case nil:
+	case string:
+		switch v {
+		case "tail":
+			rt.initial = reader.InitialPosition{Mode: reader.PositionTail}
+		case "head":
+			rt.initial = reader.InitialPosition{Mode: reader.PositionHead}
+		}
+	case int64:
+		rt.initial = reader.InitialPosition{Mode: reader.PositionSeconds, Seconds: int(v)}
+	}
+	rt.initialSet = true
+
+	// add_match constraints: units_to_match become _SYSTEMD_UNIT matches
+	// (journalpump.py:480-481). Any configured journald_filters dict
+	// makes Python's add_match raise TypeError mid-run (probed in Task
+	// 15); Go rejects it at construction (crash-free parity, parity doc).
+	if len(cfg.JournaldFilters) > 0 {
+		return nil, fmt.Errorf("readers.%s.journald_filters: journald_filters is not supported by the Go reader (Python crashed with TypeError at add_match)", name)
+	}
+	matches := make([]reader.Match, 0, len(cfg.UnitsToMatch))
+	for _, unit := range cfg.UnitsToMatch {
+		matches = append(matches, reader.Match{Field: "_SYSTEMD_UNIT", Value: unit})
+	}
+
+	// The reopener: recreation rate-limited like
+	// create_journald_reader_if_missing (journalpump.py:201-206); the
+	// OpenConfig closure carries the CURRENT cursor (recreations resume
+	// from the last seen entry) and the once-only initial position
+	// (journalpump.py:478).
+	rt.reopener = reader.NewReopener(func() reader.OpenConfig {
+		return reader.OpenConfig{
+			Flags:        rt.openFlags,
+			Path:         cfg.JournalPath,
+			Files:        cfg.JournalFiles,
+			Namespace:    cfg.JournalNamespace,
+			Matches:      matches,
+			ResumeCursor: rt.currentCursor(),
+			Initial:      rt.takeInitial(),
+			Stats:        rt.stats,
+		}
+	}, log)
+
+	// Resolve the senders now (see resolvedSender): unknown output
+	// types, field filters, or unit log levels are Python crashes
+	// (KeyError/ValueError inside get_reader) — fail construction.
+	senderNames := make([]string, 0, len(cfg.Senders))
+	for senderName := range cfg.Senders {
+		senderNames = append(senderNames, senderName)
+	}
+	sort.Strings(senderNames)
+	for _, senderName := range senderNames {
+		resolved, err := rt.resolveSender(senderName, cfg.Senders[senderName])
+		if err != nil {
+			return nil, err
+		}
+		rt.resolved = append(rt.resolved, resolved)
+	}
+	return rt, nil
+}
+
+// currentCursor reads the cursor (thread-safe: the supervisor's state
+// builder and the openConfig closure read while the reader goroutine
+// writes).
+func (rt *ReaderRuntime) currentCursor() string {
+	rt.muCursor.Lock()
+	defer rt.muCursor.Unlock()
+	return rt.cursor
+}
+
+func (rt *ReaderRuntime) setCursor(cursor string) {
+	rt.muCursor.Lock()
+	rt.cursor = cursor
+	rt.muCursor.Unlock()
+}
+
+// takeInitial returns the initial position for an open attempt: the
+// configured position while it is set, none afterwards. The CLEARING
+// happens only after a successful open (updateStatus) — Python clears
+// self.initial_position after ANY successful get_reader
+// (journalpump.py:476-478) and retries failed opens with it intact.
+func (rt *ReaderRuntime) takeInitial() reader.InitialPosition {
+	if !rt.initialSet {
+		return reader.InitialPosition{}
+	}
+	return rt.initial
+}
+
+// resolveSender performs the construction-time lookups of
+// initialize_senders (journalpump.py:267-284): unknown output_type /
+// field_filter / unit_log_level are Python KeyError/ValueError crashes
+// → construction errors; a non-object extra_field_values warns and
+// degrades to none, like Python.
+func (rt *ReaderRuntime) resolveSender(senderName string, raw any) (resolvedSender, error) {
+	resolved := resolvedSender{name: senderName}
+	config, ok := raw.(map[string]any)
+	if !ok {
+		return resolved, fmt.Errorf("readers.%s.senders.%s: sender config must be an object", rt.name, senderName)
+	}
+	resolved.config = config
+
+	outputType, ok := config["output_type"]
+	if !ok {
+		// Python sender_config["output_type"] KeyError → daemon crash.
+		return resolved, fmt.Errorf("readers.%s.senders.%s.output_type: key is required", rt.name, senderName)
+	}
+	typeName, ok := outputType.(string)
+	if !ok {
+		return resolved, fmt.Errorf("readers.%s.senders.%s.output_type: must be a string", rt.name, senderName)
+	}
+	ctor, err := sender.Lookup(typeName)
+	if err != nil {
+		return resolved, fmt.Errorf("readers.%s.senders.%s: %w", rt.name, senderName, err)
+	}
+	resolved.ctor = ctor
+
+	// field_filter: truthy name → registry lookup (Python
+	// self.field_filters[name] KeyError crash).
+	if value, present := config["field_filter"]; present && !isFalsyAny(value) {
+		name, ok := value.(string)
+		if !ok {
+			return resolved, fmt.Errorf("readers.%s.senders.%s.field_filter: must be a string", rt.name, senderName)
+		}
+		ff, ok := rt.pump.fieldFilters[name]
+		if !ok {
+			return resolved, fmt.Errorf("readers.%s.senders.%s.field_filter: unknown field filter %q", rt.name, senderName, name)
+		}
+		resolved.fieldFilter = ff
+	}
+
+	// unit_log_level: truthy name → registry lookup (Python
+	// self.unit_log_levels[name] KeyError crash; the pump-level dict is
+	// always present, so the `is not None` guard is always true).
+	if value, present := config["unit_log_level"]; present && !isFalsyAny(value) {
+		name, ok := value.(string)
+		if !ok {
+			return resolved, fmt.Errorf("readers.%s.senders.%s.unit_log_level: must be a string", rt.name, senderName)
+		}
+		ull, ok := rt.pump.unitLogLevels[name]
+		if !ok {
+			return resolved, fmt.Errorf("readers.%s.senders.%s.unit_log_level: unknown unit log level %q", rt.name, senderName, name)
+		}
+		resolved.unitLogLevels = ull
+	}
+
+	// extra_field_values: decoded from the order-captured raw subtree
+	// (config.ReaderConfig.ExtraFieldValuesRaw). Absent → none; a
+	// non-object warns and degrades to none, like Python
+	// (journalpump.py:279-284); the %r rendering of the value is the
+	// raw JSON text (rendering deviation, parity doc).
+	rawExtras, present := rt.cfg.ExtraFieldValuesRaw[senderName]
+	if present && len(rawExtras) > 0 && rawExtras[0] != '{' {
+		rt.log.Printf("Extra_field_values: %s not a dictionary object, ignoring", rawExtras)
+	} else if present {
+		extras, err := journal.DecodeOrderedFields(rawExtras)
+		if err != nil {
+			return resolved, fmt.Errorf("readers.%s.senders.%s.extra_field_values: %w", rt.name, senderName, err)
+		}
+		resolved.extraFieldValues = extras
+	}
+	return resolved, nil
+}
+
+// isFalsyAny mirrors Python truthiness for the sender-config lookup
+// guards (`if sender_config.get("field_filter", None)`).
+func isFalsyAny(v any) bool {
+	switch typed := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return !typed
+	case int64:
+		return typed == 0
+	case float64:
+		return typed == 0
+	case string:
+		return typed == ""
+	case map[string]any:
+		return len(typed) == 0
+	case []any:
+		return len(typed) == 0
+	}
+	return false
+}
+
+// initSenders ports initialize_senders (journalpump.py:261-312),
+// called at the tail of every successful reader open. Failed
+// constructors log, skip and count — retried on every recreation;
+// _failed_senders feeds the sender.failed_to_start persistent gauge
+// with the reader's base tags.
+func (rt *ReaderRuntime) initSenders() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for _, resolved := range rt.resolved {
+		if _, done := rt.initialised[resolved.name]; done {
+			continue
+		}
+		args := sender.ConstructorArgs{
+			Name:             resolved.name,
+			Config:           resolved.config,
+			Stats:            rt.pump.stats,
+			Tags:             rt.tags, // reader-level Tagged (base + reader=name)
+			FieldFilter:      resolved.fieldFilter,
+			UnitLogLevels:    resolved.unitLogLevels,
+			ExtraFieldValues: resolved.extraFieldValues,
+		}
+		inst, err := resolved.ctor(args)
+		if err != nil {
+			// Python log.exception("Sender %r failed to initialize") —
+			// the traceback renders as the error text in Go.
+			rt.log.Printf("Sender %q failed to initialize: %v", resolved.name, err)
+			continue
+		}
+		buf := buffer.NewSenderBuffer(resolved.name, rt.msgBufferMaxLength)
+		loop := sender.NewLoop(sender.LoopConfig{
+			Name:  resolved.name,
+			Stats: rt.pump.stats,
+			Tags:  rt.senderTags(resolved.name),
+			Log:   rt.pump.log,
+		}, inst, buf.Chan())
+		buf.Attach(loop)
+		if inst.ConnectOnInit {
+			// The file sender opens its output and marks itself
+			// connected at construction (file.py:8-11).
+			loop.MarkConnected()
+		}
+		sctx, cancel := context.WithCancel(rt.pump.senderRoot)
+		entry := &senderEntry{name: resolved.name, loop: loop, buffer: buf, inst: inst, cancel: cancel, grace: inst.MaxSendInterval}
+		rt.pump.senderMu.Lock()
+		rt.pump.senders[rt.name] = append(rt.pump.senders[rt.name], entry)
+		rt.pump.senderMu.Unlock()
+		rt.pump.senderWG.Add(1)
+		go func(e *senderEntry, ctx context.Context) {
+			defer rt.pump.senderWG.Done()
+			_ = e.loop.Run(ctx)
+		}(entry, sctx)
+		rt.initialised[resolved.name] = struct{}{}
+		rt.senders[resolved.name] = entry
+		rt.buffers = append(rt.buffers, buf)
+	}
+	rt.failedSenders = len(rt.resolved) - len(rt.initialised)
+	rt.gate = buffer.NewGate(rt.msgBufferMaxLength, rt.msgBufferMaxBytes, rt.buffers...)
+	rt.stats.Gauges.Set("sender.failed_to_start", int64(rt.failedSenders), rt.tags.MakeTags(nil))
+}
+
+// senderTags builds the sender's final tag set: Python passes the
+// READER's make_tags() to the constructor and base.py's Tagged adds
+// sender=<name> RAW; the final sanitization happens at make_tags time.
+func (rt *ReaderRuntime) senderTags(senderName string) map[string]string {
+	tags := rt.tags.Tags()
+	tags["sender"] = senderName
+	return tagged.New(tags).MakeTags(nil)
+}
+
+// writeLimitCount ports get_write_limit_message_count
+// (journalpump.py:221-230), including the "failed senders and no live
+// senders → 0" variant.
+func (rt *ReaderRuntime) writeLimitCount() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.failedSenders > 0 && len(rt.senders) == 0 {
+		return 0
+	}
+	if rt.gate == nil {
+		return buffer.ChunkSize
+	}
+	return rt.gate.WriteLimitCount()
+}
+
+// writeLimitBytes ports get_write_limit_bytes (journalpump.py:210-219)
+// with the same failed-senders variant. The caller honors the falsy
+// msg_buffer_max_bytes toggle (update_status, journalpump.py:236-237).
+func (rt *ReaderRuntime) writeLimitBytes() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.failedSenders > 0 && len(rt.senders) == 0 {
+		return 0
+	}
+	if rt.gate == nil {
+		return buffer.DefaultMsgBufferMaxBytes
+	}
+	return rt.gate.WriteLimitBytes()
+}
+
+// ready mirrors the is_ready property (journalpump.py:207-208):
+// bool(journald_reader and _is_ready).
+func (rt *ReaderRuntime) ready() bool {
+	return rt.journaldReader != nil && rt.readyFlag
+}
+
+// run drives one reader — the per-goroutine decomposition of the
+// Python poll loop body for one reader (journalpump.py:1116-1206):
+// wait for journal activity, drain pending events up to the write
+// limits, then update_status (recreation + readiness gate + sender
+// initialization) and the per-iteration secret-filter metrics report.
+func (rt *ReaderRuntime) run(ctx context.Context) error {
+	defer func() {
+		if rt.journaldReader != nil {
+			_ = rt.journaldReader.Close()
+			rt.journaldReader = nil
+		}
+	}()
+	for {
+		// Event wait phase. With a live reader, honor journal events
+		// (Python's poller on the inotify fd with poll_timeout_ms);
+		// without one, idle-wait one poll interval.
+		if rt.journaldReader != nil {
+			evt, err := rt.journaldReader.Wait(ctx, pollInterval)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil // shutdown: the normal exit path
+				}
+				return err
+			}
+			rt.pending = maxEvent(rt.pending, evt)
+		} else {
+			if err := sleepCtx(ctx, pollInterval); err != nil {
+				return nil
+			}
+		}
+
+		// Process pending events (journalpump.py:1153-1173): only ready
+		// readers drain; INVALIDATE recreates after the drain.
+		if rt.ready() && (rt.pending == reader.EventAppend || rt.pending == reader.EventInvalidate) {
+			exhausted, lines, err := rt.readMessages(ctx)
+			if err != nil {
+				return err
+			}
+			rt.pump.linesRead.Add(int64(lines))
+			if rt.pending == reader.EventInvalidate {
+				// If a file was deleted some unread messages may be lost
+				// here; releasing the descriptors is the point
+				// (journalpump.py:1165-1169).
+				rt.reopener.Invalidate()
+				rt.journaldReader = nil
+			}
+			// Only drop the event when everything was drained
+			// (journalpump.py:1171-1173).
+			if exhausted {
+				rt.pending = reader.EventNOP
+			}
+		}
+
+		// update_status + register_for_poll parity: a freshly opened
+		// reader schedules an APPEND ("Check if there is something to
+		// read in newly created reader", journalpump.py:1177-1179).
+		if err := rt.updateStatus(ctx); err != nil {
+			return err
+		}
+
+		if rt.secretFilterMetrics {
+			rt.reportSecretFilterMetrics()
+		}
+	}
+}
+
+// updateStatus ports update_status (journalpump.py:232-250): reader
+// recreation (rate-limited), then the readiness transitions with their
+// two log lines.
+func (rt *ReaderRuntime) updateStatus(_ context.Context) error {
+	if rt.journaldReader == nil {
+		opened, err := rt.reopener.Ensure()
+		switch {
+		case err != nil && errors.Is(err, reader.ErrFilesNotAvailable):
+			rt.log.Printf("Journal files for %q are not yet available", rt.name)
+		case err != nil && errors.Is(err, os.ErrNotExist):
+			// Python renders "FileNotFoundError: [Errno 2] ..."; Go
+			// renders the wrapped error text (rendering deviation).
+			rt.log.Printf("Journal for %q not available yet: FileNotFoundError: %v", rt.name, err)
+		case err != nil:
+			// Python: any other open error propagates out of the run
+			// loop and crashes the daemon.
+			return err
+		case opened != nil:
+			rt.journaldReader = opened
+			rt.initialSet = false // journalpump.py:476-478
+			rt.initSenders()      // get_reader tail: initialize_senders LAST
+			rt.pending = maxEvent(rt.pending, reader.EventAppend)
+		}
+	}
+
+	senderOverLimit := rt.writeLimitCount() <= 0
+	if rt.msgBufferMaxBytes != 0 {
+		senderOverLimit = senderOverLimit || rt.writeLimitBytes() <= 0
+	}
+	if !rt.readyFlag && !senderOverLimit {
+		rt.log.Printf("Message buffer size under threshold for all senders, ready to process journal for %q", rt.name)
+		rt.readyFlag = true
+	} else if rt.readyFlag && senderOverLimit {
+		rt.log.Printf("Message buffer size for at least one sender over threshold, pause processing journal for %q", rt.name)
+		rt.readyFlag = false
+	}
+	return nil
+}
+
+// readMessages ports read_messages (journalpump.py:1019-1049): the
+// budgets are sampled once per chunk; each iteration reads ONE message
+// (Python read_single_message); skipped messages (bytes_read None) do
+// not decrement the budgets but still consume loop iterations; the
+// search-hit recording happens only on the exhaustion and full-chunk
+// paths, never on the early limit returns.
+func (rt *ReaderRuntime) readMessages(ctx context.Context) (exhausted bool, lines int, err error) {
+	limitBytes := rt.writeLimitBytes()
+	limitCount := rt.writeLimitCount()
+	for i := 0; i < buffer.ChunkSize; i++ {
+		if limitBytes <= 0 {
+			return false, lines, nil
+		}
+		if limitCount <= 0 {
+			return false, lines, nil
+		}
+		hasMore, bytesRead, hasBytes, err := rt.readSingleMessage(ctx)
+		if err != nil {
+			return false, lines, err
+		}
+		if hasBytes {
+			limitBytes -= bytesRead
+			limitCount--
+		}
+		if !hasMore {
+			rt.recordHits()
+			return true, lines, nil
+		}
+		lines++
+	}
+	rt.recordHits()
+	return false, lines, nil
+}
+
+// readSingleMessage ports read_single_message (journalpump.py
+// 1005-1017): ONE entry per call; the broad exception handler wraps
+// BOTH the read and the processing.
+func (rt *ReaderRuntime) readSingleMessage(ctx context.Context) (hasMore bool, bytesRead int, hasBytes bool, err error) {
+	entries, batchErr := rt.journaldReader.ReadBatch(1)
+	if errors.Is(batchErr, reader.ErrBadMessage) {
+		// Python read_next: corrupted_log_entry + None → (False, None)
+		// — the chunk ends and stalls until the next poll cycle.
+		rt.stats.CorruptedEntry()
+		return false, 0, false, nil
+	}
+	if batchErr != nil {
+		// Python: any other read error escapes read_next into
+		// read_single_message's broad handler.
+		rt.broadHandler(batchErr)
+		return false, 0, false, nil
+	}
+	if len(entries) == 0 {
+		// Journal exhausted (Python StopIteration → None → (False, None)).
+		return false, 0, false, nil
+	}
+	entry := entries[0]
+
+	// read_next (journalpump.py:403-405): EVERY cursor-carrying entry
+	// updates the cursor and last_journal_msg_time — including entries
+	// later dropped by searches/match.
+	if entry.Cursor != "" {
+		rt.setCursor(entry.Cursor)
+		rt.stats.NoteCursor()
+	}
+
+	hasMore, bytesRead, hasBytes, processErr := rt.process(ctx, entry)
+	if processErr != nil {
+		rt.broadHandler(processErr)
+		return false, 0, false, nil
+	}
+	return hasMore, bytesRead, hasBytes, nil
+}
+
+// broadHandler ports read_single_message's except-arm
+// (journalpump.py:1012-1017): log (Python's log.exception renders the
+// traceback; Go renders the error), the unexpected_exception counter,
+// a 0.5 s sleep, and (has_more=False, bytes_read=None).
+func (rt *ReaderRuntime) broadHandler(err error) {
+	rt.log.Printf("Unexpected exception while handling entry for %s: %v", rt.name, err)
+	if rt.pump.stats != nil {
+		rt.pump.stats.UnexpectedException(err, "mainloop", rt.pump.tags.MakeTags(map[string]string{"app": "journalpump"}))
+	}
+	time.Sleep(500 * time.Millisecond)
+}
+
+// process runs the per-entry pipeline (Python JournalObjectHandler
+// constructed per message): the live senders become the targets, in
+// initialization order (Python reader.senders insertion order).
+func (rt *ReaderRuntime) process(ctx context.Context, entry journal.Entry) (bool, int, bool, error) {
+	var enqueueErr error
+	rt.mu.Lock()
+	targets := make([]journal.SenderTarget, 0, len(rt.senders))
+	for _, resolved := range rt.resolved {
+		live, ok := rt.senders[resolved.name]
+		if !ok {
+			continue
+		}
+		sbuf := live.buffer
+		targets = append(targets, journal.SenderTarget{
+			Name:             resolved.name,
+			FieldFilter:      resolved.fieldFilter,
+			UnitLogLevels:    resolved.unitLogLevels,
+			ExtraFieldValues: resolved.extraFieldValues,
+			AddItem: func(item []byte, cursor string) {
+				// Python msg_buffer.add_item never fails; Enqueue blocks
+				// only past the gate and returns on ctx cancellation
+				// (shutdown) — recorded, not dropped.
+				if enqueueErr != nil {
+					return
+				}
+				enqueueErr = sbuf.Enqueue(ctx, sender.Item{Payload: item, Cursor: cursor})
+			},
+		})
+	}
+	rt.mu.Unlock()
+
+	handler := journal.NewHandler(journal.HandlerConfig{
+		ReaderName:            rt.name,
+		Searcher:              rt.searcher,
+		ReaderMatchKey:        rt.matchKey,
+		ReaderMatchValue:      rt.matchValue,
+		SecretFilters:         rt.secretFilters,
+		SecretFilterMetrics:   rt.secretFilterMetrics,
+		PumpMatchKey:          rt.pump.cfg.MatchKey,
+		PumpMatchValue:        rt.pump.cfg.MatchValue,
+		Stats:                 rt.pump.stats,
+		PumpTags:              rt.pump.tags,
+		IncLineStats:          rt.stats.IncLineStats,
+		NoteSecretFilterMatch: func() { rt.secretFilterMatches++ },
+		Log:                   rt.log,
+	})
+	hasMore, bytesRead, hasBytes, err := handler.Process(entry, targets)
+	if err == nil && enqueueErr != nil {
+		// Enqueue only fails on context cancellation (shutdown): stop
+		// reading, exactly like a ctx-done Wait would.
+		return false, 0, false, nil
+	}
+	return hasMore, bytesRead, hasBytes, err
+}
+
+// recordHits ports the read_messages tail (journalpump.py:1046-1047):
+// the search hit counters are cumulative; the supervisor merges them.
+func (rt *ReaderRuntime) recordHits() {
+	rt.hitsDirty.Store(true)
+}
+
+// reportSecretFilterMetrics ports report_secret_filter_metrics
+// (journalpump.py:337-348): the 10 s gate shares inc_line_stats'
+// last-send time WITHOUT advancing it; an absent stats client leaves
+// the counter unreset (journalpump.py:344-346).
+func (rt *ReaderRuntime) reportSecretFilterMetrics() {
+	if !rt.stats.SecretFilterStatsDue() {
+		return
+	}
+	if rt.secretFilterMatches == 0 {
+		return
+	}
+	if rt.pump.stats == nil {
+		return
+	}
+	rt.pump.stats.Increase("journal.secret_filter_match", rt.secretFilterMatches, rt.tags.MakeTags(nil))
+	rt.secretFilterMatches = 0
+}
+
+// Run drives the pump until ctx is done or a component fails: reader
+// goroutines, the per-second housekeeping tick, and the D9 shutdown
+// sequence (spec §4.3): STOPPING notify, reader drain, the sender
+// grace window, sender cancellation, the final state save.
+func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
+	// The TERM/INT log line needs the signal NAME (Python's sigterm
+	// handler renders SIGTERM vs SIGINT); the run context already
+	// consumed the signal, so observe it a second time.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
+	readerCtx, cancelReaders := context.WithCancel(ctx)
+	defer cancelReaders()
+	readerErr := make(chan error, len(p.readers)+1)
+	var readerWG sync.WaitGroup
+	for _, rt := range p.readers {
+		readerWG.Add(1)
+		go func(rt *ReaderRuntime) {
+			defer readerWG.Done()
+			if err := rt.run(readerCtx); err != nil {
+				select {
+				case readerErr <- err:
+				default:
+				}
+			}
+		}(rt)
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	var cause error
+	for cause == nil {
+		select {
+		case <-ctx.Done():
+			name := "TERM"
+			select {
+			case sig := <-sigCh:
+				if sig == syscall.SIGINT {
+					name = "INT"
+				}
+			default:
+			}
+			p.log.Printf("Received SIG%s, stopping daemon...", name)
+			// A clean signal-driven shutdown always ends the loop: the
+			// run context stays cancelled, so returning shutdown's
+			// result (nil on success) is the exit.
+			return p.shutdown(cancelReaders, &readerWG)
+		case err := <-readerErr:
+			// A reader goroutine failed: Python's unhandled exception in
+			// the single-threaded loop would crash the daemon — shut down
+			// (with the grace window) and propagate the error.
+			p.log.Printf("Reader failed, stopping daemon: %v", err)
+			p.log.Printf("Received SIGTERM, stopping daemon...")
+			cause = err
+			_ = p.shutdown(cancelReaders, &readerWG)
+		case <-ticker.C:
+			if err := p.tick(); err != nil {
+				p.log.Printf("Housekeeping failed, stopping daemon: %v", err)
+				p.log.Printf("Received SIGTERM, stopping daemon...")
+				cause = err
+				_ = p.shutdown(cancelReaders, &readerWG)
+			}
+		case <-hup:
+			// SIGHUP is a reload EVENT (daemon.py:72-74); reload is
+			// Task 17 — consumed and logged only.
+			p.log.Printf("Received SIGHUP")
+		}
+	}
+	return cause
+}
+
+// shutdown ports the exit sequence: STOPPING=1 notify (Python's
+// sigterm handler — an OSError there crashes the daemon), the reader
+// drain, the D9 sender grace window (max_send_interval + TickInterval
+// over the LIVE senders), sender cancellation, the final state save,
+// and transport closure.
+func (p *Pump) shutdown(cancelReaders context.CancelFunc, readerWG *sync.WaitGroup) error {
+	if _, err := p.notifier.Notify(StateStopping); err != nil {
+		return err
+	}
+	cancelReaders()
+	readerWG.Wait()
+
+	grace := p.maxSenderGrace() + sender.TickInterval
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	<-timer.C
+
+	p.senderMu.Lock()
+	entries := make([]*senderEntry, 0, len(p.senders))
+	for _, readerEntries := range p.senders {
+		entries = append(entries, readerEntries...)
+	}
+	p.senderMu.Unlock()
+	for _, entry := range entries {
+		entry.cancel()
+	}
+	p.senderWG.Wait()
+
+	// Python shutdown: save_state in a broad try ("Saving state at
+	// shutdown failed").
+	if err := p.saveState(); err != nil {
+		p.log.Printf("Saving state at shutdown failed: %v", err)
+	}
+	for _, entry := range entries {
+		if closer, ok := entry.inst.Transport.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	return nil
+}
+
+// maxSenderGrace returns the max over the LIVE senders'
+// max_send_interval (the D9 window: every sender gets one final flush
+// tick). No senders → zero grace.
+func (p *Pump) maxSenderGrace() time.Duration {
+	p.senderMu.Lock()
+	defer p.senderMu.Unlock()
+	maxGrace := time.Duration(0)
+	for _, readerEntries := range p.senders {
+		for _, entry := range readerEntries {
+			if entry.grace > maxGrace {
+				maxGrace = entry.grace
+			}
+		}
+	}
+	return maxGrace
+}
+
+// sleepCtx sleeps d or returns ctx.Err() — the ctx-aware idle wait.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func maxEvent(a, b reader.Event) reader.Event {
+	if b > a {
+		return b
+	}
+	return a
+}
+
+// tick is one supervisor iteration (journalpump.py:1184-1206): the
+// watchdog ping, the 60 s search-hits line, the 10 s state save +
+// persistent-gauge refresh, and the GLOBAL idle refresh (Python gates
+// it on no reader having produced lines this iteration).
+func (p *Pump) tick() error {
+	// ping_watchdog (Python unguarded notify: an error crashes).
+	if _, err := p.notifier.Notify(StateWatchdog); err != nil {
+		return err
+	}
+
+	// Merge newly recorded search hits; log at most every 60 s
+	// (journalpump.py:1184-1187). Python renders the dict with %s —
+	// reproduced with sorted names (cosmetic order deviation).
+	p.mergeHits()
+	p.hitsMu.Lock()
+	hits := p.hits
+	last := p.lastHitsAt
+	p.hitsMu.Unlock()
+	if len(hits) > 0 && p.now().Sub(last) > 60*time.Second {
+		p.log.Printf("search hits stats: %s", pythonDictString(hits))
+		p.hitsMu.Lock()
+		p.hits = map[string]int64{}
+		p.lastHitsAt = p.now()
+		p.hitsMu.Unlock()
+	}
+
+	// save_state + refresh_gauges every 10 s (journalpump.py:1189-1193).
+	if p.now().Sub(p.lastStateSave) > 10*time.Second {
+		if err := p.saveState(); err != nil {
+			return err
+		}
+		p.lastStateSave = p.now()
+		for _, rt := range p.readers {
+			rt.stats.Gauges.RefreshNonZero()
+		}
+	}
+
+	// Idle refresh, GLOBAL gate (journalpump.py:1195-1198): refresh the
+	// readers so they flush buffered stats when NO reader produced
+	// lines since the last tick.
+	if p.linesRead.Swap(0) == 0 {
+		for _, rt := range p.readers {
+			rt.stats.IncLineStats(0, 0)
+		}
+	}
+	return nil
+}
+
+// mergeHits folds the readers' cumulative hit counters into the pump's
+// hits dict when newly recorded (last-writer-wins across readers, like
+// Python's shared dict; Go merges in sorted reader order — cosmetic).
+func (p *Pump) mergeHits() {
+	for _, rt := range p.readers {
+		if !rt.hitsDirty.CompareAndSwap(true, false) {
+			continue
+		}
+		p.hitsMu.Lock()
+		for _, search := range rt.searcher.Searches() {
+			p.hits[search.Name()] = search.Hits()
+		}
+		p.hitsMu.Unlock()
+	}
+}
+
+// pythonDictString renders a name->int map like Python's %s of a dict:
+// {'a': 1, 'b': 2} — keys in sorted order (Python renders insertion
+// order; the cosmetic deviation is recorded).
+func pythonDictString(hits map[string]int64) string {
+	names := make([]string, 0, len(hits))
+	for name := range hits {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("'%s': %d", name, hits[name]))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// saveState ports save_state (journalpump.py:1057-1072): an absent
+// path skips entirely; the write happens only when the state CHANGED
+// (Python compares the parsed dicts — Go compares the typed states
+// with reflect.DeepEqual, the sanctioned equivalent).
+func (p *Pump) saveState() error {
+	if p.statePath == "" {
+		return nil
+	}
+	st := p.buildState()
+	if p.previousState != nil && reflect.DeepEqual(st, p.previousState) {
+		return nil
+	}
+	if err := state.Write(p.statePath, st); err != nil {
+		return err
+	}
+	p.previousState = st
+	return nil
+}
+
+// buildState ports the state_to_save construction: per-reader
+// get_state (journalpump.py:326-335) plus start_time.
+func (p *Pump) buildState() *state.State {
+	st := &state.State{
+		Readers:   map[string]*state.ReaderState{},
+		StartTime: json.RawMessage(`"` + p.startTimeStr + `"`),
+	}
+	for _, rt := range p.readers {
+		cursor := rt.currentCursor()
+		var cursorPtr *string
+		if cursor != "" {
+			cursorPtr = &cursor
+		}
+		searches := map[string]json.RawMessage{}
+		for _, search := range rt.searcher.Searches() {
+			searches[search.Name()] = json.RawMessage(strconv.FormatInt(search.Hits(), 10))
+		}
+		rt.mu.Lock()
+		senders := make([]state.NamedSenderState, 0, len(rt.senders))
+		for name, entry := range rt.senders {
+			senders = append(senders, state.NamedSenderState{Name: name, State: entry.loop.State()})
+		}
+		rt.mu.Unlock()
+		sort.Slice(senders, func(i, j int) bool { return senders[i].Name < senders[j].Name })
+		lines, bytes := rt.stats.Totals()
+		st.Readers[rt.name] = &state.ReaderState{
+			Cursor:     cursorPtr,
+			Searches:   searches,
+			Senders:    senders,
+			TotalLines: json.RawMessage(strconv.FormatInt(lines, 10)),
+			TotalBytes: json.RawMessage(strconv.FormatInt(bytes, 10)),
+		}
+	}
+	return st
+}

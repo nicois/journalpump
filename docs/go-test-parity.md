@@ -811,3 +811,70 @@ Review notes from the Task 15 round (3 majors fixed):
   round).
 - The files-available gate sits before the position block, matching
   Python's get_reader order (journalpump.py:432 before :448).
+
+## Task 16 — run loop, reader wiring, file sender
+
+The supervisor (`internal/daemon/pump.go`), the per-message handler
+(`internal/journal/handler.go`) and the file sender
+(`internal/sender/file/file.go`) land together with the value
+demonstration: a production-format `journalpump.json` drives the real
+libsystemd reader over the Task 11 rotated-log fixture into the file
+sender, producing the fixture's expected output (recorded in the
+charter §6 "last value demonstration" line).
+
+Parity-critical behavior reproduced exactly:
+
+- `read_messages` budgets (`write_limit_bytes`/`write_limit_count`
+  sampled once per chunk, skipped messages not decrementing them), the
+  `_failed_senders and not senders → 0` variant, and the falsy
+  `msg_buffer_max_bytes` toggle in `update_status`.
+- The two readiness transition log lines, `_is_ready` pause/resume.
+- `sender.failed_to_start` as a reader-level persistent gauge with the
+  reader base tags (zero-on-transition semantics live in
+  `statsd.PersistentGauges`).
+- `bytes_read = max serialized size across senders`.
+- The broad `read_single_message` handler: `Unexpected exception while
+  handling entry for %s`, `stats.unexpected_exception(where="mainloop",
+  tags=make_tags({"app":"journalpump"}))`, 0.5 s sleep, and
+  `(has_more=False, bytes_read=None)`.
+- Lifecycle per spec §4.3: the run context from `signal.NotifyContext`;
+  `Run` returns nil on `ctx.Done`; the D9 grace window
+  (`max_send_interval + TickInterval`, coordinator-pinned) precedes
+  sender cancellation.
+- The cross-sender contamination quirk (shared, mutated processed
+  entry) is reproduced via the shared `[]journal.Field` slice in
+  `Handler.Process`; the per-message serialization cache is keyed by
+  field-filter name and never spans messages (one `Handler` per entry).
+- The too-large truncation record, cached after truncation, with the
+  once-per-handler `journal.read_error` counter.
+
+Recorded deviations:
+
+- One goroutine per reader (plus one per sender loop) replaces Python's
+  single-threaded poll loop; the global idle-refresh gate
+  (`if not lines`) is reproduced with a pump-level atomic counter
+  (`linesRead.Swap(0)`), so the decision stays GLOBAL as in Python.
+- Readers and senders are constructed in sorted-name order (Go map
+  decode loses document order); Python iterates dict insertion order.
+- Search-hits logging merges readers in sorted order and renders the
+  dict with sorted keys (`pythonDictString`) — Python renders insertion
+  order.
+- State save compares typed states with `reflect.DeepEqual` (Python
+  compares the parsed dicts); the writer is Go-native.
+- A `journald_filters` dict is a construction error (Python raises
+  TypeError mid-run at `add_match`).
+- Unknown `output_type` / `field_filter` / `unit_log_level` / journal
+  flag names are construction errors — Python crashes with
+  KeyError/ValueError/AttributeError inside `get_reader`.
+- A non-numeric `max_send_interval` is a failed sender (Python reaches
+  the run-loop float comparison and crashes with TypeError).
+- `extra_field_values` non-object warning renders the raw JSON text
+  rather than Python's `%r`; the truncated-preview log renders Go `%q`;
+  `FileNotFoundError` renders as the wrapped Go error text.
+- `Open` closes handles on partial failure (Python can leave a
+  partially-initialized reader behind).
+- A truncated-entry preview that is not valid UTF-8 returns an error
+  (→ broad handler), where Python's `json.dumps` raises
+  UnicodeDecodeError from the same point.
+- `write_running_config` and journald (`logging`) output are deferred
+  to Task 17.

@@ -148,9 +148,12 @@ func stepFromRc(rc int) (present bool, err error) {
 // returns the error — recorded in the parity doc as a divergence.
 func Open(cfg OpenConfig) (*SDJournal, error) {
 	flags := cfg.Flags
-	if flags == 0 && cfg.Path == "" && len(cfg.Files) == 0 {
+	if flags == 0 && cfg.Path == "" && cfg.Files == nil {
 		// python-systemd's default: LOCAL_ONLY for plain and
 		// namespace opens when flags is None (journal.py:168-174).
+		// nil distinguishes Python's files=None from a configured
+		// empty list ([] passes flags through, like Python's
+		// files=[]).
 		flags = FlagLocalOnly
 	}
 	var h *ffiJournal
@@ -161,7 +164,7 @@ func Open(cfg OpenConfig) (*SDJournal, error) {
 		h, rc, err = ffiOpenNamespace(cfg.Namespace, flags)
 	case cfg.Path != "":
 		h, rc, err = ffiOpenDirectory(cfg.Path, flags)
-	case len(cfg.Files) > 0:
+	case cfg.Files != nil:
 		h, rc, err = ffiOpenFiles(cfg.Files, flags)
 	default:
 		h, rc, err = ffiOpen(flags)

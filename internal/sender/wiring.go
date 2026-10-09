@@ -14,15 +14,16 @@ package sender
 import (
 	"fmt"
 
+	"github.com/Aiven-Open/journalpump/internal/filter"
+	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/statsd"
 	"github.com/Aiven-Open/journalpump/internal/tagged"
 )
 
 // ConstructorArgs carries the construction inputs every sender
 // receives (the kwargs of Python's sender_class call,
-// journalpump.py:286-299). Reader-side extras (field_filter,
-// extra_field_values, unit_log_levels) are added as fields when the
-// first sender that needs them lands; the struct is additive.
+// journalpump.py:286-299), including the reader-side extras
+// (field_filter, unit_log_levels, extra_field_values).
 type ConstructorArgs struct {
 	// Name is the sender name (the config key under "senders").
 	Name string
@@ -36,6 +37,19 @@ type ConstructorArgs struct {
 	// the sender merges its own identity (sender=<name>) over them
 	// via tagged.
 	Tags *tagged.Tagged
+	// FieldFilter is the reader-resolved field_filter object
+	// (journalpump.py:269-271; nil when the config key is absent or
+	// empty). Senders that need it keep the reference — the reload
+	// corollary: filter objects are captured at sender construction,
+	// not looked up per entry.
+	FieldFilter *filter.FieldFilter
+	// UnitLogLevels is the reader-resolved unit_log_level object
+	// (journalpump.py:273-275; nil when unset).
+	UnitLogLevels *filter.UnitLogLevel
+	// ExtraFieldValues carries the sender's extra_field_values in
+	// config document order (journalpump.py:277-284; empty when the
+	// key is absent, empty, or warned about as a non-object).
+	ExtraFieldValues []journal.Field
 }
 
 // Constructor builds one sender transport from its config block.
@@ -46,10 +60,18 @@ type ConstructorArgs struct {
 type Constructor func(args ConstructorArgs) (Instance, error)
 
 // constructors maps the config output_type to the sender constructor.
-// Empty until the first sender task lands (Task 19 file sender); the
-// framework, map type and lookup ship in Task 13 so every sender
-// plugs into one reviewed seam.
+// Populated by Register from the process wiring (cmd/journalpump), the
+// greppable counterpart of
+// journalpump/senders/__init__.py:output_type_to_sender_class_path.
 var constructors = map[string]Constructor{}
+
+// Register wires one output_type to its constructor. Called from the
+// process wiring (cmd/journalpump) — no blank imports and no init()
+// registration; each implemented sender package appears there as one
+// explicit import plus one Register call.
+func Register(outputType string, ctor Constructor) {
+	constructors[outputType] = ctor
+}
 
 // Lookup mirrors senders/__init__.py:get_sender_class: unknown
 // output_type is an error (Python raises ValueError "Unknown sender

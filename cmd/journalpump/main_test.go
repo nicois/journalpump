@@ -7,9 +7,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Aiven-Open/journalpump/internal/daemon"
 )
 
 // runInTempDir invokes run and captures its stdout/stderr output for
@@ -80,9 +83,31 @@ func TestRunExitCodes(t *testing.T) {
 		if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		// The run loop is real since Task 16: pre-cancel the run context
+		// so the pump starts, shuts down cleanly (D9 sequence over zero
+		// readers/senders) and exits 0 — the Python parity of
+		// "config loads, loop exits".
+		restore := overrideSignals(t, preCancelledSignals())
+		defer restore()
 		code, _, _ := runInTempDir(t, []string{path})
 		if code != 0 {
 			t.Errorf("exit code = %d, want 0", code)
 		}
 	})
+}
+
+// preCancelledSignals builds a Signals whose run context is already
+// done — the test seam for the real ListenSignals.
+func preCancelledSignals() *daemon.Signals {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return &daemon.Signals{Run: ctx, Hup: nil}
+}
+
+// overrideSignals installs a fake signal factory for the test.
+func overrideSignals(t *testing.T, signals *daemon.Signals) func() {
+	t.Helper()
+	previous := newSignals
+	newSignals = func() *daemon.Signals { return signals }
+	return func() { newSignals = previous }
 }

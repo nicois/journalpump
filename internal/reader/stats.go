@@ -123,6 +123,18 @@ func (s *Stats) IncLineStats(journalLines, journalBytes int) {
 	}
 }
 
+// SecretFilterStatsDue reports whether the 10 s stats-send window has
+// elapsed — the gate of report_secret_filter_metrics
+// (journalpump.py:338-341), which shares the reader's
+// last_stats_send_time with inc_line_stats but does NOT advance it
+// (only inc_line_stats does). Callers combine this with their own
+// match-count check; the counter is NOT reset by this method.
+func (s *Stats) SecretFilterStatsDue() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.now().Sub(s.lastStatsSend) >= statsThrottleInterval
+}
+
 // CorruptedEntry ports the "Bad message" arm of read_next
 // (journalpump.py:392-397): journal.corrupted_log_entry increases
 // immediately (not throttled) and the corruption is warned.

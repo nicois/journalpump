@@ -63,3 +63,12 @@ func (f *FieldFilter) FilterFields(data map[string]any) map[string]any {
 	}
 	return result
 }
+
+// Keep reports whether one field name survives the filter — the same
+// predicate FilterFields applies, exposed for order-preserving callers:
+// Python's dict comprehension builds the filtered dict in the ORIGINAL
+// iteration order, which a Go map view cannot represent.
+func (f *FieldFilter) Keep(name string) bool {
+	_, member := f.fields[strings.ToLower(strings.TrimLeft(name, "_"))]
+	return member == f.whitelist
+}

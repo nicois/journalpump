@@ -43,9 +43,17 @@ func ListenSignals() *Signals {
 	return &Signals{Run: runCtx, Hup: hupCh, stopRun: stopRun, hupRaw: hupCh}
 }
 
-// Close unregisters the signal handlers (tests; the Task 17 supervisor
-// calls it on exit).
+// Close unregisters the signal handlers (the supervisor calls it on
+// exit). It is nil-safe, so a Signals built without live handlers — the
+// test seam — closes cleanly.
 func (s *Signals) Close() {
-	s.stopRun()
-	signal.Stop(s.hupRaw)
+	if s == nil {
+		return
+	}
+	if s.stopRun != nil {
+		s.stopRun()
+	}
+	if s.hupRaw != nil {
+		signal.Stop(s.hupRaw)
+	}
 }
