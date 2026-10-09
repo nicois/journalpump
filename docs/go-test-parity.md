@@ -651,3 +651,107 @@ Review notes from the Task 14 round:
   reader's senders — NOT the per-sender payload length
   `SenderBuffer.ByteCount` tracks. The Task 16 reader must use
   Python's measure for the gate decrement and `inc_line_stats`.
+
+## Task 15 — sdjournal reader (spec §4.4)
+
+`internal/reader` ports the sd_journal interop, open semantics, initial
+positions, corrupt-entry handling and reader-side stats.
+
+Structure:
+
+- `reader.go` — the consumer seam (`Reader`: `Wait`/`ReadBatch`/`Seek`/
+  `Close`), `Event` (NOP/APPEND/INVALIDATE = 0/1/2), journal flag
+  constants and `FlagsFromNames`, `ErrBadMessage`, `CheckMatch`.
+  Entries are `journal.Entry` (Task 4 types reused, no parallel model).
+- `ffi.go` — hand-written dlopen binding to libsystemd (`-ldl` only,
+  no systemd headers at build time, all symbols resolved at runtime;
+  lib probe order mirrors go-systemd: libsystemd-journal then
+  libsystemd). `sd_journal_open/open_namespace/open_directory/
+  open_files/add_match/next/previous/seek_head/tail/cursor/
+  seek_monotonic_usec + sd_id128_get_boot/wait/enumerate_data/
+  get_cursor/get_realtime_usec/has_persistent_files/has_runtime_files/
+  close`.
+- `sdjournal.go` — `SDJournal` (PumpReader port), `Open` (the full
+  get_reader open sequence minus pump-owned bookkeeping), initial
+  position modes, `ReadBatch` semantics.
+- `stats.go` — `Stats` (inc_line_stats port: 10 s throttle,
+  journal.read_lines/read_bytes/last_read_ago gauges, 120 s
+  "Processed N journal lines (M bytes)" summary, corrupted-entry
+  counter, cursor-time note).
+- `reopener.go` — `Reopener` (create_journald_reader_if_missing port:
+  attempt recorded BEFORE the attempt, strictly > 2 s spacing,
+  `Invalidate` port).
+
+Python facts pinned:
+
+- Flags pass through verbatim; `flags=None` in Python ≡ `0` in Go
+  (empirically probed: LOCAL_ONLY=1 passed to `sd_journal_open_directory`
+  fails with EINVAL / Python "Opening the journal failed" — there is
+  NO masking in python-systemd, so none here either).
+- **libsystemd does not export `sd_journal_add_file`** — files mode is
+  `sd_journal_open_files` (NULL-terminated argv-style path array).
+- `seek_monotonic` resolves the current boot via `sd_id128_get_boot`
+  (python-systemd's seconds-from-boot semantics).
+- Empty entry (`_next` returns >0 but `_get_all` yields no fields) is
+  Python's falsy-entry skip: `get_next` returns None without cursor
+  bookkeeping — reproduced in `readNext`.
+- Enrichment order: `__REALTIME_TIMESTAMP` (int64 μs) via dict-
+  assignment semantics, then `__SEQNUM` (only when the cursor's `i=`
+  parses), both LAST in field order (`journal.SetField`).
+- Repeated fields collapse into `[]any` value lists in enumeration
+  order, first occurrence stays scalar bytes (python-systemd `_get_all`).
+- **Corruption taxonomy (probed on `systest/data/bad_msg`)**: the
+  corrupt entries surface as python-systemd's
+  `OSError("journal gave us a field without '='")` — NOT "Bad message".
+  Python's read_next only tolerates the "Bad message" text
+  (journal.corrupted_log_entry + warn + None); the field-without-=
+  OSError propagates to `read_single_message`'s broad handler
+  (journalpump.py:1005-1017): log.exception, stats.unexpected_exception
+  with `where="mainloop"` and `app=journalpump` tag, sleep 0.5 s,
+  `has_more=False` — the chunk stops, the reader survives, one failed
+  poll per corrupt entry. Go reproduces: `materialize` returns
+  `errFieldWithoutEquals` (same text), `ErrBadMessage` classification
+  is pinned by `TestSdErrClassification`. **Task 16 forward note**: the
+  run loop must catch ALL read errors like Python's broad except —
+  `ErrBadMessage` → `journal.corrupted_log_entry` + warn (read_next
+  parity), everything else → `stats.unexpected_exception` with
+  `where="mainloop"` + `app=journalpump` tag + 0.5 s pause +
+  `has_more=False`.
+- Resume semantics: `seek_cursor` positions BEFORE the cursor entry;
+  the one-entry skip consumes exactly the cursor entry
+  (journalpump.py:448-452) and still refreshes `last_journal_msg_time`
+  (read_next's cursor bookkeeping runs for the skipped entry).
+- Tail init: seek_tail → previous → materialize (corrupt last entry
+  tolerated ONLY for "Bad message" with corrupted counter,
+  journalpump.py:458-468) → step past the last entry.
+- Files-available gate (`has_persistent_files() or has_runtime_files()`)
+  applies in ALL modes; both return false for arbitrary fixture
+  directories and files mode (probed). Python's systest harness patches
+  the check globally (groundtruth_support.py:77-78); the Go equivalent
+  is the package-level `FilesAvailableOverride` hook — nil in
+  production, tests only. **Task 16/18 forward note**: the value-
+  demonstration run and the systest harness will need this override
+  for fixture-based configs, exactly as the Python shim does.
+- `create_journald_reader_if_missing` records the attempt BEFORE the
+  attempt (`last_journald_create_attempt = time.monotonic()` first),
+  recreations always pass `seek_to=self.cursor`.
+
+Accepted deviations (to be flagged for review):
+
+- **Library deviation (spec §4.4)**: go-systemd/v22/sdjournal is NOT
+  used. It requires the systemd development headers at build time
+  (absent on this host; no sudo to install) and lacks
+  `sd_journal_open_namespace` entirely. Replaced by a hand-written
+  dlopen binding (only dlfcn/stdlib/stdint/string via cgo), same
+  runtime dependency as python-systemd (libsystemd.so.0), same
+  runtime-library probe order as go-systemd. Spike note (spec risk 3)
+  resolved: the binding works against the real fixture binaries
+  (`TestFixtureRotatedLogs` reproduces Python's probed ground truth
+  exactly, including the 1640610602.142779 realtime float and key
+  order).
+- Plan says "same 30 messages" for the fixture acceptance; the probed
+  ground truth is 40 entries (Messages 0..39) — the test pins 40
+  (probe-verified, plan figure corrected).
+- `persistent_gauges` live in `statsd.PersistentGauges` (Task 7);
+  reader.Stats owns one via its `Gauges` field. The test_stats.py
+  parity test is `statsd.TestPersistentGauge` (already green).
