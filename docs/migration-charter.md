@@ -158,6 +158,18 @@ NEWS entry — plan Task 28):
   load). Python-INVALID patterns still hard-error at load with Python's
   message. User decision (2026-10-09, Task 5 review): sanctioned.
   NEWS-recorded (Task 28).
+- Native sd_notify client: the sd_notify/watchdog client is a
+  hand-written std-lib implementation (~60 lines, `internal/daemon`)
+  instead of the spec §4.6 coreos/go-systemd (sdnotify) library row.
+  Coordinator decision (2026-10-09, Task 9 review): sanctioned —
+  std-lib preference (D10, no new dependency) and Python-exact failure
+  shapes (the empty NOTIFY_SOCKET must fail with Python's OSError
+  EPROTO shape and a garbage address must fail at a prefix check,
+  where go-systemd would attempt a relative-path connect; go-systemd
+  v22.7.0 `daemon.SdNotify` returns (false, nil) for an empty socket
+  value and uses the same abstract-socket mechanism — the deviation is
+  the failure-shape parity and the Notifier seam, not the wire
+  mechanics). NEWS-recorded (Task 28).
 
 ## 3. Resolved decisions (spec §9, user-confirmed 2026-10-09)
 

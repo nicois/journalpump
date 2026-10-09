@@ -380,23 +380,27 @@ systemd.daemon.notify semantics; Go port: `internal/daemon` (the
 supervisor wiring is Tasks 10/17).
 
 - **Notify client semantics are probed against python-systemd**, not
-  guessed (all five probes run against the installed
-  python-systemd): unset NOTIFY_SOCKET → False, NO error; repeated
+  guessed (all probes run against the installed
+  python-systemd): unset NOTIFY_SOCKET → False, NO error; an EMPTY
+  NOTIFY_SOCKET raises OSError EPROTO (probed — set-but-empty is NOT
+  the unset no-op); repeated
   calls all deliver (the env var is never unset or cached); a leading
   '@' addresses an abstract-namespace socket (byte → NUL); a dead
   listener RAISES OSError (ECONNREFUSED abstract, ENOENT filesystem
   path); NOTIFY_SOCKET that is neither '/'- nor '@'-prefixed raises
-  OSError EPROTO. Go mirrors each: (false, nil) no-op, env read on
+  OSError EPROTO. Go mirrors each: (false, nil) no-op via
+  os.LookupEnv (unset only), env read on
   every call, net.UnixAddr '@' abstract handling, errors returned from
   Notify (Python's unguarded daemon.notify calls would crash the
   daemon — the Task 17 caller decides where to propagate).
-  `TestNotifyUnsetSocketIsNoOp`, `TestNotifySendsOverAbstractSocket`,
+  `TestNotifyUnsetSocketIsNoOp`, `TestNotifyEmptySocketFailsLikePython`,
+  `TestNotifySendsOverAbstractSocket`,
   `TestNotifySendsOverPathSocket`, `TestNotifyInvalidSocketFails`,
   `TestNotifyAbsentListenerFails`.
 - **Harness test, plan Task 9**: `TestStubBinarySendsNotifyOverAbstractSocket`
   spawns a stub binary (the test binary re-executed in stub mode via
   TestMain) with an abstract-socket NOTIFY_SOCKET and asserts the
-  exact READY=1 / WATCHDOG=1 / STOPPING=1 datagrams
+  exact READY=1 / RELOADING=1 / WATCHDOG=1 / STOPPING=1 datagrams
   systest/journalpump_process.py asserts against the real daemon.
 - **Notifier seam for the mock strategy**: `Notifier` interface +
   `SocketNotifier` implementation; the fake `delayNotifier` (holds
@@ -418,11 +422,16 @@ supervisor wiring is Tasks 10/17).
   reload_if_requested coalesce into one reload. Go's signal.Notify on
   a capacity-1 channel with drop-when-full delivery coalesces the same
   way; the supervisor select drains it every loop iteration.
-- **Library deviation, flagged for coordinator sanction**: spec §4.6
-  names coreos/go-systemd (sdnotify) for sd_notify; the plan's Task 9
+- **Library deviation, coordinator-sanctioned**: spec §4.6 names
+  coreos/go-systemd (sdnotify) for sd_notify; the plan's Task 9
   "small client interface + fake" is implemented natively (~60 lines,
-  no new dependency) because the probe-locked semantics above are
-  easier to pin exactly on a purpose-built client (e.g. sdnotify
-  would DIAL an empty NOTIFY_SOCKET instead of no-op'ing, and its
-  '@' handling differs from python-systemd's byte-replacement). The
+  no new dependency). Coordinator decision (2026-10-09, Task 9 review),
+  corrected rationale: std-lib preference (D10 — no new dependency) and
+  Python-exact failure shapes — e.g. the empty NOTIFY_SOCKET must fail
+  with Python's OSError EPROTO shape (probed) and a garbage address
+  must fail at a prefix check, where go-systemd would attempt a
+  relative-path connect instead. For the record, go-systemd
+  v22.7.0 `daemon.SdNotify` returns (false, nil) for an empty socket
+  value and uses the same abstract-socket mechanism — the deviation is
+  the failure-shape parity and the seam, not the wire mechanics. The
   syscalls are identical (AF_UNIX SOCK_DGRAM connect + send).

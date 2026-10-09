@@ -43,10 +43,23 @@ func recvWithTimeout(t *testing.T, listener *net.UnixConn) string {
 	return string(buf[:n])
 }
 
-// TestNotifyUnsetSocketIsNoOp: no NOTIFY_SOCKET → no-op, no error
-// (probed against python-systemd: notify() returns False).
+// TestNotifyUnsetSocketIsNoOp: no NOTIFY_SOCKET in the environment at
+// all → no-op, no error (probed against python-systemd: notify()
+// returns False). Explicitly UNSETS the variable — t.Setenv("",) would
+// be the different EMPTY case (see TestNotifyEmptySocketFailsLikePython).
 func TestNotifyUnsetSocketIsNoOp(t *testing.T) {
-	t.Setenv("NOTIFY_SOCKET", "")
+	orig, had := os.LookupEnv("NOTIFY_SOCKET")
+	if err := os.Unsetenv("NOTIFY_SOCKET"); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("NOTIFY_SOCKET", orig)
+		} else {
+			_ = os.Unsetenv("NOTIFY_SOCKET")
+		}
+	})
+
 	sent, err := (SocketNotifier{}).Notify(StateReady)
 	if err != nil {
 		t.Fatalf("Notify: %v", err)
@@ -56,16 +69,27 @@ func TestNotifyUnsetSocketIsNoOp(t *testing.T) {
 	}
 }
 
+// TestNotifyEmptySocketFailsLikePython: NOTIFY_SOCKET="" (set but
+// empty) is NOT the unset no-op — Python raises OSError EPROTO
+// "Protocol error" (probed), so the Go client must error too.
+func TestNotifyEmptySocketFailsLikePython(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "")
+	if _, err := (SocketNotifier{}).Notify(StateReady); err == nil {
+		t.Error("empty NOTIFY_SOCKET must fail like Python's OSError EPROTO")
+	}
+}
+
 // TestNotifySendsOverAbstractSocket: '@' NOTIFY_SOCKET delivers the
 // state string byte-exact to the abstract unixgram listener, repeated
 // calls all deliver (the env var is never unset or cached — probed
-// against python-systemd).
+// against python-systemd). The sequence includes the full daemon
+// lifecycle incl. the RELOADING=1 → READY=1 reload pair.
 func TestNotifySendsOverAbstractSocket(t *testing.T) {
 	listener, notifySocket := socketPair(t)
 	t.Setenv("NOTIFY_SOCKET", notifySocket)
 	notifier := SocketNotifier{}
 
-	for _, state := range []string{StateReady, StateWatchdog, StateStopping} {
+	for _, state := range []string{StateReady, StateReloading, StateWatchdog, StateStopping} {
 		sent, err := notifier.Notify(state)
 		if err != nil {
 			t.Fatalf("Notify(%s): %v", state, err)
@@ -143,7 +167,7 @@ func (f *delayNotifier) Notify(state string) (bool, error) {
 func TestFakeNotifierCanHoldWatchdog(t *testing.T) {
 	notifier := &delayNotifier{delay: 5 * time.Millisecond}
 	start := time.Now()
-	for _, state := range []string{StateReady, StateWatchdog, StateStopping} {
+	for _, state := range []string{StateReady, StateReloading, StateWatchdog, StateStopping} {
 		if _, err := notifier.Notify(state); err != nil {
 			t.Fatalf("Notify(%s): %v", state, err)
 		}
@@ -151,7 +175,7 @@ func TestFakeNotifierCanHoldWatchdog(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < 5*time.Millisecond {
 		t.Errorf("elapsed = %v, want >= the WATCHDOG delay", elapsed)
 	}
-	if fmt.Sprint(notifier.sent) != fmt.Sprint([]string{StateReady, StateWatchdog, StateStopping}) {
+	if fmt.Sprint(notifier.sent) != fmt.Sprint([]string{StateReady, StateReloading, StateWatchdog, StateStopping}) {
 		t.Errorf("sent = %v", notifier.sent)
 	}
 }
@@ -161,13 +185,13 @@ func TestFakeNotifierCanHoldWatchdog(t *testing.T) {
 const notifyStubEnv = "GO_DAEMON_NOTIFY_STUB"
 
 // stubMain is the in-binary stub the harness test spawns: it sends
-// READY=1, WATCHDOG=1, STOPPING=1 through the real SocketNotifier
+// READY=1, RELOADING=1, WATCHDOG=1, STOPPING=1 through the real SocketNotifier
 // against the NOTIFY_SOCKET it inherited, then exits 0 — the datagram
 // sequence journalpump_process.py expects from the daemon. A failure
 // exits nonzero with a message on stderr.
 func stubMain() int {
 	notifier := SocketNotifier{}
-	for _, state := range []string{StateReady, StateWatchdog, StateStopping} {
+	for _, state := range []string{StateReady, StateReloading, StateWatchdog, StateStopping} {
 		if _, err := notifier.Notify(state); err != nil {
 			fmt.Fprintf(os.Stderr, "stub notify %s: %v\n", state, err)
 			return 3
@@ -207,7 +231,7 @@ func TestStubBinarySendsNotifyOverAbstractSocket(t *testing.T) {
 		}
 	}()
 
-	want := []string{StateReady, StateWatchdog, StateStopping}
+	want := []string{StateReady, StateReloading, StateWatchdog, StateStopping}
 	received := make(map[string]bool)
 	for range want {
 		select {

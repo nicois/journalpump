@@ -32,7 +32,11 @@ const (
 // strategy, plan Task 9) — e.g. a notifier that delays on WATCHDOG=1
 // is the Go-native equivalent of the systest sitecustomize trick that
 // holds ping_watchdog so SIGTERM lands mid-loop
-// (systest/test_sigterm.py:11-23).
+// (systest/test_sigterm.py:11-23). Seam placement is deliberate and
+// producer-side for now: the consumers (the Task 10 systest harness
+// and the Task 17 supervisor run loop) land in later tasks and may
+// want the interface moved to the layer they both see; nothing outside
+// this package may take a concrete SocketNotifier.
 type Notifier interface {
 	// Notify sends one sd_notify state datagram. It returns false when
 	// NOTIFY_SOCKET is unset (no-op — systemd.daemon.notify returns
@@ -47,13 +51,14 @@ type Notifier interface {
 //
 //   - NOTIFY_SOCKET is read from the environment on EVERY call (never
 //     cached or unset — probed: repeated Python notifies all deliver);
-//   - an unset (or empty) NOTIFY_SOCKET is a silent no-op returning
-//     (false, nil) — probed: notify() returns False when unset;
+//   - an UNSET NOTIFY_SOCKET is a silent no-op returning (false, nil)
+//     — probed: notify() returns False when unset;
 //   - a leading '@' addresses an abstract-namespace socket (the byte
 //     becomes NUL) — the systest harness socket form;
 //   - otherwise the value is a filesystem socket path;
-//   - anything else fails (Python raises OSError EPROTO "Protocol
-//     error" — probed with NOTIFY_SOCKET="garbage");
+//   - anything else fails, INCLUDING an empty value (Python raises
+//     OSError EPROTO "Protocol error" — probed with both
+//     NOTIFY_SOCKET="" and "garbage");
 //   - delivery is an AF_UNIX/SOCK_DGRAM datagram (connect + send);
 //   - a dead or absent listener is an error (Python raises OSError:
 //     ECONNREFUSED for a missing abstract listener, ENOENT for a
@@ -62,11 +67,13 @@ type SocketNotifier struct{}
 
 // Notify implements Notifier with the real socket.
 func (SocketNotifier) Notify(state string) (bool, error) {
-	addr := os.Getenv("NOTIFY_SOCKET")
-	if addr == "" {
+	addr, present := os.LookupEnv("NOTIFY_SOCKET")
+	if !present {
 		return false, nil
 	}
-	if addr[0] != '/' && addr[0] != '@' {
+	if addr == "" || (addr[0] != '/' && addr[0] != '@') {
+		// Python (probed): OSError EPROTO for both the empty value and
+		// an address that is neither a path nor '@'-abstract.
 		return false, fmt.Errorf("sd_notify: invalid NOTIFY_SOCKET %q: must start with / or @", addr)
 	}
 	// net.UnixAddr interprets a leading '@' as an abstract-namespace
