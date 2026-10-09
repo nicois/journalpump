@@ -3,11 +3,10 @@
 # This file is under the Apache License, Version 2.0.
 # See the file `LICENSE` for details.
 
-from .util import journalpump_initialized
-from journalpump.journalpump import JournalPump
+from .journalpump_process import JournalpumpProcess
 from pathlib import Path
 from systemd import journal
-from time import sleep
+from time import monotonic, sleep
 from typing import Any
 
 import json
@@ -18,7 +17,6 @@ import random
 import socket
 import string
 import subprocess
-import threading
 
 # NOTE: make sure to use google-re >= 1.1 if this is enabled.
 if os.environ.get("USE_RE2"):
@@ -113,6 +111,41 @@ class _TestRsyslogd:
             self.process = None
 
 
+def _wait_for_reader_ready(logfile: Path, *, timeout: float = 10.0) -> None:
+    """Block until the spawned daemon's journal reader is attached.
+
+    The harness's READY=1 is not sufficient for the tail-positioned reader:
+    the Python daemon opens the journal in JournalPump.__init__ (before its
+    first READY=1, daemon.py:113-114), but the Go daemon's reader goroutine
+    opens it inside Pump.Run, AFTER the READY=1 notifications. With
+    ``initial_position: "tail"`` a line injected before the reader attaches
+    is pinned away and lost, so the readiness probe below re-sends a
+    throwaway journal entry until one reaches the wire — proving the tail
+    pin is now taken — before the real batch is injected. The probe text
+    deliberately does not match any ``{Info,Warning,Error,Critical} message
+    for {identifier}`` assertion pattern.
+
+    The Go READY-before-reader-open ordering is a divergence from Python
+    and is flagged for adjudication (see the Task 20 report); this wait
+    keeps the wire-parity assertions deterministic meanwhile.
+    """
+    deadline = monotonic() + timeout
+    probe_identifier = "".join(random.sample(string.ascii_uppercase + string.digits, k=8))
+    attempt = 0
+    while monotonic() < deadline:
+        attempt += 1
+        probe_text = f"readiness probe {probe_identifier} #{attempt}"
+        journal.send(probe_text, PRIORITY=journal.LOG_INFO, SYSLOG_IDENTIFIER="jp-readiness-probe")
+        sleep(0.3)
+        try:
+            written = logfile.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            continue
+        if probe_text in written:
+            return
+    raise AssertionError("journalpump reader did not attach before the readiness timeout")
+
+
 def _run_pump_test(
     *,
     config_path: Path,
@@ -122,15 +155,15 @@ def _run_pump_test(
     expected_info_line_ending: str | None = None,
     expected_subsequent_message: str | None = None,
 ) -> None:
-    journalpump = None
-    threads = []
-    try:
-        journalpump = JournalPump(config_path)
-        pump = threading.Thread(target=journalpump.run)
-        pump.start()
-        threads.append(pump)
-
-        assert journalpump_initialized(journalpump), "Failed to initialize journalpump"
+    # Drive the journalpump BINARY through the implementation-agnostic
+    # harness (systest/journalpump_process.py, plan Task 10/20): the
+    # JOURNALPUMP_BIN selection picks the Python daemon (default) or the Go
+    # binary, so the same black-box suite pins both. READY=1 replaces the
+    # in-process journalpump_initialized() check, and SIGTERM (harness
+    # stop) replaces the manual reader/sender request_stop().
+    with JournalpumpProcess() as journalpump:
+        journalpump.start(config_path)
+        _wait_for_reader_ready(logfile)
 
         identifier = "".join(random.sample(string.ascii_uppercase + string.digits, k=8))
         for msg in messages_to_send:
@@ -141,22 +174,8 @@ def _run_pump_test(
             journal.send(msg_text, **kwargs)
         # Wait for everything to trickle thru
         sleep(5)
-    finally:
-        # Stop the journalpump and senders
-        if journalpump is not None:
-            journalpump.running = False
-            for reader in journalpump.readers.values():
-                for sender in reader.senders.values():
-                    threads.append(sender)
-                    sender.request_stop()
 
-        # Wait a little while for threads to finish
-        retry = 0
-        while retry < 5:
-            if not [thread for thread in threads if thread.is_alive()]:
-                break
-            sleep(1)
-            retry += 1
+        assert journalpump.stop() == 0, "journalpump did not shut down cleanly"
 
     # Check the results
     found = 0

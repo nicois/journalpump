@@ -1,0 +1,133 @@
+[
+  {
+    "config": {},
+    "messages": [
+      {
+        "HOSTNAME": "h",
+        "MESSAGE": "Info message",
+        "PID": "100",
+        "PRIORITY": "6",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      },
+      {
+        "HOSTNAME": "h",
+        "MESSAGE": "Critical message",
+        "PID": "100",
+        "PRIORITY": "2",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      },
+      {
+        "MESSAGE": "Ident message",
+        "PRIORITY": "3",
+        "SYSLOG_IDENTIFIER": "ident",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "rfc5424_priorities",
+    "wire_hex": "3c31343e3120323032352d30312d30315430303a30303a30302e3030303030305a2068202d20313030202d20496e666f206d6573736167650a3c31303e3120323032352d30312d30315430303a30303a30302e3030303030305a2068202d20313030202d20437269746963616c206d6573736167650a3c31313e3120323032352d30312d30315430303a30303a30302e3030303030305a202d206964656e74202d202d204964656e74206d6573736167650a"
+  },
+  {
+    "config": {
+      "octet_counted_framing": false
+    },
+    "messages": [
+      {
+        "MESSAGE": "Info message\nexample\nstack\ntrace",
+        "PRIORITY": "6",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "multiline_nontransparent",
+    "wire_hex": "3c31343e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d20496e666f206d6573736167650a6578616d706c650a737461636b0a74726163650a"
+  },
+  {
+    "config": {
+      "octet_counted_framing": true
+    },
+    "messages": [
+      {
+        "MESSAGE": "Info message\nexample\nstack\ntrace",
+        "PRIORITY": "6",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "multiline_octet_counted",
+    "wire_hex": "3735203c31343e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d20496e666f206d6573736167650a6578616d706c650a737461636b0a74726163650a"
+  },
+  {
+    "config": {
+      "escape_newlines": true
+    },
+    "messages": [
+      {
+        "MESSAGE": "Info message\nexample\nstack\ntrace",
+        "PRIORITY": "6",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "multiline_escape_newlines",
+    "wire_hex": "3c31343e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d20496e666f206d6573736167655c6e6578616d706c655c6e737461636b5c6e74726163650a"
+  },
+  {
+    "config": {
+      "max_message_size": 200,
+      "octet_counted_framing": true
+    },
+    "messages": [
+      {
+        "MESSAGE": "Info message\nXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "PRIORITY": "6",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      },
+      {
+        "MESSAGE": "Critical message",
+        "PRIORITY": "2",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "oversize_octet_counted_truncation",
+    "wire_hex": "323030203c31343e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d20496e666f206d6573736167650a585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858583539203c31303e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d20437269746963616c206d6573736167650a"
+  },
+  {
+    "config": {
+      "format": "custom",
+      "logline": "<%pri%>%timestamp% %HOSTNAME% %app-name%[%procid%]: %msg% {%%} %not-valid-tag%"
+    },
+    "messages": [
+      {
+        "HOSTNAME": "h",
+        "MESSAGE": "Info message",
+        "PID": "100",
+        "PRIORITY": "6",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "custom_logline",
+    "wire_hex": "3c31343e4a616e2030312030303a30303a30302068202d5b3130305d3a20496e666f206d657373616765207b257d202d0a"
+  },
+  {
+    "config": {
+      "default_facility": 3,
+      "structured_data": "x=\"y\""
+    },
+    "messages": [
+      {
+        "MESSAGE": "with sd",
+        "PRIORITY": "6",
+        "SYSLOG_FACILITY": [
+          "4",
+          "5"
+        ],
+        "timestamp": "2025-01-01T00:00:00.000000"
+      },
+      {
+        "MESSAGE": "default facility",
+        "PRIORITY": "6",
+        "SYSLOG_FACILITY": "bogus",
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "facility_list_and_structured_data",
+    "wire_hex": "3c33383e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d205b783d2279225d20776974682073640a3c33303e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d205b783d2279225d2064656661756c7420666163696c6974790a"
+  }
+]

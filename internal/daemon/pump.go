@@ -873,6 +873,8 @@ func (rt *ReaderRuntime) initSenders() {
 			FieldFilter:      resolved.fieldFilter,
 			UnitLogLevels:    resolved.unitLogLevels,
 			ExtraFieldValues: resolved.extraFieldValues,
+			// Python base.py:119 self.log = logging.getLogger(f"LogSender:{reader.name}").
+			Log: namedLogger(rt.pump.log, "LogSender:"+rt.name),
 		}
 		inst, err := resolved.ctor(args)
 		if err != nil {

@@ -50,6 +50,12 @@ type ConstructorArgs struct {
 	// config document order (journalpump.py:277-284; empty when the
 	// key is absent, empty, or warned about as a non-object).
 	ExtraFieldValues []journal.Field
+	// Log is the sender's own logger — Python base.py:119
+	// self.log = logging.getLogger(f"LogSender:{reader.name}"), the same
+	// logger the shared loop uses. Senders that emit their own
+	// warnings/errors (e.g. the rsyslog sender's missing-timestamp
+	// warning) use it. May be nil (discard).
+	Log Logger
 }
 
 // Constructor builds one sender transport from its config block.
