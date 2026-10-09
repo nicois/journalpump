@@ -624,45 +624,88 @@ func TestDiscardReopenReplayValidJSONL(t *testing.T) {
 	}
 }
 
-// failTruncateOnceFile fails the first Truncate, records whether the
-// handle was closed.
-type failTruncateOnceFile struct {
+// truncateFailFile wraps a real file and fails Truncate while fails != 0
+// (fails < 0 = forever), recording whether Close was called.
+type truncateFailFile struct {
 	f      *os.File
-	fired  bool
+	fails  int
 	closed bool
 }
 
-func (w *failTruncateOnceFile) Write(p []byte) (int, error) { return w.f.Write(p) }
+func (w *truncateFailFile) Write(p []byte) (int, error) { return w.f.Write(p) }
 
-func (w *failTruncateOnceFile) Truncate(size int64) error {
-	if !w.fired {
-		w.fired = true
+func (w *truncateFailFile) Truncate(size int64) error {
+	if w.fails != 0 {
+		if w.fails > 0 {
+			w.fails--
+		}
 		return errWriteBoom
 	}
 	return w.f.Truncate(size)
 }
 
-func (w *failTruncateOnceFile) Close() error {
+func (w *truncateFailFile) Close() error {
 	w.closed = true
 	return w.f.Close()
 }
 
-func (w *failTruncateOnceFile) Stat() (os.FileInfo, error) { return w.f.Stat() }
+func (w *truncateFailFile) Stat() (os.FileInfo, error) { return w.f.Stat() }
 
-// TestCloseDiscardingKeepsHandleOpenForRepair locks the repair seam: when
-// the discard truncate fails, the handle is left OPEN (a retry must be able
-// to truncate the partial line), the output stays on disk, and a later
-// CloseDiscarding that succeeds finally releases the handle.
-func TestCloseDiscardingKeepsHandleOpenForRepair(t *testing.T) {
-	const prior = "{\"old\":1}\n"
-	path, base := openPrepopulated(t, prior)
-
+// openTruncateFailSender opens path for append behind a truncate-failing
+// wrapper and returns a sender plus the wrapper.
+func openTruncateFailSender(t *testing.T, path string, base int64, fails int) (*Sender, *truncateFailFile) {
+	t.Helper()
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	of := &failTruncateOnceFile{f: f}
-	tr := newSender(of, base)
+	of := &truncateFailFile{f: f, fails: fails}
+	return newSender(of, base), of
+}
+
+// writeCompleteThenPartial writes one complete JSON line then a message
+// larger than the buffer, so the auto-flush lands a complete line plus a
+// PARTIAL prefix of the big line on disk.
+func writeCompleteThenPartial(t *testing.T, tr *Sender, complete string) string {
+	t.Helper()
+	big := `{"pad":"` + strings.Repeat("x", pythonBufferSize+16) + `"}`
+	if err := tr.SendMessages(context.Background(), [][]byte{[]byte(complete)}, ""); err != nil {
+		t.Fatalf("SendMessages complete: %v", err)
+	}
+	if err := tr.SendMessages(context.Background(), [][]byte{[]byte(big)}, ""); err != nil {
+		t.Fatalf("SendMessages big: %v", err)
+	}
+	return big
+}
+
+// assertValidJSONLLines asserts the file parses as JSONL and returns the
+// message lines in order.
+func assertValidJSONLLines(t *testing.T, path string) []string {
+	t.Helper()
+	raw := readFile(t, path)
+	lines := strings.Split(strings.TrimSuffix(raw, "\n"), "\n")
+	for i, line := range lines {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("line %d is not valid JSON: %q", i, line)
+		}
+	}
+	return lines
+}
+
+// TestDiscardRetryRemovesPartialLinePreservesComplete locks the discard
+// repair with real data: a complete new line plus a partial next line are
+// on disk, the first discard's truncate fails (partial remains, handle
+// left open), and the retry removes exactly the partial bytes — complete
+// lines survive and a replay appends valid JSONL.
+func TestDiscardRetryRemovesPartialLinePreservesComplete(t *testing.T) {
+	path, _ := openPrepopulated(t, "")
+	tr, of := openTruncateFailSender(t, path, 0, 1)
+	writeCompleteThenPartial(t, tr, `{"keep":1}`)
+
+	before := readFile(t, path)
+	if !strings.HasPrefix(before, "{\"keep\":1}\n") || len(before) <= len("{\"keep\":1}\n") {
+		t.Fatalf("setup did not leave a partial tail on disk: %q", before)
+	}
 
 	if err := tr.CloseDiscarding(); !errors.Is(err, errWriteBoom) {
 		t.Fatalf("first CloseDiscarding err = %v, want the truncate failure", err)
@@ -670,13 +713,90 @@ func TestCloseDiscardingKeepsHandleOpenForRepair(t *testing.T) {
 	if of.closed {
 		t.Fatal("handle closed on a failed discard: a retry could not repair")
 	}
+	if got := readFile(t, path); got != before {
+		t.Fatalf("failed discard changed the file: %q, want %q", got, before)
+	}
+
 	if err := tr.CloseDiscarding(); err != nil {
 		t.Fatalf("retry CloseDiscarding: %v", err)
 	}
 	if !of.closed {
 		t.Error("retry did not release the handle")
 	}
-	if got := readFile(t, path); got != prior {
-		t.Errorf("output = %q, want %q (pre-existing lines preserved)", got, prior)
+	if got := readFile(t, path); got != "{\"keep\":1}\n" {
+		t.Fatalf("after repair = %q, want only the complete line", got)
+	}
+
+	// Replay: a fresh sender appends a clean next line; the file is valid JSONL.
+	tr2, _ := newTestSenderAt(t, path)
+	if err := tr2.SendMessages(context.Background(), [][]byte{[]byte(`{"next":2}`)}, ""); err != nil {
+		t.Fatalf("replay SendMessages: %v", err)
+	}
+	if err := tr2.Close(); err != nil {
+		t.Fatalf("replay Close: %v", err)
+	}
+	lines := assertValidJSONLLines(t, path)
+	if len(lines) != 2 || lines[0] != `{"keep":1}` || lines[1] != `{"next":2}` {
+		t.Fatalf("replayed lines = %v, want the complete line plus the replay", lines)
+	}
+}
+
+// TestFinalizeRepairsPendingDiscardTruncation locks the SIGTERM-after-a-
+// failed-reload-cleanup path: no second reload happens, so shutdown's
+// Finalize must retry the pending truncation, remove the partial line, and
+// leave the file as valid JSONL for the next restart.
+func TestFinalizeRepairsPendingDiscardTruncation(t *testing.T) {
+	path, _ := openPrepopulated(t, "")
+	tr, _ := openTruncateFailSender(t, path, 0, 1)
+	writeCompleteThenPartial(t, tr, `{"keep":1}`)
+
+	if err := tr.CloseDiscarding(); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("CloseDiscarding err = %v, want the truncate failure", err)
+	}
+
+	// SIGTERM/shutdown: Finalize (not a reload) retries the repair.
+	if err := tr.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v, want the pending repair to succeed", err)
+	}
+	if got := readFile(t, path); got != "{\"keep\":1}\n" {
+		t.Fatalf("after Finalize = %q, want the partial line repaired", got)
+	}
+
+	// Restart replays as valid JSONL.
+	tr2, _ := newTestSenderAt(t, path)
+	if err := tr2.SendMessages(context.Background(), [][]byte{[]byte(`{"next":2}`)}, ""); err != nil {
+		t.Fatalf("replay SendMessages: %v", err)
+	}
+	if err := tr2.Close(); err != nil {
+		t.Fatalf("replay Close: %v", err)
+	}
+	if lines := assertValidJSONLLines(t, path); len(lines) != 2 {
+		t.Fatalf("replayed lines = %v, want 2 valid JSONL lines", lines)
+	}
+}
+
+// TestFinalizeAndCloseSurfaceUnrepairedDiscard locks the failure-report
+// contract: when the repair keeps failing, Finalize returns an error AND
+// Close refuses to release the corrupt handle (no silent success).
+func TestFinalizeAndCloseSurfaceUnrepairedDiscard(t *testing.T) {
+	path, _ := openPrepopulated(t, "")
+	tr, of := openTruncateFailSender(t, path, 0, -1)
+	writeCompleteThenPartial(t, tr, `{"keep":1}`)
+	before := readFile(t, path)
+
+	if err := tr.CloseDiscarding(); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("CloseDiscarding err = %v, want the truncate failure", err)
+	}
+	if err := tr.Finalize(); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("Finalize err = %v, want the unrepaired-truncation error", err)
+	}
+	if err := tr.Close(); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("Close err = %v, want the unrepaired-truncation error", err)
+	}
+	if of.closed {
+		t.Error("Close released the handle while the partial line was unrepaired")
+	}
+	if got := readFile(t, path); got != before {
+		t.Errorf("file changed despite the unrepaired state: %q, want %q", got, before)
 	}
 }

@@ -76,6 +76,12 @@ type Sender struct {
 	// boundary. Without this a retire that has not written anything yet
 	// would truncate the file to zero, deleting previously delivered lines.
 	base int64
+	// repairPending records that a discard truncate failed: a partial line
+	// still sits past boundary on disk and the handle was left open for a
+	// retry. Finalize and Close honor it (Close refuses to release an
+	// unrepaired handle) so a shutdown after a failed reload cleanup cannot
+	// let a restart append onto the corrupt prefix.
+	repairPending bool
 }
 
 // outputFile is the output-handle subset the Sender uses: the *os.File an
@@ -172,10 +178,19 @@ func (s *Sender) discardUnflushedLocked() error {
 	// Drop buffered, unwritten bytes (bufio.Reset does not write them).
 	s.buf.Reset(s.count)
 	s.queue = nil
-	// boundary is run-relative; Truncate needs the absolute file offset.
+	return s.retryRepairLocked()
+}
+
+// retryRepairLocked truncates the output back to the last complete-line
+// boundary (base + the run-relative boundary) and clears the pending-repair
+// flag; on failure it keeps the flag set and returns the error so Finalize
+// and Close surface an unrepaired partial line. Caller holds s.mu.
+func (s *Sender) retryRepairLocked() error {
 	if err := s.output.Truncate(s.base + s.boundary); err != nil {
+		s.repairPending = true
 		return err
 	}
+	s.repairPending = false
 	s.count.n = s.boundary
 	return nil
 }
@@ -188,9 +203,17 @@ func (s *Sender) discardUnflushedLocked() error {
 // FlushedPayloadBytes so the persisted cursor catches up to the full sent
 // position; a failed flush leaves the durable cursor at the last flushed
 // boundary (the tail is replayed on restart).
+//
+// When an earlier discard left an unrepaired partial line (repairPending),
+// Finalize retries the truncation FIRST — a SIGTERM after a failed reload
+// cleanup must not let the corrupt prefix survive into the next run — and
+// surfaces an error if it still cannot be repaired.
 func (s *Sender) Finalize() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.repairPending {
+		return s.retryRepairLocked()
+	}
 	err := s.buf.Flush()
 	if err != nil {
 		// A partial line may have reached the file before the failure:
@@ -202,10 +225,19 @@ func (s *Sender) Finalize() error {
 	return nil
 }
 
-// Close flushes the buffered tail and releases the output handle.
+// Close flushes the buffered tail and releases the output handle. Like
+// Finalize it first retries any pending boundary repair, and it will NOT
+// release the handle while a partial line remains unrepaired: silently
+// closing would leave a corrupt prefix a restart would append onto, so the
+// error is returned instead.
 func (s *Sender) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.repairPending {
+		if err := s.retryRepairLocked(); err != nil {
+			return err
+		}
+	}
 	if err := s.buf.Flush(); err != nil {
 		_ = s.output.Close()
 		return err
@@ -218,11 +250,11 @@ func (s *Sender) Close() error {
 // not persist lines the delivery checkpoint never claimed (Python
 // request_stop drops the old sender's buffered messages identically).
 //
-// When the truncate fails the handle is deliberately LEFT OPEN: the
-// partial line is still on disk and the supervisor treats the output as
-// blocked until a later retire retries CloseDiscarding and repairs it. If
-// the handle were closed here the retry could never truncate, so the
-// output would be blocked forever.
+// When the truncate fails the handle is deliberately LEFT OPEN and the
+// pending repair is recorded (repairPending): the partial line is still on
+// disk, so a later retire's retry — or Finalize/Close at shutdown — must be
+// able to truncate it. If the handle were closed here no retry could
+// truncate, so the output would be blocked (or corrupted) forever.
 func (s *Sender) CloseDiscarding() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
