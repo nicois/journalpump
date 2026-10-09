@@ -220,6 +220,13 @@ library call shape (thread B rule).
 Tests: the capture tests themselves (run against the Python binary in CI
 until Task 29 retires that mode; then they flip to Go-binary parity
 assertions).
+
+Re-scope note (Task 11, 2026-10-09): the Go-side files named here
+(systest-go/groundtruth_*_test.go) are deferred to Task 18 together
+with the deferred Go harness; Task 11 delivers the committed fixtures
+under systest-go/fixtures/ plus the Python capture tests
+(systest/test_groundtruth_*.py) that produce and verify them, so a Go
+test can consume the same manifest files unchanged.
 Depends on: Task 10.
 
 ### Task 12. Kafka ground truth via real broker or recording proxy (thread C2)

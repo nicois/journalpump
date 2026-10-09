@@ -1,0 +1,74 @@
+{
+  "capture": {
+    "journals": "systest/data/rotated_logs/*.journal (Messages 0..39)",
+    "response_status": 500,
+    "sender": {
+      "logplex_log_input_url": "<capture server>/",
+      "logplex_token": "token",
+      "output_type": "logplex"
+    }
+  },
+  "expected": {
+    "health_status": "connected",
+    "sent_count": 40,
+    "sent_cursor": "s=e12db0190c834c7db506c5753bf5e469;i=2d;b=2f0260dc7e17478bbcf36721cac9e29d;m=45d4fb304;t=5d4206c28a526;x=e9125649dfac9e95"
+  },
+  "frames": [
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 0",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 1",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 2",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 3",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 4",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 5",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 6",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 7",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 8",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 9",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 10",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 11",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 12",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 13",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 14",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 15",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 16",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 17",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 18",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 19",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 20",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 21",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 22",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 23",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 24",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 25",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 26",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 27",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 28",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 29",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 30",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 31",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 32",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 33",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 34",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 35",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 36",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 37",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 38",
+    "<190>1 0000-00-00T00:00:00+00:00 localhost token localhost - -Message 39"
+  ],
+  "name": "logplex",
+  "notes": [
+    "every POST got a 500 response; the captured stream holds each of the 40 messages exactly once in order => 500 does NOT trigger retry/disconnect, and the sender still marks the batch sent",
+    "WIRE SHAPE: each length prefix is followed by the Python bytes REPR of the packet, b'...', which is len+3 characters on the wire (format_msg f-strings the encoded bytes packet); the length prefix counts the packet content only; the frames stored here are that content with timestamps normalized",
+    "frame timestamps normalized to 0000-00-00T00:00:00+00:00 (wall clock in Python)",
+    "hostname and pid are the literal 'localhost' fallbacks: the sender looks up _HOSTNAME/_PID but payload keys are stored un-underscored (HOSTNAME/PID)",
+    "batch/POST boundaries are timing-dependent: compare the concatenated frame stream, not per-request splits"
+  ],
+  "request": {
+    "headers": {
+      "authorization": "Basic dG9rZW46dG9rZW4=",
+      "content-type": "application/logplex-1"
+    },
+    "method": "POST",
+    "path": "/"
+  }
+}

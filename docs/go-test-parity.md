@@ -435,3 +435,57 @@ supervisor wiring is Tasks 10/17).
   value and uses the same abstract-socket mechanism — the deviation is
   the failure-shape parity and the seam, not the wire mechanics. The
   syscalls are identical (AF_UNIX SOCK_DGRAM connect + send).
+
+## Task 11 — Python ground-truth wire fixtures (consumed by Go parity tests)
+
+Committed fixtures: `systest-go/fixtures/*.json`, produced by the
+capture tests `systest/test_groundtruth_*.py` running the REAL Python
+binary through the Task 10 harness (JOURNALPUMP_BIN forced to "").
+Regenerate with `GROUNDTRUTH_UPDATE=1`. A Go test loads the same
+manifest and asserts its side of the wire; determinism rules are
+recorded in each manifest's `notes` and in the module docstring of
+`systest/groundtruth_support.py`:
+
+- fixture journals have fixed 2021 timestamps, so payload JSON is
+  byte-deterministic; batch/POST boundaries are not, so comparisons are
+  ordered streams across everything captured;
+- wall-clock fields are normalized (logplex frame timestamps) or
+  dropped (state `health.elapsed`, `start_time`).
+
+Quirk-locks the Go senders must reproduce (captured, not assumed):
+
+- **logplex frames carry Python bytes reprs**:
+  `LogplexSender.format_msg` f-strings the encoded packet
+  (`f"{len(pkt)} {pkt}"` with bytes `pkt`), so every length prefix on
+  the wire is followed by `b'...'` — the repr — which is `len + 3`
+  characters. The length prefix itself counts only the packet content.
+  Also: `_HOSTNAME`/`_PID` lookups miss (payload keys are stored
+  un-underscored), so hostname and pid are the literal `"localhost"`
+  fallbacks; a 500 response does not trigger retry/disconnect.
+- **file sender never flushes**: `open(file_output, "ab")` is never
+  flushed or closed; a write lands only when a later write would
+  overflow `io.DEFAULT_BUFFER_SIZE`, and the daemon sender thread dies
+  with the tail buffered on SIGTERM. The output file is therefore a
+  deterministic PREFIX of the sent messages (the file fixture pins the
+  first 10 lines with padding large enough to force intermediate
+  flushes on any CPython). Go keeps a grace-flush instead — sanctioned
+  deviation D9 (Task 17); the per-line bytes are the parity contract.
+- **per-entry JSON cache**: `JournalObjectHandler.json_objects` caches
+  the serialized entry by field-filter name, so two senders without a
+  field filter on the same reader share the first sender's payload and
+  the second sender's `extra_field_values` are silently ignored.
+- **ES/OpenSearch**: version probe (`GET /`) once per sender; index
+  name `<prefix>-<timestamp[:10]>` per message (daily rollover);
+  mapping from each index's first message; `_bulk` NDJSON of
+  `{"index": {"_index": ...}}` action + raw payload lines;
+  `content-length` set explicitly; bulk response status not enforced.
+- **websocket**: connect headers `User-Agent: journalpump/<version>`,
+  `Journalpump-Batch-Size: 1048576` (default `max_batch_size`, batching
+  on), `Journalpump-Compression: snappy`; each binary frame is
+  `snappy.compress(NUL-join(batch))`.
+- **missing-cursor replay**: a null `sent.cursor` replays the entire
+  journal from the head — captured as a two-phase run whose second
+  phase's lines are byte-identical to the first phase's.
+- **state file**: `systest-go/fixtures/state_file.json` is a real
+  Python-written state (wall-clock fields dropped); Task 8's decoder
+  and `ResumeCursor` must accept this exact shape.
