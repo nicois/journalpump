@@ -326,7 +326,9 @@ func isIntegerLiteral(s string) bool {
 // int/float semantics via blobEqual. Recorded deviation (NEWS, Task 28):
 // the running-config dump is parsed-JSON-equal to Python's
 // json.dump(..., sort_keys=True) but not byte-identical — Go renders
-// float64 like 60.0 as "60", 1e-05 as "1e-05", 1e+20 as "1e+20", and emits
+// float64 like 60.0 as "60", 1e-05 as "0.00001", and 1e+20 as
+// "100000000000000000000" (Python's repr renders "60.0", "1e-05",
+// "1e+20"), and emits
 // non-ASCII as raw UTF-8 where Python's ensure_ascii=True writes \uXXXX.
 func normalizeNumbers(raw map[string]any) {
 	for key, val := range raw {

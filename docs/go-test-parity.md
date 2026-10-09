@@ -34,7 +34,7 @@ Source: `test/test_running_config.py` (5 tests), `systest/test_running_config.py
 Recorded deviation (user decision, Task 3 review; NEWS in plan Task 28):
 the running-config dump is parsed-JSON-equal to Python's
 `json.dump(..., sort_keys=True)` but **not byte-identical** — Go renders
-floats like 60.0 as "60" and 1e+20 as "1e+20" (Python: "60.0",
-"1e+20"), and emits non-ASCII as raw UTF-8 where Python's
+floats like 60.0 as "60", 1e-05 as "0.00001", and 1e+20 as
+"100000000000000000000" (Python: "60.0", "1e-05", "1e+20"), and emits non-ASCII as raw UTF-8 where Python's
 `ensure_ascii=True` writes \uXXXX. All parity assertions above compare
 parsed JSON, so none of them depend on the byte-level difference.

@@ -108,7 +108,9 @@ NEWS entry — plan Task 28):
   — all rejected at load.
 - Running-config dump formatting: the Go dump is parsed-JSON-equal to
   Python's json.dump(..., sort_keys=True) but not byte-identical (Go
-  renders floats like 60.0 as "60" and 1e+20 as "1e+20", and emits
+  renders floats like 60.0 as "60", 1e-05 as "0.00001", and 1e+20 as
+  "100000000000000000000" (Python's repr renders "60.0", "1e-05",
+  "1e+20"), and emits
   non-ASCII as raw UTF-8 where Python's ensure_ascii=True writes \uXXXX).
   User decision (2026-10-09, Task 3 review): recorded as a deviation
   rather than reimplementing Python's float repr.
@@ -346,7 +348,7 @@ from git log alone.
 |---|---|---|---|---|
 | 1 | Branch scaffold, Go module skeleton, Makefile targets | done | 1421f47 + 353ea17 | approved (6 minors fixed)¹ |
 | 2 | CI workflow: golangci-lint, go vet, go test -race | done | 17d1c3b + 9cb194f | approved (6 minors fixed)² |
-| 3 | Config loader + running-config writer (parsed-blob diff) | not-started | - | - |
+| 3 | Config loader + running-config writer (parsed-blob diff) | done | c9fbab9 + 7ab4a89 | approved (3 doc minors fixed)³ |
 | 4 | Journal entry model, repr UTF-8 fallback, JSON serialization | not-started | - | - |
 | 5 | Filters (field/unit-log-level/secret/search) | not-started | - | - |
 | 6 | Geohash encoder + GeoIP + tag callables | not-started | - | - |
@@ -395,3 +397,9 @@ D10 linter set + gofumpt); trivial intentional lint failures verified to
 block once on the branch (errcheck exit 2; gofumpt and gocyclo reported);
 `make lint-go` / `unittest-go` green on 9cb194f; workflow YAML parsed
 (actual GitHub Actions run pending the first Go-touching PR).
+
+³ Task 3 evidence: `make unittest-go` / `make lint-go` green on 7ab4a89;
+golden full-config decode (all 9 senders' §5 key sets), 34+ rejection
+rows (strict typed decoding incl. trailing data and invalid UTF-8),
+numeric-aware blobEqual quirk-lock (10 vs 10.0, 1 vs true), byte-exact
+running-config write (0600/0700 modes), WARN/FATAL level aliases.

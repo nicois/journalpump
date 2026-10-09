@@ -437,6 +437,7 @@ func TestDecodeRejectsWrongTypedValues(t *testing.T) {
 		{"unit log level missing glob", `{"unit_log_levels": {"u": [{"log_level": "INFO"}]}}`, "unit_log_levels.u[0]: 'service_glob' is required"},
 		{"unit log level unknown name", `{"unit_log_levels": {"u": [{"service_glob": "*", "log_level": "LOUD"}]}}`, "unknown log level"},
 		{"readers wrong type", `{"readers": []}`, "readers: must be an object"},
+		{"readers null", `{"readers": null}`, "readers: must be an object"},
 		{"reader wrong type", `{"readers": {"r": []}}`, "readers.r: must be an object"},
 		{"journal_flags wrong type", `{"readers": {"r": {"journal_flags": "SYSTEM", "senders": {}}}}`, "readers.r.journal_flags: must be a list of flag names or an integer"},
 		{"units_to_match wrong type", `{"readers": {"r": {"units_to_match": "sshd", "senders": {}}}}`, "readers.r.units_to_match: must be a list of strings"},
