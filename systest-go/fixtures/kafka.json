@@ -126,7 +126,7 @@
     "consumer race: a subscribing consumer's metadata request containing the topic name auto-creates it on an auto-create-enabled broker with the DEFAULT 1 partition, so the manual-create capture waits for the sender's own create_topics (verified 2 partitions in the journal) before subscribing \u2014 probed: producer construction alone does not auto-create; a send() does",
     "keying: a fixed kafka_msg_key pins kafka-python's default partitioner murmur2(key) % num_partitions \u2014 ALL keyed records land on ONE deterministic partition",
     "compression: producer chose snappy (zstd preferred when zstandard is importable \u2014 blocked by the test shim because the deployment ships no zstandard, requirements.txt); consumer-side decompression is transparent",
-    "xerial framing: kafka-python's snappy codec compresses batches in Java-compatible xerial block framing (magic 0x82 0x01 0x01 + block table) \u2014 producer-to-broker detail invisible to the consumer; the sarama framing interop verdict is Task 22's",
+    "xerial framing: kafka-python's snappy codec compresses batches in Java-compatible xerial block framing (header b'\\x82SNAPPY\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x01' = 0x82 + 'SNAPPY' + int32 version 1 + int32 compat 1, kafka/codec.py _XERIAL_V1_HEADER, followed by the block table) \u2014 producer-to-broker detail invisible to the consumer; the sarama framing interop verdict is Task 22's",
     "produce path pinned from source: per-message send() + flush() + future.get(timeout=1) must all succeed before mark_sent (kafka_sender.py:163-172); producer linger_ms=500",
     "record timestamps are broker-assigned wall clock (excluded); headers are empty (the Python producer sends none); offsets are contiguous from 0 on the fresh topic"
   ]

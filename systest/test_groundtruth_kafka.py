@@ -30,7 +30,10 @@ DEPLOYMENT ships python-snappy and no zstandard (requirements.txt), so
 the shared sitecustomize shim blocks the system zstandard — the capture
 pins the snappy configuration. The consumer side is transparent
 decompression; the on-wire compressed-batch framing (kafka-python's
-snappy codec = xerial block framing, magic ``\\x82\\x01\\x01``) is
+snappy codec = xerial block framing, header
+``\\x82SNAPPY\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x01`` = 0x82 + 'SNAPPY'
++ int32 version 1 + int32 compat 1, kafka/codec.py
+``_XERIAL_V1_HEADER``) is
 producer↔broker detail that the fixture documents but the consumer
 cannot observe — the sarama-vs-kafka-python framing interop verdict is
 Task 22's.
@@ -54,6 +57,7 @@ from systest import groundtruth_support as gt
 from pathlib import Path
 from uuid import uuid4
 
+import importlib.util
 import os
 import pytest
 import socket
@@ -183,6 +187,7 @@ def _consume_all(broker: str, topic: str) -> list:
             batch = consumer.poll(timeout_ms=2_000, max_records=500)
             for fetched in batch.values():
                 records.extend(fetched)
+        assert len(records) >= _MESSAGE_COUNT, f"consumed {len(records)} of {_MESSAGE_COUNT} records"
         return sorted(records, key=lambda record: (record.partition, record.offset))
     finally:
         consumer.close()
@@ -214,7 +219,6 @@ def _run_and_capture(
                 description=f"sender-created topic {topic} with {expected_partitions} partitions",
             )
         records = _consume_all(broker, topic)
-        gt.wait_until(lambda: len(records) >= _MESSAGE_COUNT, description="40 consumed records")
         process.stop()
 
     partitions = {record.partition for record in records}
@@ -229,10 +233,15 @@ def _run_and_capture(
     keys = {record.key for record in records}
     assert len(keys) == 1, f"expected one key, got {keys}"
     sent = gt.read_sender_state(state_path, "out")["sent"]
+    # Payloads are pinned as UTF-8 strings, which is byte-exact only for
+    # ASCII — fail loud on non-ASCII capture bytes (the fixture would
+    # then have to switch to base64 pinning).
+    payloads = [record.value.decode("utf-8") for record in records]
+    assert all(payload.isascii() for payload in payloads), "non-ASCII payload bytes: fixture pinning must switch to base64"
     return {
         "partition": partition,
         "key": records[0].key.decode("utf-8") if records[0].key is not None else None,
-        "payloads": [record.value.decode("utf-8") for record in records],
+        "payloads": payloads,
         "sent_count": sent["count"],
         "sent_cursor": sent["cursor"],
     }
@@ -273,6 +282,17 @@ def test_kafka_wire_records(tmp_path: Path, kafka_broker: str) -> None:
     assert manual_partitions == 2, f"manual create produced {manual_partitions} partitions"
 
     if fixture is None or gt.update_mode():
+        # The "compression" field below pins snappy. The sender falls
+        # back silently when python-snappy is absent
+        # (kafka_sender.py:96-101), so refuse to capture a fixture that
+        # would misstate the codec for Task 22. The test process shares
+        # the child's site-packages (the shim only adds PYTHONPATH), so
+        # find_spec is a faithful proxy for the child's import.
+        if importlib.util.find_spec("snappy") is None:
+            raise AssertionError(
+                "python-snappy not importable: the Kafka sender would fall back to gzip "
+                "(kafka_sender.py:96-101); refusing to capture a 'snappy' fixture"
+            )
         fixture = {
             "name": _FIXTURE_NAME,
             "capture": {
@@ -314,8 +334,10 @@ def test_kafka_wire_records(tmp_path: Path, kafka_broker: str) -> None:
                 "the test shim because the deployment ships no zstandard, requirements.txt); consumer-side "
                 "decompression is transparent",
                 "xerial framing: kafka-python's snappy codec compresses batches in Java-compatible xerial block "
-                "framing (magic 0x82 0x01 0x01 + block table) — producer-to-broker detail invisible to the "
-                "consumer; the sarama framing interop verdict is Task 22's",
+                "framing (header b'\\x82SNAPPY\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x01' = 0x82 + 'SNAPPY' + int32 "
+                "version 1 + int32 compat 1, kafka/codec.py _XERIAL_V1_HEADER, followed by the block table) — "
+                "producer-to-broker detail invisible to the consumer; the sarama framing interop verdict is "
+                "Task 22's",
                 "produce path pinned from source: per-message send() + flush() + future.get(timeout=1) must all "
                 "succeed before mark_sent (kafka_sender.py:163-172); producer linger_ms=500",
                 "record timestamps are broker-assigned wall clock (excluded); headers are empty (the Python "
