@@ -439,8 +439,10 @@ func TestGoRotationDeletedFileFdRelease(t *testing.T) {
 	oldest := r.current[len(r.current)-1]
 	r.remove(1)
 
-	// No open descriptor may reference the deleted file.
-	for _, target := range openFdTargets(t, p.cmd.Process.Pid) {
+	// No open descriptor may reference the deleted file. The daemon learns of
+	// the deletion asynchronously (via the journal notification), so poll for a
+	// bounded time before asserting (an immediate check raced the close).
+	for _, target := range waitFdTargetGone(t, p.cmd.Process.Pid, oldest) {
 		if target == oldest || target == oldest+" (deleted)" {
 			t.Errorf("deleted journal %s still open as %s", oldest, target)
 		}
@@ -455,6 +457,29 @@ func TestGoRotationDeletedFileFdRelease(t *testing.T) {
 		t.Fatalf("exit status = %d, want 0; stderr:\n%s", code, p.stderr.String())
 	}
 	assertMessageSet(t, outputMessages(t, out), messageRange(0, 30))
+}
+
+// waitFdTargetGone polls until no open fd of pid references path (or its
+// "(deleted)" form), up to a bounded deadline, and returns the last observed
+// targets. The daemon handles a removed rotated file asynchronously, so an
+// immediate check races the descriptor close.
+func waitFdTargetGone(t *testing.T, pid int, path string) []string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		targets := openFdTargets(t, pid)
+		gone := true
+		for _, target := range targets {
+			if target == path || target == path+" (deleted)" {
+				gone = false
+				break
+			}
+		}
+		if gone || time.Now().After(deadline) {
+			return targets
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // openFdTargets returns the readlink target of every open fd of pid.
