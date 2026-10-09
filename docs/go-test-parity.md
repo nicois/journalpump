@@ -1603,22 +1603,28 @@ Proxy environment (review round 2):
   prepended host validation, and a proxy with no host is rejected; and
   loopback targets are NOT special-cased — they are proxied unless
   `no_proxy` matches.
-- Review round 3 completed the `no_proxy` matching (the Linux
-  `proxy_bypass` fallback is NOT a no-op: requests'
-  `set_environ("no_proxy", None)` leaves the environment untouched, so
-  `urllib.request.proxy_bypass_environment` runs against the ambient
-  `no_proxy`). The selector now OR-s requests' own loop (plain suffix on
-  host and host:port for hostnames; CIDR/plain-IP for IP hosts) with
-  urllib's fallback (`NO_PROXY=*` wildcard, case-insensitive matching,
-  leading-dot tolerance and `.name` label-boundary suffixes). Note:
-  requests' own loop is a PLAIN suffix with no label boundary, so
-  `no_proxy=example.com` also bypasses `notexample.com` (probe-verified
-  against requests 2.33.1); Python parity keeps that behavior rather than
-  silently adopting a stricter rule (which would need a sanctioned
-  deviation). `TestNoProxySelection` covers wildcard, mixed case,
-  leading dot, label boundary, port handling and CIDR/plain IP;
-  `TestParseProxyURL` and `TestProxyConfiguredWithoutScheme` cover the
-  scheme-less address.
+- Review round 4 split the two `no_proxy` layers, which have DIFFERENT
+  sources and matching rules and must not be conflated:
+  (1) requests' own loop runs only when
+  `os.environ.get("no_proxy") or os.environ.get("NO_PROXY")` is non-empty;
+  it is CASE-SENSITIVE and a PLAIN suffix (raw entry suffix-matches the
+  lowercased host or host:port, no label boundary; CIDR/plain-IP for IP
+  hosts; spaces stripped, empties skipped). (2) urllib's
+  `proxy_bypass_environment` fallback draws its list from
+  `getproxies_environment()["no"]` — an empty lowercase `no_proxy` REMOVES
+  the entry, so `no_proxy=""` with `NO_PROXY="*"` does NOT bypass all —
+  and matches case-insensitively with label boundaries (hostonly == name
+  or a `.name` suffix), with exact `== "*"` bypassing all. Conflating them
+  produced two wrong bypasses: `no_proxy=Example.Com` bypassed
+  `notexample.com` (lowercasing layer 1), and `no_proxy=""` +
+  `NO_PROXY="*"` bypassed everything (layer 2 fed from layer 1).
+  Probe-verified against requests 2.33.1. Note: requests' own loop is a
+  PLAIN suffix with no label boundary, so `no_proxy=example.com` DOES
+  bypass `notexample.com`; that quirk is retained. `TestNoProxySelection`
+  covers wildcard, mixed case, the mixed-case non-boundary negative,
+  the empty-lowercase-removes-uppercase-wildcard negative, leading dot,
+  label boundary, port handling and CIDR/plain IP; `TestParseProxyURL`
+  and `TestProxyConfiguredWithoutScheme` cover the scheme-less address.
 - `TestProxySelectionMatchesRequests` unit-tests the precedence (lowercase
   wins, empty lowercase removes), the `ALL_PROXY` fallback and the
   scheme-beats-`ALL_PROXY` case; `TestNoProxySelection` unit-tests the
