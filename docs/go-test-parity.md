@@ -530,3 +530,41 @@ except the logplex wire framing, which is a **sanctioned deviation**
 - **state file**: `systest-go/fixtures/state_file.json` is a real
   Python-written state (wall-clock fields dropped); Task 8's decoder
   and `ResumeCursor` must accept this exact shape.
+
+## Task 13 — sender framework (base.py's shared loop, spec §4.2)
+
+`internal/sender` ports the generic half of
+`journalpump/senders/base.py`: the Sender contract (error-returning
+SendMessages + per-sender Classifier seam), the shared flush/backoff
+loop (100 ms tick, >1000-buffered or idle > max_send_interval flush,
+1 MiB batch slicing with 30 B overhead, 0.5 s → 1800 s jittered
+backoff reset on connect, health ring ≤8 deduped 128-codepoint errors,
+sent-cursor advance-on-ack, buffer accounting, maintenance 60 s retry
+gate) and the explicit wiring map (output_type → constructor,
+no blank imports / init() registration — the counterpart of
+`senders/__init__.py`).
+
+Python test parity status:
+
+- `test/unit/senders/test_base.py` contains only `test_tagged`
+  (Tagged.make_tags output) — already ported and recorded under
+  Task 5 as `TestTaggedMakeTags` (`internal/tagged`). Nothing else in
+  the Python unit tree exercises base.py's loop.
+- kafka config tests (`test/unit/senders/test_kafka.py`) land with
+  the kafka sender, Task 22.
+- Loop behavior (flush triggers, slicing boundaries, backoff curve,
+  health ring, cursor semantics) has no direct Python unit test; it
+  is exercised end-to-end by the sender systests (Tasks 21+) and
+  pinned here by Go tests against the Python facts instead:
+  `TestSliceBatch`, `TestBackoffBaseDuration`,
+  `TestFlushTriggers`, `TestBackoffJitterBounds` (synctest bubble,
+  gaps in [500 ms, 1100 ms) for attempt 1),
+  `TestHealthRing` (dedup, 128-codepoint truncation, first-error
+  retention on overflow), `TestHealthStatusMapping`,
+  `TestClassifierRouting` (retriable vs permanent →
+  stats.unexpected_exception), `TestCursorAdvanceOnAckOnly`,
+  `TestLoopState`, `TestMaintenanceGate`, `TestLookup`,
+  `TestRefreshStats` (four journal.* gauges with the sender tag),
+  `TestInitializationError`.
+- Timing uses `testing/synctest` for the 100 ms tick, the idle
+  trigger and backoff jitter; all tests run under `-race`.
