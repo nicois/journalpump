@@ -14,7 +14,7 @@ import (
 // Python either crashed mid-run on these or (for the few truthiness-coerced
 // keys) silently ignored them — both are covered by the typed-decoding
 // deviation (spec §6.1a).
-func newConfig(raw map[string]any, searchTagOrders map[string][][]string) (*Config, error) {
+func newConfig(raw map[string]any, orders tagOrders) (*Config, error) {
 	cfg := &Config{
 		raw:         raw,
 		Tags:        map[string]string{},
@@ -24,7 +24,7 @@ func newConfig(raw map[string]any, searchTagOrders map[string][][]string) (*Conf
 	if cfg.LogLevel, err = decodeLogLevel(raw); err != nil {
 		return nil, err
 	}
-	if cfg.Statsd, err = decodeStatsd(raw); err != nil {
+	if cfg.Statsd, err = decodeStatsd(raw, orders.statsdTags); err != nil {
 		return nil, err
 	}
 	if cfg.Tags, err = decodeTags(raw); err != nil {
@@ -58,7 +58,7 @@ func newConfig(raw map[string]any, searchTagOrders map[string][][]string) (*Conf
 	if cfg.UnitLogLevels, err = decodeUnitLogLevels(raw); err != nil {
 		return nil, err
 	}
-	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw, searchTagOrders); err != nil {
+	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw, orders.readers); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -82,7 +82,7 @@ func decodeLogLevel(raw map[string]any) (int64, error) {
 	return 0, fmt.Errorf("log_level: must be a log level name or an integer")
 }
 
-func decodeStatsd(raw map[string]any) (StatsdConfig, error) {
+func decodeStatsd(raw map[string]any, tagOrder []string) (StatsdConfig, error) {
 	statsdConfig := StatsdConfig{Tags: map[string]string{}}
 	value, ok := raw["statsd"]
 	if !ok || isFalsy(value) {
@@ -99,7 +99,9 @@ func decodeStatsd(raw map[string]any) (StatsdConfig, error) {
 		if err != nil {
 			return statsdConfig, err
 		}
-		statsdConfig.Host = host
+		// Presence matters: Python's StatsClient disables only on None.
+		// An explicit "" resolves to 0.0.0.0 and sends to loopback.
+		statsdConfig.Host = &host
 	}
 	if stats["port"] != nil {
 		port, isInt := asInt64(stats["port"])
@@ -121,6 +123,7 @@ func decodeStatsd(raw map[string]any) (StatsdConfig, error) {
 	}
 	if tags != nil {
 		statsdConfig.Tags = tags
+		statsdConfig.TagOrder = tagOrder
 	}
 	return statsdConfig, nil
 }

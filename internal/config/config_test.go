@@ -206,7 +206,7 @@ func assertGoldenTopLevel(t *testing.T, cfg *Config) {
 	if cfg.LogLevel != 10 {
 		t.Errorf("LogLevel = %d, want 10 (DEBUG)", cfg.LogLevel)
 	}
-	if cfg.Statsd.Host != "127.0.0.1" || cfg.Statsd.Port == nil || *cfg.Statsd.Port != 8125 {
+	if cfg.Statsd.Host == nil || *cfg.Statsd.Host != "127.0.0.1" || cfg.Statsd.Port == nil || *cfg.Statsd.Port != 8125 {
 		t.Errorf("Statsd = %+v", cfg.Statsd)
 	}
 	if cfg.Statsd.Disabled() {
@@ -214,6 +214,11 @@ func assertGoldenTopLevel(t *testing.T, cfg *Config) {
 	}
 	if !reflect.DeepEqual(cfg.Statsd.Tags, map[string]string{"env": "test", "site": "5"}) {
 		t.Errorf("statsd tags = %v", cfg.Statsd.Tags)
+	}
+	if want := []string{"env", "site"}; !reflect.DeepEqual(cfg.Statsd.TagOrder, want) {
+		// statsd.tags document order, captured from the raw JSON — this
+		// is the order Python's dict reaches the statsd wire with.
+		t.Errorf("statsd.TagOrder = %v, want %v", cfg.Statsd.TagOrder, want)
 	}
 	if cfg.Statsd.Prefix != "pump." {
 		t.Errorf("statsd prefix = %q", cfg.Statsd.Prefix)
@@ -420,6 +425,63 @@ func TestCaptureSearchTagOrder(t *testing.T) {
 	}
 	if cfg.Readers["other"].SearchTagOrder != nil {
 		t.Errorf("other.SearchTagOrder = %v want nil", cfg.Readers["other"].SearchTagOrder)
+	}
+}
+
+// TestCaptureSearchTagOrderDuplicateSearches locks the duplicate-key
+// alignment: a duplicate "searches" key within one reader visits the
+// token walker's array branch twice while the map decode keeps only the
+// LAST array, so the capture must restart its index per occurrence —
+// otherwise the rows misalign with the decoded searches and silently
+// fall back to sorted keys.
+func TestCaptureSearchTagOrderDuplicateSearches(t *testing.T) {
+	t.Parallel()
+	cfg := mustDecode(t, `{
+        "readers": {
+            "r": {
+                "searches": [
+                    {"name": "a", "tags": {"x": "1"}},
+                    {"name": "b", "tags": {"y": "1"}},
+                    {"name": "c", "tags": {"z": "1"}}
+                ],
+                "searches": [
+                    {"name": "only", "tags": {"q": "1", "p": "2"}}
+                ],
+                "senders": {}
+            }
+        }
+    }`)
+	want := [][]string{{"q", "p"}} // aligned with the LAST array (map decode wins)
+	if got := cfg.Readers["r"].SearchTagOrder; !reflect.DeepEqual(got, want) {
+		t.Errorf("r.SearchTagOrder = %v want %v", got, want)
+	}
+}
+
+// TestCaptureStatsdTagOrder pins the statsd.tags document-order capture:
+// Python's dict order reaches the statsd wire, so the client must emit
+// the global tags in config order, not sorted order.
+func TestCaptureStatsdTagOrder(t *testing.T) {
+	t.Parallel()
+	cfg := mustDecode(t, `{
+        "statsd": {"host": "127.0.0.1", "port": 8125, "tags": {"zulu": "1", "alpha": "2", "mike": "3"}},
+        "readers": {"r": {"senders": {}}}
+    }`)
+	want := []string{"zulu", "alpha", "mike"}
+	if got := cfg.Statsd.TagOrder; !reflect.DeepEqual(got, want) {
+		t.Errorf("Statsd.TagOrder = %v want %v", got, want)
+	}
+	if got := cfg.Readers["r"].SearchTagOrder; got != nil {
+		t.Errorf("r.SearchTagOrder = %v want nil", got)
+	}
+}
+
+// TestCaptureStatsdTagOrderAbsent: no statsd.tags object means no order
+// (the client falls back to sorted keys, like a synthetic document).
+func TestCaptureStatsdTagOrderAbsent(t *testing.T) {
+	t.Parallel()
+	cfg := mustDecode(t, `{"statsd": {"host": "h", "port": 1}, "readers": {"r": {"senders": {}}}}`)
+	if cfg.Statsd.TagOrder != nil {
+		t.Errorf("Statsd.TagOrder = %v want nil", cfg.Statsd.TagOrder)
 	}
 }
 

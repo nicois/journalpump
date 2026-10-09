@@ -221,15 +221,21 @@ Source of truth: `journalpump/statsd.py`; consumer seam: `internal/statsd`
   tag at index 1 (`statsd.py:55`), so merged order `[a, b]` lands on the wire
   as `,b=..,a=..` after the metric name. The Go client walks the merged order
   backwards for the same result (probe-confirmed).
-- **Tag ORDERING deviation (deterministic, recorded)**: Python preserves dict
-  insertion order — config document order for the global `statsd.tags`, then
-  per-call `make_tags` keys. Go's `map[string]string` loses all of it, so
-  global keys are emitted in sorted order and new per-call keys sorted among
-  themselves appended after them; per-call overrides keep the global position
-  with the per-call value (Python `dict.update` semantics, exact). Telegraf
-  parses the tag list as a set, so only byte-level capture can tell the
-  difference. Exception: `UnexpectedException` knows its insertion order
-  (exception, where, then caller keys) and reproduces it.
+- **Global tag order is exact, no deviation**: the config layer captures the
+  `statsd.tags` document order from the raw JSON (same token-walk machinery as
+  the search tag order, `captureTagOrders` → `StatsdConfig.TagOrder`) and the
+  client emits the global tags in that order — Python's dict order. A nil
+  captured order (synthetic client construction) falls back to sorted keys;
+  the golden tests pin both behaviors.
+- **Per-call tag ORDERING deviation (sanctioned, recorded)**: per-call tags
+  arrive as `map[string]string` (from `Tagged.make_tags`), whose insertion
+  order is unrecoverable, so NEW per-call keys are appended after the globals
+  sorted among themselves; an override keeps the global position with the
+  per-call value (Python `dict.update` semantics, exact). Coordinator
+  decision (2026-10-09, Task 7 review): sanctioned — metric values identical;
+  telegraf treats the tag list as a set; ordering unobservable in stored data.
+  NEWS-recorded (Task 28). Exception: `UnexpectedException` knows its
+  insertion order (exception, where, then caller keys) and reproduces it.
 - **Int vs float gauges**: Python's single `gauge()` calls `str(value)` on
   whatever it gets — `journal.read_lines` (int) renders "123" while
   `journal.last_read_ago` (float) renders "0.123". Go splits this into
@@ -243,8 +249,11 @@ Source of truth: `journalpump/statsd.py`; consumer seam: `internal/statsd`
   formats whatever it receives.
 - **No sampling**: statsd.py has none — every send emits one datagram.
 - **Disabled client is exact**: `None in self._dest_addr` → a missing host OR
-  port disables every send (the config decode already models this with
-  `Host == "" || Port == nil`).
+  port disables every send (the config decode models host PRESENCE with
+  `*string`: nil = the key is absent). An explicitly EMPTY host is enabled,
+  like Python: `sendto(("", port))` resolves via getaddrinfo("") to 0.0.0.0
+  and the kernel delivers locally — Go resolves the empty host to a nil IP
+  and substitutes 0.0.0.0 (golden-tested against a loopback listener).
 - **Send failures log, never crash**: Python catches `OSError` around
   `sendto` and logs `"Stats UDP send failed: %s"` at INFO (statsd.py:59-60);
   Go does the same around the lazy address resolution and the unconnected
@@ -253,8 +262,14 @@ Source of truth: `journalpump/statsd.py`; consumer seam: `internal/statsd`
   sees.
 - **`exception` tag value deviation**: Python uses `ex.__class__.__name__`
   (e.g. "OSError"); Go has no exception classes, so the tag carries the
-  error's dynamic type name via `%T` (e.g. "fs.PathError"). Metric name
-  ("exception"), `where` tag and counter semantics are identical.
+  error's dynamic type name via `reflect.TypeOf` (e.g. "fs.PathError"). A nil
+  error (Python would crash on `ex.__class__`) renders "error" so the counter
+  still fires. Metric name ("exception"), `where` tag and counter semantics
+  are identical.
+- **UDP family is udp4, matching Python's AF_INET**: `ResolveUDPAddr("udp4", …)`
+  + `ListenUDP("udp4", nil)` make an IPv6-literal host fail resolution exactly
+  like Python's AF_INET `getaddrinfo` (an OSError subclass, caught and logged
+  at statsd.py:59-60) instead of sending successfully.
 - **Persistent gauge semantics are exact** (journalpump.py:313-324 ported as
   `PersistentGauges.Set`): the (value, tags) pair is always recorded; a zero
   is emitted only on the transition from an existing non-zero value; non-zero

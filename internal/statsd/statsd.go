@@ -35,10 +35,12 @@ type discardLogger struct{}
 func (discardLogger) Printf(_ string, _ ...any) {}
 
 // Client mirrors statsd.StatsClient. Sending is disabled when the host
-// or the port is missing (Python: `None in self._dest_addr`,
+// or the port is MISSING (Python: `None in self._dest_addr`,
 // statsd.py:46-48); journalpump.py passes the config values straight
 // through via stats.get("host")/stats.get("port"), so an absent host or
-// port means "no stats" and every send is a no-op.
+// port means "no stats" and every send is a no-op. An explicitly EMPTY
+// host string is enabled: Python's sendto(("", port)) resolves via
+// getaddrinfo("") to 0.0.0.0 and the kernel delivers locally.
 type Client struct {
 	disabled bool
 	host     string
@@ -47,6 +49,10 @@ type Client struct {
 	// tags holds the global tags from the config ("statsd"."tags");
 	// per-call tags are merged over them on every send.
 	tags map[string]string
+	// globalOrder holds the global tag keys in config document order
+	// (captured from the raw JSON by the config layer, mirroring
+	// Python's dict order); nil falls back to sorted keys.
+	globalOrder []string
 	// prefix is prepended to every metric name (default "").
 	prefix string
 	log    Logger
@@ -57,29 +63,66 @@ type Client struct {
 }
 
 // New mirrors StatsClient.__init__(host="127.0.0.1", port=8125,
-// tags=None, prefix=""). A nil port pointer means the config had no
-// "port" key (Python None); an empty host means no "host" key. Either
-// one disables the client. A nil logger discards send-failure logs
+// tags=None, prefix=""). A nil host or port pointer means the config
+// had no such key (Python None) and disables the client; an explicit
+// empty host string sends to loopback like Python. tagOrder carries the
+// statsd.tags document order captured by the config layer (nil falls
+// back to sorted keys). A nil logger discards send-failure logs
 // (callers pass the pump logger).
-func New(host string, port *int64, tags map[string]string, prefix string, logger Logger) *Client {
+func New(host *string, port *int64, tags map[string]string, tagOrder []string, prefix string, logger Logger) *Client {
 	if logger == nil {
 		logger = discardLogger{}
 	}
 	c := &Client{
-		host:   host,
 		tags:   tags,
 		prefix: prefix,
 		log:    logger,
+	}
+	if host != nil {
+		c.host = *host
+	} else {
+		c.disabled = true
 	}
 	if port != nil {
 		c.port = int(*port)
 	} else {
 		c.disabled = true
 	}
-	if host == "" {
-		c.disabled = true
-	}
+	c.globalOrder = globalTagOrder(tags, tagOrder)
 	return c
+}
+
+// globalTagOrder resolves the wire order of the global tags: the
+// config-captured document order when available, otherwise sorted keys.
+// Keys missing from the captured order, or duplicated in it (defensive:
+// the capture and the map decode see the same object, so neither should
+// happen — Python's dict holds each key once), are appended/deduped
+// accordingly.
+func globalTagOrder(tags map[string]string, tagOrder []string) []string {
+	if tagOrder == nil {
+		order := make([]string, 0, len(tags))
+		for key := range tags {
+			order = append(order, key)
+		}
+		sort.Strings(order)
+		return order
+	}
+	seen := make(map[string]bool, len(tags))
+	order := make([]string, 0, len(tags))
+	for _, key := range tagOrder {
+		if _, ok := tags[key]; ok && !seen[key] {
+			seen[key] = true
+			order = append(order, key)
+		}
+	}
+	var missing []string
+	for key := range tags {
+		if !seen[key] {
+			missing = append(missing, key)
+		}
+	}
+	sort.Strings(missing)
+	return append(order, missing...)
 }
 
 // Gauge sends a float gauge (Python gauge -> b"g", str(value) with
@@ -113,11 +156,18 @@ func (c *Client) Timing(metric string, value float64, tags map[string]string) {
 // the "exception" counter with tags exception=<name>, where=<where>
 // plus the caller's tags (which override the defaults). Python uses
 // ex.__class__.__name__; Go has no exception classes, so the tag
-// carries the error's dynamic type name (e.g. "fs.PathError") — a
-// recorded deviation, the metric name and "where" tag are identical.
+// carries the error's dynamic type name via reflect.TypeOf (e.g.
+// "fs.PathError") — a recorded deviation, the metric name and "where"
+// tag are identical. A nil error (impossible in Python, where
+// ex.__class__ would raise) renders the type name "error" so the
+// counter still fires.
 func (c *Client) UnexpectedException(ex error, where string, tags map[string]string) {
+	exceptionName := "error"
+	if ex != nil {
+		exceptionName = reflect.TypeOf(ex).String()
+	}
 	exceptionTags := map[string]string{
-		"exception": reflect.TypeOf(ex).String(),
+		"exception": exceptionName,
 		"where":     where,
 	}
 	for key, value := range tags {
@@ -134,7 +184,7 @@ func (c *Client) UnexpectedException(ex error, where string, tags map[string]str
 		}
 	}
 	sort.Strings(ordered[2:])
-	c.sendKeys("exception", "c", "1", mergeTagOrder(c.tags, ordered), exceptionTags)
+	c.sendKeys("exception", "c", "1", mergeTagOrder(c.globalOrder, c.tags, ordered), exceptionTags)
 }
 
 // Close closes the lazily created UDP socket. Python never closes its
@@ -158,7 +208,7 @@ func (c *Client) Close() error {
 // "metric,c=..,b=..,a=..:value|type". mergedTagOrder reproduces that
 // merged order; the loop below walks it backwards.
 func (c *Client) send(metric, metricType, value string, callTags map[string]string) {
-	c.sendKeys(metric, metricType, value, mergedTagOrder(c.tags, callTags), callTags)
+	c.sendKeys(metric, metricType, value, mergedTagOrder(c.globalOrder, c.tags, callTags), callTags)
 }
 
 // sendKeys assembles and transmits one datagram for the given merged
@@ -193,30 +243,27 @@ func (c *Client) sendKeys(metric, metricType, value string, merged []string, cal
 // `send_tags = self._tags.copy(); send_tags.update(tags or {})`:
 // global tags keep their positions and new per-call keys are appended
 // (a per-call key already in the global set keeps the global position,
-// with the per-call value). Python preserves dict insertion order; Go
-// maps have none, so the global keys and the appended per-call keys are
-// each emitted in sorted order — a recorded deviation: the config
-// document order is unrecoverable after map decoding, the protocol
-// treats the tag list as a set, and the exact-byte tests pin the sorted
-// order.
-func mergedTagOrder(global, call map[string]string) []string {
+// with the per-call value). The global positions come from the
+// config-captured document order (Python's dict order); the appended
+// per-call keys are sorted — Go's map[string]string loses the per-call
+// insertion order and it is unrecoverable, which is the recorded
+// sanctioned deviation (metric values identical; telegraf treats the
+// tag list as a set; ordering unobservable in stored data).
+func mergedTagOrder(globalOrder []string, global, call map[string]string) []string {
 	appended := make([]string, 0, len(call))
 	for key := range call {
 		appended = append(appended, key)
 	}
 	sort.Strings(appended)
-	return mergeTagOrder(global, appended)
+	return mergeTagOrder(globalOrder, global, appended)
 }
 
 // mergeTagOrder merges the global tag positions with an explicitly
 // ordered list of per-call keys (a per-call key already in the global
 // set keeps the global position, with the per-call value).
-func mergeTagOrder(global map[string]string, callKeys []string) []string {
-	keys := make([]string, 0, len(global)+len(callKeys))
-	for key := range global {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+func mergeTagOrder(globalOrder []string, global map[string]string, callKeys []string) []string {
+	keys := make([]string, 0, len(globalOrder)+len(callKeys))
+	keys = append(keys, globalOrder...)
 	for _, key := range callKeys {
 		if _, ok := global[key]; !ok {
 			keys = append(keys, key)
@@ -225,23 +272,31 @@ func mergeTagOrder(global map[string]string, callKeys []string) []string {
 	return keys
 }
 
-// write sends the datagram over a single lazily created unconnected UDP
-// socket — the exact equivalent of Python's one socket.sendto per
-// metric (statsd.py:24, 57-58). An unconnected socket never surfaces
-// ICMP "connection refused" errors the way a connected one would, so
-// sends into a dead collector stay silent just like Python's. Any
-// resolution or send error is logged at info level with the same
-// message Python uses (statsd.py:59-60).
+// write sends the datagram over a single lazily created unconnected
+// UDP4 socket — the exact equivalent of Python's AF_INET SOCK_DGRAM
+// socket with one sendto per metric (statsd.py:24, 57-58). The udp4
+// family makes an IPv6-literal host fail resolution exactly like
+// Python's AF_INET getaddrinfo (an OSError subclass, caught below). An
+// unconnected socket never surfaces ICMP "connection refused" errors
+// the way a connected one would, so sends into a dead collector stay
+// silent just like Python's. Any resolution or send error is logged at
+// info level with the same message Python uses (statsd.py:59-60).
 func (c *Client) write(b []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn == nil {
-		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(c.host, strconv.Itoa(c.port)))
+		addr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(c.host, strconv.Itoa(c.port)))
 		if err != nil {
 			c.log.Printf("Stats UDP send failed: %s", err)
 			return
 		}
-		conn, err := net.ListenUDP("udp", nil)
+		// Python's sendto(("", port)) resolves via getaddrinfo("") to
+		// 0.0.0.0 and the kernel delivers locally; Go resolves the empty
+		// host to a nil IP, so substitute 0.0.0.0 explicitly.
+		if addr.IP == nil {
+			addr.IP = net.IPv4zero
+		}
+		conn, err := net.ListenUDP("udp4", nil)
 		if err != nil {
 			c.log.Printf("Stats UDP send failed: %s", err)
 			return

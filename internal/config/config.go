@@ -77,17 +77,25 @@ var pythonLogLevels = map[string]int64{
 // stats sending entirely (Python: StatsClient._send checks
 // `None in self._dest_addr`); there is no implicit 127.0.0.1 default at
 // the config level — journalpump.py passes stats.get("host") straight
-// through, so a missing host means "no stats".
+// through, so a missing host means "no stats". An explicitly EMPTY host
+// string is present: Python's socket.sendto(("", port)) resolves via
+// getaddrinfo("") to 0.0.0.0 and the kernel delivers locally, so Go
+// sends too (it must not silently drop).
 type StatsdConfig struct {
-	Host   string // empty = disabled
-	Port   *int64 // nil = disabled
-	Tags   map[string]string
-	Prefix string // default ""
+	Host *string // nil = the "host" key is absent (Python None) = disabled
+	Port *int64  // nil = disabled
+	Tags map[string]string
+	// TagOrder holds the statsd.tags keys in config document order,
+	// captured from the raw JSON by captureTagOrders (the map decode
+	// discards key order while Python's dict order reaches the statsd
+	// wire). Nil for a synthetic document or a falsy statsd section.
+	TagOrder []string
+	Prefix   string // default ""
 }
 
 // Disabled reports whether the statsd client must not send anything.
 func (s StatsdConfig) Disabled() bool {
-	return s.Host == "" || s.Port == nil
+	return s.Host == nil || s.Port == nil
 }
 
 // FieldFilterConfig is one entry of the top-level "field_filters" map.
@@ -317,8 +325,8 @@ func Decode(data []byte) (*Config, error) {
 	}
 	normalizeNumbers(raw)
 	// The tag order must come from the raw bytes: the typed map decode
-	// below discards object key order (see captureSearchTagOrders).
-	return newConfig(raw, captureSearchTagOrders(data))
+	// below discards object key order (see captureTagOrders).
+	return newConfig(raw, captureTagOrders(data))
 }
 
 // isIntegerLiteral reports whether the JSON number literal has no fraction

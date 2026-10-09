@@ -10,24 +10,37 @@ import (
 	"encoding/json"
 )
 
-// captureSearchTagOrders walks the raw config JSON and returns, per
-// reader, the document-order key lists of each search's "tags" object.
+// tagOrders carries the document-order tag keys the token walk captured
+// from the raw config JSON.
+type tagOrders struct {
+	// readers maps reader name -> per-search tag key lists, aligned with
+	// the search list index.
+	readers map[string][][]string
+	// statsdTags holds the top-level statsd.tags keys in document order.
+	statsdTags []string
+}
+
+// captureTagOrders walks the raw config JSON and returns the
+// document-order key lists of (a) each search's "tags" object, per
+// reader, and (b) the top-level statsd.tags object.
 //
 // Why: encoding/json decodes objects into maps, which discards key
-// order — but Python's json.load preserves it, and perform_searches
-// evaluates the tag callables in config order (journalpump.py:629-634),
-// so a tag callable whose args name an earlier static tag must see the
-// value Python sees. The typed decode cannot recover the order from the
-// parsed map, hence this targeted token walk.
+// order — but Python's json.load preserves it, and the order is
+// observable downstream: perform_searches evaluates the tag callables
+// in config order (journalpump.py:629-634), so a tag callable whose
+// args name an earlier static tag must see the value Python sees, and
+// statsd.py renders the global tags in dict order onto the wire. The
+// typed decode cannot recover the order from the parsed map, hence
+// this targeted token walk.
 //
-// Rows are aligned with the search list index; searches without a "tags"
-// object (or with a non-object "tags" value) leave a nil row. A
-// malformed document yields partial results — the main decode reports
+// Reader rows are aligned with the search list index; searches without
+// a "tags" object (or with a non-object "tags" value) leave a nil row.
+// A malformed document yields partial results — the main decode reports
 // the error.
-func captureSearchTagOrders(data []byte) map[string][][]string {
+func captureTagOrders(data []byte) tagOrders {
 	w := &tagOrderWalker{
 		dec: json.NewDecoder(bytes.NewReader(data)),
-		out: map[string][][]string{},
+		out: tagOrders{readers: map[string][][]string{}},
 	}
 	_ = w.walkDocument() // malformed JSON is reported by the main decode
 	return w.out
@@ -35,7 +48,7 @@ func captureSearchTagOrders(data []byte) map[string][][]string {
 
 type tagOrderWalker struct {
 	dec *json.Decoder
-	out map[string][][]string
+	out tagOrders
 	// reader and searchIndex track the readers.<name>.searches[i] path.
 	reader      string
 	searchIndex int
@@ -114,14 +127,46 @@ func (w *tagOrderWalker) walkDocument() error {
 		return err // non-object document: the main decode errors later
 	}
 	return w.objectEntries(func(key string) error {
-		if key != "readers" {
+		switch key {
+		case "readers":
+			d, ok, err := w.openContainer()
+			if err != nil || !ok || d != '{' {
+				return err
+			}
+			return w.objectEntries(w.walkReader)
+		case "statsd":
+			return w.walkStatsd()
+		default:
+			return w.skipValue()
+		}
+	})
+}
+
+// walkStatsd visits the statsd section for its tags object. A duplicate
+// "statsd" (or "tags") key overwrites the capture — last wins, matching
+// the map decode.
+func (w *tagOrderWalker) walkStatsd() error {
+	d, ok, err := w.openContainer()
+	if err != nil || !ok || d != '{' {
+		return err // non-object statsd: the main decode errors later
+	}
+	return w.objectEntries(func(key string) error {
+		if key != "tags" {
 			return w.skipValue()
 		}
 		d, ok, err := w.openContainer()
 		if err != nil || !ok || d != '{' {
 			return err
 		}
-		return w.objectEntries(w.walkReader)
+		keys := []string{}
+		if err := w.objectEntries(func(key string) error {
+			keys = append(keys, key)
+			return w.skipValue()
+		}); err != nil {
+			return err
+		}
+		w.out.statsdTags = keys
+		return nil
 	})
 }
 
@@ -142,9 +187,11 @@ func (w *tagOrderWalker) walkReader(name string) error {
 			return err // non-array searches: the main decode errors later
 		}
 		// A duplicate "searches" key visits this branch twice while the
-		// map decode keeps only the LAST array; restart the index so the
-		// rows align with whichever array the decode kept.
+		// map decode keeps only the LAST array; restart the index AND
+		// truncate the rows captured so far, so the rows align with
+		// whichever array the decode kept.
 		w.searchIndex = 0
+		w.out.readers[w.reader] = nil
 		for w.dec.More() {
 			if err := w.walkSearch(); err != nil {
 				return err
@@ -177,10 +224,10 @@ func (w *tagOrderWalker) walkSearch() error {
 		}); err != nil {
 			return err
 		}
-		for len(w.out[w.reader]) <= w.searchIndex {
-			w.out[w.reader] = append(w.out[w.reader], nil)
+		for len(w.out.readers[w.reader]) <= w.searchIndex {
+			w.out.readers[w.reader] = append(w.out.readers[w.reader], nil)
 		}
-		w.out[w.reader][w.searchIndex] = keys
+		w.out.readers[w.reader][w.searchIndex] = keys
 		return nil
 	})
 }

@@ -141,6 +141,15 @@ NEWS entry — plan Task 28):
   stats.unexpected_exception, sleeps 0.5 s and DROPS the entry —
   forwarded-with-empty-tag vs dropped-with-unexpected-exception is the
   sanctioned delta.
+- Statsd per-call tag ordering: the GLOBAL `statsd.tags` reach the statsd
+  wire in exact Python order (the config layer captures the document order
+  from the raw JSON; `dict.update` override-keeps-position semantics are
+  ported exactly). Per-call tag keys (the `Tagged.make_tags` output) arrive
+  as Go maps whose insertion order is unrecoverable, so NEW per-call keys are
+  appended after the globals sorted among themselves. Coordinator decision
+  (2026-10-09, Task 7 review): sanctioned — metric values identical; telegraf
+  treats the tag list as a set; ordering unobservable in stored data.
+  NEWS-recorded (Task 28).
 - Regex warn-and-disable policy: secret-filter patterns that are
   Python-valid but use constructs RE2 cannot compile (backreferences,
   lookarounds, atomic groups, possessive quantifiers, `{,n}`, `\Z`,

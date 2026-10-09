@@ -136,11 +136,12 @@ func (*goldenError) Error() string { return "boom" }
 // ("user.logins,service=payroll,region=us-west:1|c").
 func TestWireFormatGolden(t *testing.T) {
 	tests := []struct {
-		name   string
-		prefix string
-		global map[string]string
-		ops    func(c *Client)
-		want   string
+		name     string
+		prefix   string
+		global   map[string]string
+		tagOrder []string
+		ops      func(c *Client)
+		want     string
 	}{
 		{
 			name: "increase default count",
@@ -179,12 +180,22 @@ func TestWireFormatGolden(t *testing.T) {
 			want:   "jp.user.logins:1|c",
 		},
 		{
-			name:   "global tags only, reversed on the wire",
-			global: map[string]string{"a": "1", "b": "2"},
-			ops:    func(c *Client) { c.Increase("m", 1, nil) },
+			name:   "global tags only, document order captured reversed on the wire",
+			global: map[string]string{"a": "1", "b": "2", "c": "3"},
+			// Config document order c,a,b (captured by the config layer);
 			// Python inserts every tag at index 1 (statsd.py:55), so the
-			// merged order [a, b] lands reversed: b before a.
-			want: "m,b=2,a=1:1|c",
+			// merged order [c, a, b] lands reversed: b, a, c.
+			tagOrder: []string{"c", "a", "b"},
+			ops:      func(c *Client) { c.Increase("m", 1, nil) },
+			want:     "m,b=2,a=1,c=3:1|c",
+		},
+		{
+			name:   "global tags without captured order fall back to sorted",
+			global: map[string]string{"a": "1", "b": "2", "c": "3"},
+			// A synthetic client (no config capture) sorts the keys;
+			// merged [a, b, c] lands reversed: c, b, a.
+			ops:  func(c *Client) { c.Increase("m", 1, nil) },
+			want: "m,c=3,b=2,a=1:1|c",
 		},
 		{
 			name:   "call tags appended after global, still reversed",
@@ -217,6 +228,26 @@ func TestWireFormatGolden(t *testing.T) {
 			// Python has ex.__class__.__name__.
 			want: "exception,app=journalpump,where=mainloop,exception=*statsd.goldenError:1|c",
 		},
+		{
+			name:     "unexpected_exception keeps the global document order",
+			global:   map[string]string{"a": "1", "b": "2"},
+			tagOrder: []string{"a", "b"},
+			ops: func(c *Client) {
+				c.UnexpectedException(&goldenError{}, "mainloop", nil)
+			},
+			// Python (probe-verified with global tags): send_tags order
+			// [a, b, exception, where] reverses to where, exception, b, a.
+			want: "exception,where=mainloop,exception=*statsd.goldenError,b=2,a=1:1|c",
+		},
+		{
+			name: "unexpected_exception with a nil error still counts",
+			ops: func(c *Client) {
+				c.UnexpectedException(nil, "maintenance", nil)
+			},
+			// Python would crash on ex.__class__ of None; the Go guard
+			// renders the type name "error" so the counter still fires.
+			want: "exception,where=maintenance,exception=error:1|c",
+		},
 	}
 
 	for _, tc := range tests {
@@ -225,7 +256,7 @@ func TestWireFormatGolden(t *testing.T) {
 			t.Parallel()
 			capture := newUDPCapture(t)
 			host, port := capture.addr()
-			client := New(host, port, tc.global, tc.prefix, nil)
+			client := New(stringPtr(host), port, tc.global, tc.tagOrder, tc.prefix, nil)
 			t.Cleanup(func() { _ = client.Close() })
 			tc.ops(client)
 			if got := capture.datagram(); got != tc.want {
@@ -235,25 +266,26 @@ func TestWireFormatGolden(t *testing.T) {
 	}
 }
 
-// TestDisabled mirrors statsd.py:46-48: a missing host or port disables
-// every send.
+// TestDisabled mirrors statsd.py:46-48: a missing (None) host or port
+// disables every send. An explicitly EMPTY host is NOT covered here —
+// Python resolves it to 0.0.0.0 and sends (TestEmptyHostSendsToLoopback).
 func TestDisabled(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
-		host string
+		host *string
 		port *int64
 	}{
-		{name: "missing host", host: "", port: int64Ptr(8125)},
-		{name: "missing port", host: "127.0.0.1", port: nil},
-		{name: "both missing", host: "", port: nil},
+		{name: "missing host", host: nil, port: int64Ptr(8125)},
+		{name: "missing port", host: stringPtr("127.0.0.1"), port: nil},
+		{name: "both missing", host: nil, port: nil},
 	}
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			capture := newUDPCapture(t)
-			client := New(tc.host, tc.port, nil, "", nil)
+			client := New(tc.host, tc.port, nil, nil, "", nil)
 			client.Gauge("m", 1.0, nil)
 			client.GaugeInt("m", 1, nil)
 			client.Increase("m", 1, nil)
@@ -272,7 +304,7 @@ func TestDisabled(t *testing.T) {
 func TestSendFailureLogged(t *testing.T) {
 	t.Parallel()
 	logger := &capturingLogger{}
-	client := New("256.256.256.256", int64Ptr(8125), nil, "", logger)
+	client := New(stringPtr("256.256.256.256"), int64Ptr(8125), nil, nil, "", logger)
 	client.Increase("m", 1, nil)
 	client.Increase("m", 1, nil)
 	logger.mu.Lock()
@@ -284,6 +316,45 @@ func TestSendFailureLogged(t *testing.T) {
 		if !strings.Contains(line, "Stats UDP send failed: ") {
 			t.Fatalf("unexpected log line: %q", line)
 		}
+	}
+}
+
+// TestIPv6HostFailsLikePythonAF_INET pins the udp4 family: an
+// IPv6-literal host fails resolution exactly like Python's AF_INET
+// getaddrinfo (an OSError caught at statsd.py:59-60) instead of sending
+// successfully.
+func TestIPv6HostFailsLikePythonAF_INET(t *testing.T) {
+	t.Parallel()
+	capture := newUDPCapture(t)
+	_, port := capture.addr()
+	logger := &capturingLogger{}
+	client := New(stringPtr("::1"), port, nil, nil, "", logger)
+	client.Increase("m", 1, nil)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	if len(logger.lines) != 1 {
+		t.Fatalf("expected one failure log line, got %q", logger.lines)
+	}
+	if !strings.Contains(logger.lines[0], "Stats UDP send failed: ") {
+		t.Fatalf("unexpected log line: %q", logger.lines[0])
+	}
+	capture.assertNoDatagram()
+}
+
+// TestEmptyHostSendsToLoopback pins the host-presence semantics: an
+// explicitly EMPTY host string is not None — Python's
+// socket.sendto(("", port)) resolves via getaddrinfo("") to 0.0.0.0 and
+// the kernel delivers to the local listener, and Go must do the same
+// instead of silently dropping.
+func TestEmptyHostSendsToLoopback(t *testing.T) {
+	t.Parallel()
+	capture := newUDPCapture(t)
+	_, port := capture.addr()
+	client := New(stringPtr(""), port, nil, nil, "", nil)
+	t.Cleanup(func() { _ = client.Close() })
+	client.Increase("m", 1, nil)
+	if got := capture.datagram(); got != "m:1|c" {
+		t.Fatalf("datagram mismatch: got %q", got)
 	}
 }
 
@@ -363,3 +434,5 @@ func TestPersistentGaugeWithoutStats(t *testing.T) {
 }
 
 func int64Ptr(v int64) *int64 { return &v }
+
+func stringPtr(v string) *string { return &v }
