@@ -18,6 +18,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 	"github.com/Aiven-Open/journalpump/internal/sender/file"
+	"github.com/Aiven-Open/journalpump/internal/sender/logplex"
 	"github.com/Aiven-Open/journalpump/internal/sender/rsyslog"
 )
 
@@ -155,7 +156,9 @@ func isRegularFile(path string) bool {
 // Registered senders (plan Tasks 16+):
 //   - file (Task 16)
 //   - rsyslog (Task 20)
+//   - logplex (Task 21)
 func registerSenders() {
 	sender.Register("file", file.New)
 	sender.Register("rsyslog", rsyslog.New)
+	sender.Register("logplex", logplex.New)
 }
