@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Aiven-Open/journalpump/internal/sender"
@@ -354,20 +356,105 @@ func TestSendFailureRefusedReconnectThenSuccess(t *testing.T) {
 }
 
 // TestInitRetriableFailureCancelledDuringSleep proves the flat 5 s init
-// wait is interruptible: cancellation surfaces the context error so
-// shutdown never hangs on a down server.
+// wait is interruptible WITHOUT changing the observable failure: Python
+// records the connection error (mark_disconnected) BEFORE its sleep
+// (rsyslog.py:62-70), so a cancellation during the wait must still surface
+// the original error in the health ring and as the returned error, never
+// context.Canceled.
 func TestInitRetriableFailureCancelledDuringSleep(t *testing.T) {
 	s, _, _ := newTestSender(t, baseConfig())
+	var recorded []error
+	s.SetConnectionObserver(nil, func(err error) { recorded = append(recorded, err) })
 	ctx, cancel := context.WithCancel(context.Background())
 	s.sleep = func(_ context.Context, _ time.Duration) bool {
+		if len(recorded) != 1 || !errors.Is(recorded[0], syscall.ECONNREFUSED) {
+			t.Fatalf("disconnect recorded before the sleep = %v, want the original ECONNREFUSED", recorded)
+		}
 		cancel()
 		return false
 	}
 	s.newClient = func(context.Context) (logClient, error) { return nil, syscall.ECONNREFUSED }
 	msg := []byte(`{"MESSAGE": "hello", "PRIORITY": "6", "timestamp": "t"}`)
-	if err := s.SendMessages(ctx, [][]byte{msg}, "c1"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("SendMessages error = %v, want context.Canceled", err)
+	err := s.SendMessages(ctx, [][]byte{msg}, "c1")
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("SendMessages error = %v, want the original ECONNREFUSED", err)
 	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("SendMessages error = %v, must not be replaced by context.Canceled", err)
+	}
+	if len(recorded) != 1 || !errors.Is(recorded[0], syscall.ECONNREFUSED) {
+		t.Fatalf("recorded = %v, want the ECONNREFUSED recorded before the sleep", recorded)
+	}
+}
+
+// TestNonStringCACertsRejected is the validation regression for the
+// truthy non-string ca_certs bug: Python's
+// ssl.create_default_context(cafile=<value>) raises on a non-string
+// value, so a value like 1 must be rejected rather than silently mapped
+// to an empty cafile (system roots) while still selecting TLS.
+func TestNonStringCACertsRejected(t *testing.T) {
+	cfg := baseConfig()
+	cfg["ca_certs"] = 1
+	inst, err := New(sender.ConstructorArgs{Name: "t", Config: cfg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := inst.Transport.(*Sender)
+	if _, err := s.resolvedConfig(); err == nil {
+		t.Fatal("resolvedConfig accepted a non-string ca_certs; want an error")
+	}
+	msg := []byte(`{"MESSAGE": "hello", "PRIORITY": "6", "timestamp": "t"}`)
+	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err == nil {
+		t.Fatal("SendMessages accepted a non-string ca_certs; want an error")
+	}
+}
+
+// TestLoopReconnectResetsSharedBackoff is the REAL sender.Loop integration
+// regression for the mark_connected reset: every attempt connects
+// successfully and then fails its payload (list-valued PRIORITY), so the
+// client is dropped and the next attempt reconnects. Python's
+// mark_connected resets the backoff exponent on each successful connect,
+// so the reconnect cadence must stay at the attempt-1 backoff. Without the
+// reset the exponent escalates (0.5s, 1s, 2s, 4s, 8s ...), which caps the
+// number of attempts that fit in a fixed window. The fake clock makes the
+// separation deterministic: >=8 attempts in 10 s only holds with the reset.
+func TestLoopReconnectResetsSharedBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		inst, err := New(sender.ConstructorArgs{Name: "rsyslog-loop", Config: baseConfig(), Log: &recordLogger{}})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		s := inst.Transport.(*Sender)
+		var mu sync.Mutex
+		connects := 0
+		s.newClient = func(context.Context) (logClient, error) {
+			mu.Lock()
+			connects++
+			mu.Unlock()
+			return &recordClient{}, nil
+		}
+		in := make(chan sender.Item, 10)
+		loop := sender.NewLoop(sender.LoopConfig{Name: "rsyslog-loop", Log: &recordLogger{}}, inst, in)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			_ = loop.Run(ctx)
+			close(done)
+		}()
+		// PRIORITY [6] fails pythonInt after every successful connect, so
+		// each retry reconnects and then fails its payload again.
+		in <- sender.Item{Payload: []byte(`{"PRIORITY":[6],"MESSAGE":"m","timestamp":"t"}`), Cursor: "c0"}
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		mu.Lock()
+		got := connects
+		mu.Unlock()
+		cancel()
+		<-done
+		if got < 8 {
+			t.Fatalf("connects in 10s = %d, want >= 8: a successful reconnect must reset the shared backoff exponent", got)
+		}
+	})
 }
 
 // TestInitLoopNonRetriableReturnsImmediately proves a non-RSYSLOG_CONN_ERRORS

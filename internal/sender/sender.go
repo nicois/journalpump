@@ -120,6 +120,20 @@ type DurableReporter interface {
 	FlushedPayloadBytes() int64
 }
 
+// ConnectionReporter is an OPTIONAL transport capability for senders whose
+// connect path runs INSIDE SendMessages and may therefore reconnect between
+// batches (the rsyslog sender re-inits after every failure). Python calls
+// mark_connected/mark_disconnected from the sender's own
+// _init_rsyslog_client, but the Go loop owns the shared connected state and
+// backoff exponent, so such a transport reports its connect transitions
+// through this seam and the loop applies them via MarkConnected /
+// MarkDisconnected. A successful connect MUST report connected: mark_connected
+// resets the exponent, so without it repeated failures separated by
+// successful reconnects would keep escalating toward the 1800 s cap.
+type ConnectionReporter interface {
+	SetConnectionObserver(connected func(), disconnected func(error))
+}
+
 // Classifier is the per-sender retriable(error) seam — the Go
 // equivalent of Python's per-sender except-clauses
 // (e.g. kafka_sender's KAFKA_CONN_ERRORS set). The loop routes a
@@ -373,7 +387,7 @@ func NewLoop(cfg LoopConfig, inst Instance, in <-chan Item) *Loop {
 	if dr, ok := inst.Transport.(DurableReporter); ok {
 		durable = dr
 	}
-	return &Loop{
+	l := &Loop{
 		cfg:              cfg,
 		inst:             inst,
 		transport:        inst.Transport,
@@ -389,6 +403,14 @@ func NewLoop(cfg LoopConfig, inst Instance, in <-chan Item) *Loop {
 		connectedChanged: time.Now(),
 		lastSend:         time.Now(),
 	}
+	// A transport that manages its own connect path reports its transitions
+	// so the loop owns connected state and the shared backoff exponent
+	// (Python's mark_connected/mark_disconnected call sites live in the
+	// sender's _init_rsyslog_client).
+	if cr, ok := inst.Transport.(ConnectionReporter); ok {
+		cr.SetConnectionObserver(l.MarkConnected, l.MarkDisconnected)
+	}
+	return l
 }
 
 // Run drives the loop until ctx is canceled (base.py:run): every tick

@@ -83,6 +83,14 @@ type Sender struct {
 	cfg     *clientConfig
 	parseEr error
 	parsed  bool
+	// onConnected/onDisconnected are the shared-loop lifecycle callbacks
+	// (sender.ConnectionReporter). A successful connect reports onConnected,
+	// resetting the shared backoff exponent exactly like Python's
+	// mark_connected in _init_rsyslog_client; a retriable connect failure
+	// reports the ORIGINAL error via onDisconnected before the flat 5 s wait.
+	// Guarded by mu; installed by NewLoop before Run.
+	onConnected    func()
+	onDisconnected func(error)
 }
 
 // clientConfig is the resolved SyslogTcpClient configuration
@@ -175,8 +183,20 @@ func parseConfig(raw map[string]any) (*clientConfig, error) {
 	// built whenever ca_certs is supplied with a non-null value — an
 	// explicitly empty string included. config.get returns None for both
 	// an absent key and an explicit null, so only present+non-nil counts.
+	caCerts := ""
 	caCertsPresent := false
 	if v, present := raw["ca_certs"]; present && v != nil {
+		str, ok := v.(string)
+		if !ok {
+			// Python builds ssl.create_default_context(cafile=<value>); a
+			// non-string cafile (e.g. 1) raises rather than silently falling
+			// back to system roots. Reject it instead of substituting a trust
+			// configuration the operator never asked for (the sanctioned
+			// wrong-type deviation permits earlier rejection, not silent
+			// acceptance).
+			return nil, fmt.Errorf("ca_certs: %v is not a string", v)
+		}
+		caCerts = str
 		caCertsPresent = true
 	}
 	cfg := syslogframing.Config{
@@ -185,7 +205,7 @@ func parseConfig(raw map[string]any) (*clientConfig, error) {
 		RFC:                 strings.ToUpper(rfc),
 		MaxMsg:              maxMsg,
 		Protocol:            protocol,
-		CACerts:             optionalConfigString(raw, "ca_certs"),
+		CACerts:             caCerts,
 		CACertsPresent:      caCertsPresent,
 		KeyFile:             optionalConfigString(raw, "client_key"),
 		CertFile:            optionalConfigString(raw, "client_cert"),
@@ -247,14 +267,22 @@ func (s *Sender) connect(ctx context.Context) (logClient, error) {
 // connect call runs WITHOUT holding s.mu (the production connect reads
 // the parsed config under the same lock; holding it here would deadlock).
 //
-// Reconnection is integrated with the shared Task 13 loop: on a retriable
-// connection failure the sender logs rsyslog.py:62-66's warning, waits
-// out the flat 5 s sleep (rsyslog.py:70), and RETURNS the error so the
-// loop owns the mark_disconnected transition (populating the health error
-// ring), the jittered exponential backoff — one shared counter, so a
-// send-failure backoff and a subsequent reconnect-failure backoff
-// continue the same exponent instead of restarting — and the reset on
-// the next successful batch. The sender keeps no private backoff state.
+// Connection transitions are reported to the shared Task 13 loop through
+// the sender.ConnectionReporter seam, so the loop owns the connected state
+// and the single shared backoff exponent (the sender keeps no private
+// backoff state):
+//
+//   - A SUCCESSFUL connect reports connected, resetting the shared exponent
+//     exactly like Python's mark_connected at the end of
+//     _init_rsyslog_client. Without it, repeated payload failures separated
+//     by successful reconnects would keep escalating toward the 1800 s cap.
+//   - A RETRIABLE failure reports the ORIGINAL error before the flat 5 s
+//     wait (Python marks disconnected immediately after the except, then
+//     sleeps, rsyslog.py:62-70), so the error lands in the health ring at
+//     once and a cancellation during the wait cannot replace it with
+//     context.Canceled. It then returns that error so the loop applies its
+//     jittered exponential backoff on top of the flat sleep.
+//
 // A non-retriable failure (missing rsyslog_server, bad format) returns
 // immediately for the loop's "unexpected exception" path.
 func (s *Sender) ensureClient(ctx context.Context) (logClient, error) {
@@ -273,9 +301,10 @@ func (s *Sender) ensureClient(ctx context.Context) (logClient, error) {
 			return nil, err
 		}
 		s.warn("Retryable error during Rsyslog Client initialization: %s: %s, sleeping", fmt.Sprintf("%T", err), err)
-		if !s.sleep(ctx, initRetrySleep) {
-			return nil, ctx.Err()
+		if dc := s.disconnectedObserver(); dc != nil {
+			dc(err)
 		}
+		s.sleep(ctx, initRetrySleep)
 		return nil, err
 	}
 	s.mu.Lock()
@@ -287,10 +316,36 @@ func (s *Sender) ensureClient(ctx context.Context) (logClient, error) {
 	}
 	res := s.client
 	s.mu.Unlock()
+	if cc := s.connectedObserver(); cc != nil {
+		cc()
+	}
 	if cfg, cerr := s.resolvedConfig(); cerr == nil {
 		s.logf("Initialized Rsyslog Client %s, server: %s, port: %d", s.name(), cfg.client.Server, cfg.client.Port)
 	}
 	return res, nil
+}
+
+// SetConnectionObserver implements sender.ConnectionReporter. NewLoop calls
+// it (before Run) with the loop's MarkConnected/MarkDisconnected, so a
+// connect success resets the shared exponent and a connect failure records
+// the original error in the shared health ring.
+func (s *Sender) SetConnectionObserver(connected func(), disconnected func(error)) {
+	s.mu.Lock()
+	s.onConnected = connected
+	s.onDisconnected = disconnected
+	s.mu.Unlock()
+}
+
+func (s *Sender) connectedObserver() func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onConnected
+}
+
+func (s *Sender) disconnectedObserver() func(error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onDisconnected
 }
 
 // sleepCtx waits d, returning false if ctx is cancelled first.
