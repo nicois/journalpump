@@ -214,8 +214,8 @@ func TestPythonJSONString(t *testing.T) {
 		{"", `""`},
 		{"ascii", `"ascii"`},
 	} {
-		if got := pythonJSONString(tc.value); got != tc.want {
-			t.Errorf("pythonJSONString(%q) = %s, want %s", tc.value, got, tc.want)
+		if got := PythonJSONString(tc.value); got != tc.want {
+			t.Errorf("PythonJSONString(%q) = %s, want %s", tc.value, got, tc.want)
 		}
 	}
 }

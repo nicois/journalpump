@@ -1,0 +1,57 @@
+{
+    "readers": {
+        "reader_two": {
+            "cursor": "cursor=primary-1",
+            "searches": {
+                "alpha": 10,
+                "zeta": 3
+            },
+            "senders": {
+                "kafka_backup": {
+                    "buffer": {
+                        "current_queue": 2,
+                        "cursor": "cursor=buffer-3",
+                        "entry_num": 9,
+                        "total_size": 4096
+                    },
+                    "health": {
+                        "elapsed": 3.5,
+                        "errors": [
+                            "connection reset \u00e9t\u00e9",
+                            "first error stays"
+                        ],
+                        "status": "connected"
+                    },
+                    "sent": {
+                        "bytes": 65536,
+                        "count": 7,
+                        "cursor": "cursor=backup-2"
+                    },
+                    "type": "LogSender"
+                },
+                "kafka_primary": {
+                    "buffer": {
+                        "current_queue": 0,
+                        "cursor": null,
+                        "entry_num": 0,
+                        "total_size": 0
+                    },
+                    "health": {
+                        "elapsed": 0.0,
+                        "errors": [],
+                        "status": "stale"
+                    },
+                    "sent": {
+                        "bytes": 0,
+                        "count": 0,
+                        "cursor": null
+                    },
+                    "type": "LogSender"
+                }
+            },
+            "total_bytes": 84,
+            "total_lines": 42
+        }
+    },
+    "start_time": "2026-10-09T13:00:00.000000"
+}

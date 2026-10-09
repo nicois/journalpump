@@ -28,7 +28,7 @@ func Serialize(fields []Field) ([]byte, error) {
 		if i > 0 {
 			out.WriteString(", ")
 		}
-		out.WriteString(pythonJSONString(field.Key))
+		out.WriteString(PythonJSONString(field.Key))
 		out.WriteString(": ")
 		if err := appendPythonJSON(&out, field.Key, field.Value); err != nil {
 			return nil, err
@@ -49,7 +49,7 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 			out.WriteString("false")
 		}
 	case string:
-		out.WriteString(pythonJSONString(v))
+		out.WriteString(PythonJSONString(v))
 	case []byte:
 		// default_json_serialization decodes bytes as UTF-8; after
 		// ProcessEntry undecodable bytes are already repr() strings, so an
@@ -57,7 +57,7 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 		if !utf8.Valid(v) {
 			return fmt.Errorf("undecodable byte value for key %q", key)
 		}
-		out.WriteString(pythonJSONString(string(v)))
+		out.WriteString(PythonJSONString(string(v)))
 	case int64:
 		out.WriteString(strconv.FormatInt(v, 10))
 	case json.Number:
@@ -67,7 +67,7 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 	case time.Time:
 		// Python's default handler returns obj.isoformat(), which
 		// json.dumps then encodes as a regular JSON string.
-		out.WriteString(pythonJSONString(pythonISOFormat(v)))
+		out.WriteString(PythonJSONString(pythonISOFormat(v)))
 	case []any:
 		out.WriteByte('[')
 		for i, item := range v {
@@ -89,7 +89,7 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 			if i > 0 {
 				out.WriteString(", ")
 			}
-			out.WriteString(pythonJSONString(field.Key))
+			out.WriteString(PythonJSONString(field.Key))
 			out.WriteString(": ")
 			if err := appendPythonJSON(out, field.Key, field.Value); err != nil {
 				return err
@@ -102,14 +102,14 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 	return nil
 }
 
-// pythonJSONString escapes a string exactly like Python's
+// PythonJSONString escapes a string exactly like Python's
 // json.dumps(ensure_ascii=True): short escapes for \b \f \n \r \t and the
 // two JSON specials, \u00xx (lowercase) for other control characters and
 // DEL, \uxxxx for non-ASCII BMP characters, and UTF-16 surrogate pairs
 // for astral characters. There is deliberately no HTML escaping of
 // < > & (Python does not, unlike Go encoding/json — the parity
 // equivalent of SetEscapeHTML(false)).
-func pythonJSONString(s string) string {
+func PythonJSONString(s string) string {
 	var out bytes.Buffer
 	out.WriteByte('"')
 	for _, r := range s {

@@ -1,0 +1,57 @@
+{
+    "readers": {
+        "reader_one": {
+            "cursor": "cursor=11223344-0",
+            "searches": {
+                "errors": 0,
+                "payment_lines": 7
+            },
+            "senders": {
+                "kafka_backup": {
+                    "buffer": {
+                        "current_queue": 3,
+                        "cursor": null,
+                        "entry_num": 17,
+                        "total_size": 2048
+                    },
+                    "health": {
+                        "elapsed": 0.25,
+                        "errors": [],
+                        "status": "stale"
+                    },
+                    "sent": {
+                        "bytes": 4096,
+                        "count": 5,
+                        "cursor": null
+                    },
+                    "type": "LogSender"
+                },
+                "kafka_primary": {
+                    "buffer": {
+                        "current_queue": 3,
+                        "cursor": "cursor=aabbccdd-1",
+                        "entry_num": 17,
+                        "total_size": 2048
+                    },
+                    "health": {
+                        "elapsed": 12.5,
+                        "errors": [
+                            "Connection refused",
+                            "Timed out"
+                        ],
+                        "status": "connected"
+                    },
+                    "sent": {
+                        "bytes": 5000000,
+                        "count": 1234,
+                        "cursor": "cursor=aabbccdd-1"
+                    },
+                    "type": "LogSender"
+                }
+            },
+            "total_bytes": 999999999,
+            "total_lines": 1000000
+        }
+    },
+    "start_time": "2026-10-09T12:00:00.000000"
+}
