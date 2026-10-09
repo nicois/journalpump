@@ -182,7 +182,7 @@ Tests: harness test spawning the stub binary with an abstract-socket
 runCtx; SIGTERM does).
 
 ### Task 10. Implementation-agnostic systest harness + first black-box suites (thread C1)
-Files: `systest-go/journalpump_process.go` (harness) + suites. The harness
+Files: `systest-go/journalpump_process_test.go` (harness) + suites. The harness
 spawns *a binary*: env `JOURNALPUMP_BIN` selects the implementation —
 unset/`go` runs the built Go binary, `python` runs
 `python3 -m journalpump` with the same env (`RUNTIME_DIRECTORY`, abstract
@@ -194,7 +194,7 @@ implementations.
 Acceptance: the same suites pass against the Python binary today and are
 the standing harness every later systest uses.
 Re-scope note (Task 10 review, 2026-10-09): the Go-side harness
-(systest-go/journalpump_process.go) is deferred to Task 18, where the
+(systest-go/journalpump_process_test.go) is deferred to Task 18, where the
 Go systest suites land; the Python-side harness rework
 (JOURNALPUMP_BIN selection) was delivered in Task 10 and is the
 mechanism both implementations will use.

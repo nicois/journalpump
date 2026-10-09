@@ -23,12 +23,12 @@ Source: `test/test_running_config.py` (5 tests), `systest/test_running_config.py
 | test_running_config_path_configured_wins | ported | same subtest as above (configured path is asserted against a set RUNTIME_DIRECTORY) |
 | test_running_config_path_unset | ported | `TestRunningConfigPath/both unset` |
 | test_write_running_config_warns_when_path_set_without_enable | ported | `TestWriteRunningConfigSkips/path set without enable warns` (asserts the exact Python warning text) |
-| systest: writes to runtime directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/full parsed document with modes` (parsed-equality, file 0600, dir 0700) + `TestWriteRunningConfigRuntimeDirectory` (RUNTIME_DIRECTORY fallback); the spawn-based cases are delivered by the Python systest harness (Task 10 rework, JOURNALPUMP_BIN selection) and the Go binary runs them once its run loop lands (Task 18) |
-| systest: with secret filters | Go-idiomatic (unit level here) | raw-document preservation incl. `secret_filters` covered by `TestDecodeGoldenFullConfig` + `TestDecodeIgnoresUnknownKeys`; spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
+| systest: writes to runtime directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/full parsed document with modes` (parsed-equality, file 0600, dir 0700) + `TestWriteRunningConfigRuntimeDirectory` (RUNTIME_DIRECTORY fallback); the spawn-based cases are delivered by the Python systest harness (Task 10 rework, JOURNALPUMP_BIN selection) and the Go binary runs them since Task 18 (`TestGoWritesRunningConfig*`) |
+| systest: with secret filters | Go-idiomatic (unit level here) | raw-document preservation incl. `secret_filters` covered by `TestDecodeGoldenFullConfig` + `TestDecodeIgnoresUnknownKeys`; spawn-based case in the Task 10 Python systest harness, now also run against the Go binary in `TestGoWritesRunningConfig*` (Task 18) |
 | systest: no write without opt-in | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/not enabled and no path is silent` (no file created) |
-| systest: no write from path alone | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/path set without enable warns` (no write); spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
+| systest: no write from path alone | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/path set without enable warns` (no write); spawn-based case in the Task 10 Python systest harness, now also run against the Go binary in `TestGoWritesRunningConfig*` (Task 18) |
 | systest: no write when enabled without path | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/enabled without path warns` |
-| systest: writes to configured path (modes 0600/0700) | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/full parsed document with modes`; spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
+| systest: writes to configured path (modes 0600/0700) | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/full parsed document with modes`; spawn-based case in the Task 10 Python systest harness, now also run against the Go binary in `TestGoWritesRunningConfig*` (Task 18) |
 | systest: does not chmod existing directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/existing directory is not chmodded` |
 
 Recorded deviation (user decision, 2026-10-09, extending the Task 3
@@ -1047,3 +1047,41 @@ a parity claim.
 
 Deferred: none — the Task 16 "journald output deferred to Task 17" note
 is resolved here.
+
+## Task 18 — core systest suites (Milestone A)
+
+Deferred Go-side harness work lands here together with the systest sweep
+that runs the implementation-agnostic Python suites against the Go binary.
+
+Go-native suites (driven through the real binary via the Task 10 harness
+in `systest-go/journalpump_process_test.go`; all run under `-race`):
+
+| Source | Status | Go counterpart |
+|---|---|---|
+| `systest/test_running_config.py` (7 cases) | ported | `TestGoWritesRunningConfig*` (7 tests) |
+| `systest/test_rotation.py` (rotation behavior; Python is in-process/monkeypatched) | Go-idiomatic | `TestGoRotationThirtyMessagesAcrossRotation`, `TestGoRotationBufferLengthBoundaries`, `TestGoRotationBufferBytesBoundaries`, `TestGoRotationCorruptEntrySkip`, `TestGoRotationDeletedFileFdRelease` |
+| `systest/test_reload.py::test_sighup_with_changed_readers_keeps_process_alive` | ported | `TestGoSighupWithChangedReadersKeepsProcessAlive` |
+| `systest/test_sigterm.py` (sitecustomize slow-flush trick is Python-only) | `go-native` (outside the Python parity set; sanctioned deviation D9) | `TestGoSigtermGraceFlushDeliversBufferedTail` asserts the grace-flush window Python does not exhibit; `TestGoCleanShutdownAfterReloads` asserts every goroutine joins and the process exits 0 after repeated SIGHUPs |
+| D3 pair (`systest/test_state_file_interop.py` is the Python side) | ported | `TestGoResumesFromPythonStateFile` (Python-written fixture → Go resume → python3 `json.load` of the Go rewrite) and `TestGoCursorSurvivesRestart` (Go→Go restart) |
+
+The Task 10 Python systest harness now runs against the Go build
+(`JOURNALPUMP_BIN=go make build-go` prerequisite): `test_harness.py`,
+`test_reload.py`, `test_sigterm.py`, `test_running_config.py` (15 passed)
+and `test_rotation.py` (10 passed) all green, so the implementation-agnostic
+suites are proven on both implementations.
+
+Defect fixed while bringing the reload suite up: the port installed its
+SIGHUP/SIGTERM handlers (`cmd/journalpump/main.go` `newSignals()`) only
+AFTER both startup `READY=1` notifications, so a supervisor reacting to
+readiness (SIGHUP immediately after the first `READY=1`) raced ahead of
+handler installation and the reload was dropped. Python installs its
+handlers in `ServiceDaemon.__init__` (daemon.py:52-54), before main's
+final `READY=1`. The handlers are now installed before the READY loop;
+no operator-visible change, so no §2 entry.
+
+Test-only shim (not operator-visible): `internal/daemon/pump.go`'s
+`pollInterval` is a `var` so the systest build honors
+`JOURNALPUMP_POLL_INTERVAL_MS` via `poll_interval_systest.go` — the
+analogue of the Python harness setting `pump.poll_interval_ms = 100`.
+The production default stays 1000 ms and the shim file is compiled only
+under `-tags systest`.
