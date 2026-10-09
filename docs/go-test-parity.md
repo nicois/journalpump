@@ -631,3 +631,23 @@ budget with `sys.getsizeof(item)` (CPython bytes-object overhead,
 ~33 B/item); Go counts plain payload lengths. `buffer_size` is never
 serialized (the state file carries `total_size`, which is
 len-based in both) — the budget only feeds the admission gate.
+
+Review notes from the Task 14 round:
+
+- The `maxLength < 1` fallback was removed: the budget passes through
+  unchanged (Python's `msg_buffer_max_length=0` corner makes the
+  reader never read, journalpump.py:230) and only the channel
+  capacity is clamped to stay usable.
+- `Attach` is enforced at runtime: `Enqueue` panics when the buffer
+  was never attached to its loop — a missing drain observer would
+  stall the reader once the byte budget fills, and a skipped
+  TrackEnqueue would corrupt the state-file accounting. The Task 16
+  wiring test must still exercise the composed order
+  (NewSenderBuffer → NewLoop → Attach).
+- **Task 16 forward note (byte accounting on the read side)**: Python
+  decrements `limit_bytes` by `bytes_read =
+  max(len(v) for v in json_objects.values())`
+  (journalpump.py:746-748) — the MAX serialized size across the
+  reader's senders — NOT the per-sender payload length
+  `SenderBuffer.ByteCount` tracks. The Task 16 reader must use
+  Python's measure for the gate decrement and `inc_line_stats`.

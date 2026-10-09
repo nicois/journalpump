@@ -67,17 +67,16 @@ type SenderBuffer struct {
 }
 
 // NewSenderBuffer builds a buffer whose channel capacity is maxLength
-// (+ a small headroom). Wiring order in the composed system:
+// (+ a small headroom). The budget passes through unchanged so the
+// Gate reproduces Python's ≤0-limit corner (msg_buffer_max_length=0
+// with live senders makes the reader never read, journalpump.py:230);
+// only the channel capacity is clamped, so the channel stays usable.
+// Wiring order in the composed system:
 // NewSenderBuffer → sender.NewLoop with Chan() → Attach.
 func NewSenderBuffer(name string, maxLength int) *SenderBuffer {
-	if maxLength < 1 {
-		// The config layer enforces positive values; defensively fall
-		// back to the Python default instead of an unbuffered channel.
-		maxLength = DefaultMsgBufferMaxLength
-	}
 	return &SenderBuffer{
 		name: name,
-		ch:   make(chan sender.Item, maxLength+admissionHeadroom),
+		ch:   make(chan sender.Item, max(maxLength, 1)+admissionHeadroom),
 	}
 }
 
@@ -101,8 +100,14 @@ func (b *SenderBuffer) Chan() <-chan sender.Item { return b.ch }
 // retrying until it fits or ctx is done — the spec §4.3 "never drops"
 // rule. On admission it updates the in-flight byte accounting and the
 // loop's cumulative buffer counters (Python add_item's accounting
-// half).
+// half). Attach must have been called: a silently skipped TrackEnqueue
+// would corrupt the state-file accounting, and a missing drain
+// observer would stall the reader once the byte budget fills — both
+// are wiring bugs, so they fail fast instead.
 func (b *SenderBuffer) Enqueue(ctx context.Context, item sender.Item) error {
+	if b.loop == nil {
+		panic("buffer: Attach must be called before Enqueue")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -112,9 +117,7 @@ func (b *SenderBuffer) Enqueue(ctx context.Context, item sender.Item) error {
 			b.mu.Lock()
 			b.bytes += len(item.Payload)
 			b.mu.Unlock()
-			if b.loop != nil {
-				b.loop.TrackEnqueue(item)
-			}
+			b.loop.TrackEnqueue(item)
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()

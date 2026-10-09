@@ -374,3 +374,14 @@ func TestGateLimits(t *testing.T) {
 		}
 	})
 }
+
+func TestAttachEnforced(t *testing.T) {
+	t.Parallel()
+	buf := buffer.NewSenderBuffer("out", 10)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("Enqueue without Attach must panic")
+		}
+	}()
+	_ = buf.Enqueue(context.Background(), item(0))
+}
