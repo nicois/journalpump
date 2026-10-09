@@ -1243,3 +1243,58 @@ real-socket/TLS paths are exercised by Task 20's rsyslogd systest):
   proves a worker terminates promptly on cancellation.
 - **Zero `max_msg` normalizes to 2048** (`max_msg or 2048`,
   rsyslog.py:118); negatives preserved (see above).
+
+### Task 19 review round 2 (changes-required)
+
+- **AfterFunc race — connection retirement.** `context.AfterFunc`'s
+  `stop()` does NOT wait for an already-started callback, so a
+  cancellation racing a completed write could leave `Send` returning
+  success while the callback then forced an expired write deadline onto
+  the RETAINED connection, poisoning later sends.
+  `writeWithContext` now returns whether the callback fired and waits on
+  a done channel (`stop()` false → `<-done`) so no deadline write can
+  race the caller after return; when the callback ran on a completed
+  write, `Send` retires the connection (closes it) so the next send
+  reconnects cleanly. `TestSendCancellationRacingCompletedWriteRetiresConn`
+  is deterministic (cancels from INSIDE the first Write) and asserts the
+  deadline callback ran, the connection was closed and a later send
+  reconnects (non-vacuous: disabling the retirement leaves the poisoned
+  socket retained).
+- **`max_msg == math.MinInt` overflow.** `max_msg - 1` in Go int
+  overflows to a large POSITIVE bound at MinInt, sending the whole
+  message plus a newline where Python's arbitrary-precision arithmetic
+  yields the newline alone. `maxMsgMinusOne` saturates at MinInt.
+  Covered by `TestFramingNegativeAndZeroMaxMsg` (int64 extremes) and a
+  `-(2**63)` oracle case in the fixture.
+- **Independent fuzz oracle.** The fuzz expectation no longer calls the
+  production `pySliceEnd` (which also repeated the overflowing
+  subtraction, validating the implementation against itself). It
+  reimplements Python's framing independently (`oracleFrame` /
+  `pythonSlice`), including the `max_msg or 2048` zero normalization and
+  int64-extreme saturation, while keeping the advertised-octet-length
+  desync check. The MinInt seeds fail against the overflowing
+  implementation.
+- **Deterministic cancellation test.** The cancellation worker-
+  termination test no longer sleeps; the blocking stub signals when
+  `Write` is ENTERED, and the test cancels only after observing it, so
+  `Send` cannot pass by returning at its initial canceled-context check.
+
+### Gate-integrity finding — a fixture consumer went red undetected
+
+`systest/test_groundtruth_replay.py` asserts that the replayed file
+output matches the `file_sender` fixture. Commit `d51bb7d` (Task 16
+round 1) expanded that fixture from 10 to 40 lines but left this Task 11
+assertion comparing a literal 10-line slice against the whole fixture,
+so the assertion went red. It survived both the Task 16 and Task 18
+"all green" claims because `test_groundtruth_replay.py` was not part of
+the per-task green runs — the fixture changed in Task 16, but this
+consumer suite was outside the Task 16 command set, and Task 18's
+Milestone A gate did not re-run every consumer of a previously captured
+fixture either.
+
+**Corrective (process, not just this test):** a milestone/full-suite run
+must include ALL consumer suites of any changed fixture. After a fixture
+is (re)captured, the green bar is every suite that loads it, not only
+the suite that wrote it. The assertion is fixed to compare matching
+prefixes (the file sender flushes only a prefix mid-run), keeping the
+expanded 40-line fixture.
