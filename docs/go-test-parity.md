@@ -909,8 +909,8 @@ Recorded deviations (kept):
   the file; Python's `BufferedWriter` is never flushed and the daemon
   thread dies with the tail buffered on SIGTERM. This is exactly the
   sanctioned D9 deviation (no new §2 entry).
-- `write_running_config` and journald (`logging`) output are deferred
-  to Task 17.
+- `write_running_config` and journald (`logging`) output are implemented
+  in Task 17 (see the Task 17 section below).
 
 Additional parity-critical behavior pinned in this task's review:
 
@@ -943,3 +943,54 @@ Additional parity-critical behavior pinned in this task's review:
   The file fixture now pins all 40 lines (the capture composes an
   unbuffered-open shim; the first 10 remain byte-identical to the
   previously pinned prefix).
+
+## Task 17 — reload, resume, state save, shutdown
+
+Reload/lifecycle (`internal/daemon/reload.go`, `pump.go`), the
+level-aware logger (`internal/journaldlog/journaldlog.go`), and the
+durable file-sender cursor (`internal/sender/file/file.go`) land
+together with the running-config writer.
+
+Parity-critical behavior reproduced exactly:
+
+- SIGHUP reload: the whole `readers` blob is diffed by parsed structure
+  (Task 3 compare); changed/new readers are stopped and recreated,
+  removed readers cleaned up; statsd/tags/geoip/filters are rebuilt on
+  every reload even when the readers blob is unchanged.
+- GLOBAL vs reader-owned settings: an unchanged readers blob still picks
+  up new GLOBAL `match` rules, statsd client and tags — readers consult a
+  synchronized current pump-settings snapshot (`Pump.settings`,
+  atomic.Pointer) for these, exactly as Python readers read the live
+  pump (`self.pump.stats`, `self.pump.make_tags()`,
+  `self.pump.check_match`); only genuinely reader-owned settings stay
+  captured at construction.
+- `statePath` is re-read from the parsed config on reload
+  (`get_state_file_path()` parity), with both unchanged and replaced
+  readers.
+- Reconfigured `log_level` on SIGHUP takes effect
+  (`daemon.py reload_config` sets `self.log_level` then reconfigures).
+- Logging: journald datagram writer when stdout is not a tty, TTY
+  formatter otherwise; Python level→PRIORITY mapping
+  (`systemd.journal.JournalHandler.map_priority`: DEBUG→7, INFO→6,
+  WARNING→4, ERROR→3, CRITICAL→2, higher→ALERT 1); `log_level` filtering
+  at startup and on reload; LOGGER/SYSLOG_IDENTIFIER and the
+  `LOG_FORMAT_JOURNAL`-style MESSAGE (`"%(name)-20s  %(levelname)-8s  %(message)s"`).
+- Multi-line journald field values use the native binary field form —
+  `NAME\n` + 8-byte little-endian value length + value + `\n` — asserted
+  byte-exact.
+- The D9/D3 delivery-checkpoint contract (charter §2): the persisted
+  cursor never claims bytes not durably on disk; a failed flush or a
+  reload retire truncates back to the last complete-line boundary before
+  state is saved.
+- The readerErr channel carries at least one buffer slot regardless of
+  the initial reader count, so the first reader failure always reaches
+  `Run` (Python's reader threads surface via the errgroup-equivalent).
+
+Sanctioned deviations (charter §2): construct-before-retire safe abort
+(Python tears the old reader down first); the io.Writer-sink logging
+architecture (spec §4.5 mentioned slog); the D9 grace flush and the
+delivery-checkpoint correctness contract (Python's cursor is the last
+SENT, not flushed, position).
+
+Deferred: none — the Task 16 "journald output deferred to Task 17" note
+is resolved here.

@@ -231,6 +231,40 @@ NEWS entry — plan Task 28):
   degraded to one wedged sender — accepted because senders must
   return errors rather than panic and the systemd restart is
   self-resetting with state-file resume. NEWS-recorded (Task 28).
+- Construct-before-retire safe abort: on reload, the replacement reader
+  is fully constructed BEFORE the old one is retired; if construction
+  fails, the old reader stays running with its settings and cursors
+  intact (a safe abort) rather than tearing down the old reader and
+  leaving the pump with a missing reader. Python destroys the old
+  reader first and constructs the replacement second
+  (`configure_readers`), so a construction failure leaves it with
+  neither — under the §2 "Python is incorrect" clause this ordering is
+  not reproduced. Coordinator-ruled 2026-10-10 (Task 17 review);
+  NEWS-recorded (Task 28).
+- Delivery-checkpoint contract (Task 17): the persisted sender cursor
+  only ever claims bytes that are durably on disk — the durable
+  watermark never advances past a complete output line. A failed flush
+  or a reload retire truncates the output back to the last complete-line
+  boundary before the cursor is saved, so a restart/replay can never
+  re-append onto a corrupt partial JSON object and can never duplicate a
+  line the cursor already claimed. This is a correctness contract, not a
+  Python-parity claim: Python's cursor is the last SENT (not flushed)
+  position, which under its daemon-thread shutdown can already point past
+  data it never wrote. Required failure tests: restart after a flush that
+  cuts through a line (assert valid JSONL, no duplicate/corrupt partial
+  object), discard truncation to the last complete line, and a failed
+  flush leaving a clean edge. NEWS-recorded (Task 28).
+- Logging architecture (Task 17): the daemon logs through an io.Writer
+  sink wired into the Printf seam (level-aware `journaldlog.Log`), rather
+  than the spec §4.5 slog-to-journald datagram mention. The sink selects
+  the journald datagram writer when stdout is not a tty and a TTY
+  formatter otherwise, maps Python log levels to journald PRIORITY,
+  honors `log_level` at startup and on SIGHUP, and emits the logger-name
+  context Python includes — reproducing daemon.py's configure_logging
+  behavior (the Printf seam was the pre-existing wiring; the bug fixed
+  here was that it ignored level/severity). Coordinator-sanctioned
+  2026-10-10 (Task 17 review) as a deviation from the spec's slog
+  mention; NEWS-recorded (Task 28).
 
 ## 3. Resolved decisions (spec §9, user-confirmed 2026-10-09)
 
@@ -518,7 +552,7 @@ Task 18 harness's job.
 | 14 | Per-sender buffer + reader backpressure (admission gate) | done | 08ad213 + 3ed7609 | approved after one review round (4 minors fixed in 3ed7609: budget passthrough for the msg_buffer_max_length=0 corner, runtime Attach guard, Task 16 forward note on the bytes_read measure; getsizeof byte budget ruled cosmetic with coordinator+reviewer concurrence) | 1 | 4 |
 | 15 | sdjournal reader (consumer-side seam, stats, match_key/value in handler) | done | 0fabf21 + 56f217a | changes-required → FIXED in 56f217a (one review round: 3 majors + 4 minors): FFI step ABI (sd_journal_next/previous return int — a uint64 wrapper zero-extended -errno into "entry present"; stepFromRc + test pin), match-add moved after the initial seek (Python order — match-then-seek silently lost the first matching entry after the resume cursor), LOCAL_ONLY default for plain/namespace opens restored (python-systemd journal.py:168-174; earlier false "no masking" probe claim corrected in the parity doc); minors: Wait timeout semantics (<0 indefinite, 0 non-blocking poll), symbol-resolution errors surfaced as named errors, match_value=None wiring guard + mid-open-failure divergence pinned in the parity doc. Native libsystemd dlopen binding deviation sanctioned (§2). Fixture acceptance: rotated_logs reproduces Python's probed ground truth (40 entries, entry-0 fields/types/key order); bad_msg corruption taxonomy probed (field-without-= vs Bad message layering). Metrics backfilled: 2 rounds (1 major round: 3M+4m, then confirm: 1 minor residual + accepted scope call) | 2 | 5 |
 | 16 | Run loop + per-sender pipeline + file sender | done | 6403ff0 + d51bb7d + 2846641 + 050a2bd | approved after 5 review rounds (round 1: 9 majors + 2 minors; round 2: 3 majors + 3 minors; round 3: 3 majors; round 4: 2 majors; round 5: approve), all fixed. Round-1 finds included four real parity bugs — sender document order, empty-filter {}, match_value None, SIGTERM chunk over-read — plus the buffered-flush ordering major. Value demonstration validated as the committed e2e test (systest-tagged shim path: all 40 lines + state + exit 0 independently confirmed) | 5 | 5 |
-| 17 | Reload, resume, state save, shutdown (errgroup lifecycle) | in-progress | - | - |
+| 17 | Reload, resume, state save, shutdown (errgroup lifecycle) | review | 4734fe2 + 3e46a03 + 02f784f | changes-required (6 majors + 1 minor) FIXED in 02f784f: partial-line corruption on auto-flush/discard now truncates to the last complete-line boundary (durable cursor never claims bytes past a complete line); global pump settings (match/stats/tags) read from a synchronized snapshot so an unchanged readers blob picks up new GLOBAL match rules; `statePath` updated on reload; journald multi-line values use the native binary field form (8-byte LE length prefix); logging made level-aware (Python PRIORITY mapping, `log_level` at startup and on SIGHUP, logger-name context); readerErr buffered ≥1 so a zero-reader start still delivers the first reader failure. Construct-before-retire safe abort, the delivery-checkpoint contract and the io.Writer-sink logging architecture recorded in §2. Awaiting re-review |
 | 18 | Core systest suites (rotation/sigterm Go-native, interop) | not-started | - | - |
 | 19 | Syslog framing package | not-started | - | - |
 | 20 | Rsyslog sender (+ ported rsyslog systest driver) | not-started | - | - |

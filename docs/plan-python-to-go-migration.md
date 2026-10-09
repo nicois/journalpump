@@ -369,6 +369,36 @@ cadence and the shutdown grace timer (thread A9); integration with the
 Task 10 harness.
 Depends on: Task 16.
 
+Review additions (2026-10-10, cross-review changes-required fix batch;
+full records in charter §2):
+- **Delivery-checkpoint contract**: the durable sender cursor only claims
+  bytes durably on disk — the watermark never advances past a complete
+  output line, and a failed flush or reload retire truncates back to the
+  last complete-line boundary before state is saved. Required failure
+  tests: restart after a line-splitting flush (valid JSONL, no duplicate
+  or corrupt partial object), discard-truncation to the last complete
+  line, failed flush leaving a clean edge.
+- **Construct-before-retire safe abort** (sanctioned deviation): the
+  replacement reader is built before the old one is retired; a
+  construction failure keeps the old reader running, where Python tears
+  the old reader down first.
+- **Logging architecture** (sanctioned deviation from spec §4.5's slog
+  mention): an io.Writer sink into the Printf seam with a level-aware
+  journald/TTY logger — Python PRIORITY mapping, `log_level` honored at
+  startup and on SIGHUP, logger-name context emitted. The io.Writer sink
+  was ruled acceptable separately; the fixed bug was missing
+  level-awareness.
+- **Global vs reader-owned settings on reload**: readers consult a
+  synchronized current pump-settings snapshot for GLOBAL settings
+  (match key/value, statsd client, tags) so an unchanged readers blob
+  still picks up new global match rules; only genuinely reader-owned
+  settings stay captured at construction.
+- Also fixed: `statePath` updated from the parsed config on reload;
+  journald multi-line field values encoded with the native binary
+  field form (8-byte little-endian length prefix); the readerErr channel
+  buffered with at least one slot so the first reader failure is
+  delivered even from a zero-reader start.
+
 ### Task 18. Core systest suites (Milestone A)
 Files: `systest-go/`. Rotation suite as a **Go-native test** (thread C3:
 `systest/test_rotation.py` is in-process/monkeypatched in Python — port
