@@ -57,7 +57,7 @@ var constructors = map[string]Constructor{}
 func Lookup(outputType string) (Constructor, error) {
 	ctor, ok := constructors[outputType]
 	if !ok {
-		return nil, fmt.Errorf("Unknown sender type %q", outputType) //nolint:staticcheck // error-text parity with senders/__init__.py:get_sender_class's ValueError
+		return nil, fmt.Errorf("Unknown sender type '%s'", outputType) //nolint:staticcheck // error-text parity (including capitalized first word) with senders/__init__.py:get_sender_class's ValueError %r
 	}
 	return ctor, nil
 }

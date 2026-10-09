@@ -17,8 +17,9 @@ func TestLookup(t *testing.T) {
 	// Not parallel: the package-global wiring map is mutated below.
 	t.Run("unknown output type errors like Python's ValueError", func(t *testing.T) {
 		_, err := Lookup("nonexistent")
-		if err == nil || !strings.Contains(err.Error(), "Unknown sender type") {
-			t.Fatalf("Lookup error = %v, want an Unknown sender type error", err)
+		// Python's %r on a string renders single quotes.
+		if err == nil || err.Error() != "Unknown sender type 'nonexistent'" {
+			t.Fatalf("Lookup error = %v, want Unknown sender type 'nonexistent'", err)
 		}
 	})
 

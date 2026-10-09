@@ -568,3 +568,29 @@ Python test parity status:
   `TestInitializationError`.
 - Timing uses `testing/synctest` for the 100 ms tick, the idle
   trigger and backoff jitter; all tests run under `-race`.
+
+Deferred and forward notes from the Task 13 review:
+
+- **`sender.failed_to_start` gauge defers to Task 16**: Python emits
+  it at pump level (`set_persistent_gauge` + `refresh_gauges`,
+  journalpump.py:312, 1102-1108), not in the sender loop; the
+  PersistentGauges machinery from Task 7 is ready for it.
+- **D9 grace-window sizing (for the Task 16/17 supervisor)**: the
+  idle-trigger final flush fires at
+  `lastSend + max_send_interval + one tick` (the tick quantizes the
+  trigger), so the supervisor grace window before canceling a
+  sender's context must be `max_send_interval + TickInterval`, not
+  bare `max_send_interval`.
+- **Advisory for Task 19 (first real sender)**: `Instance.MaxSendInterval`
+  is documented must-be-positive but not validated — a zero value
+  makes `time.Since(lastSend) > 0` true on every tick, silently
+  turning the loop into a per-tick drain. The first real sender's
+  constructor (or `NewLoop`) should reject non-positive values.
+- Exception-tag routing matches the Python call sites: the send path
+  adds `app=journalpump` (kafka_sender.py:186 et al.), the
+  maintenance-failure site passes none (base.py:245) — pinned by the
+  `TestClassifierRouting` and `TestMaintenanceGate` subtests.
+- Backoff logging matches base.py:148-149: the post-jitter duration
+  is logged, not the pre-jitter base.
+- Unknown `output_type` error text matches Python's `%r` rendering
+  (single quotes): `Unknown sender type 'nonexistent'`.

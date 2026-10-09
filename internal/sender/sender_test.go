@@ -510,8 +510,9 @@ func TestClassifierRouting(t *testing.T) {
 		cancel()
 		<-done
 		datagram := capture.datagram()
-		if !strings.Contains(datagram, "exception") || !strings.Contains(datagram, "where=sender") {
-			t.Fatalf("datagram = %q, want the unexpected_exception counter with where=sender", datagram)
+		if !strings.Contains(datagram, "exception") || !strings.Contains(datagram, "where=sender") ||
+			!strings.Contains(datagram, "app=journalpump") {
+			t.Fatalf("datagram = %q, want the unexpected_exception counter with where=sender and app=journalpump", datagram)
 		}
 	})
 
@@ -728,6 +729,35 @@ func TestMaintenanceGate(t *testing.T) {
 			cancel()
 			<-done
 		})
+	})
+
+	t.Run("maintenance failure counter carries no app tag", func(t *testing.T) {
+		// Real UDP I/O, like the classifier routing tests — not inside
+		// the synctest bubble.
+		t.Parallel()
+		capture := newUDPCapture(t)
+		client := newStatsClient(capture)
+		tr := &fakeTransport{maintBehavior: func(int) error { return errors.New("maintenance failed") }}
+		in := make(chan Item, 1)
+		loop := NewLoop(
+			LoopConfig{Name: "out", Stats: client, Tags: map[string]string{"sender": "out"}},
+			Instance{Transport: tr, MaxSendInterval: time.Hour, Type: "FakeSender"},
+			in,
+		)
+		loop.tickInterval = 10 * time.Millisecond
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := startLoop(ctx, loop)
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+		<-done
+		datagram := capture.datagram()
+		if !strings.Contains(datagram, "where=maintenance_operation") {
+			t.Fatalf("datagram = %q, want where=maintenance_operation", datagram)
+		}
+		if strings.Contains(datagram, "app=journalpump") {
+			t.Fatalf("datagram = %q, want no app tag on the maintenance route (base.py:245)", datagram)
+		}
 	})
 }
 

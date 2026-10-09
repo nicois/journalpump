@@ -336,7 +336,7 @@ func (l *Loop) maybeMaintenance(ctx context.Context) {
 		l.lastMaintenance = time.Now()
 		l.mu.Unlock()
 		l.log.Printf("Maintenance operation failed for sender %q: %v", l.cfg.Name, err)
-		l.unexpected(err, "maintenance_operation")
+		l.unexpected(err, "maintenance_operation", nil)
 	}
 }
 
@@ -385,7 +385,7 @@ func (l *Loop) failBatch(err error) {
 		return
 	}
 	l.log.Printf("Sender %q unexpected exception during send: %v", l.cfg.Name, err)
-	l.unexpected(err, "sender")
+	l.unexpected(err, "sender", map[string]string{"app": "journalpump"})
 }
 
 // hold parks the not-yet-acked tail for the next flush's head retry.
@@ -466,8 +466,9 @@ func (l *Loop) backoffSleep(ctx context.Context) {
 	attempt := l.backoffAttempt
 	l.mu.Unlock()
 	base := backoffBaseDuration(attempt)
-	l.log.Printf("Sender %q sleeping for %.0f seconds", l.cfg.Name, base.Seconds())
 	delay := base + time.Duration(rand.Float64()*float64(base))
+	// base.py:148-149 logs the post-jitter duration.
+	l.log.Printf("Sender %q sleeping for %.0f seconds", l.cfg.Name, delay.Seconds())
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -575,17 +576,21 @@ func (l *Loop) setRunning(running bool) {
 }
 
 // unexpected emits stats.unexpected_exception with the sender's base
-// tags plus app=journalpump (the Python call sites' tag merge), when
-// stats are configured.
-func (l *Loop) unexpected(err error, where string) {
+// tags merged under extra (which overrides), when stats are
+// configured. The extra tag set mirrors the Python call sites: the
+// send path passes app=journalpump (e.g. kafka_sender.py:186); the
+// maintenance-failure site passes none (base.py:245).
+func (l *Loop) unexpected(err error, where string, extra map[string]string) {
 	if l.cfg.Stats == nil {
 		return
 	}
-	tags := make(map[string]string, len(l.cfg.Tags)+1)
+	tags := make(map[string]string, len(l.cfg.Tags)+len(extra))
 	for k, v := range l.cfg.Tags {
 		tags[k] = v
 	}
-	tags["app"] = "journalpump"
+	for k, v := range extra {
+		tags[k] = v
+	}
 	l.cfg.Stats.UnexpectedException(err, where, tags)
 }
 
