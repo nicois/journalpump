@@ -36,12 +36,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/net/http/httpproxy"
 
 	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/sender"
@@ -104,6 +103,14 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 		if !ok {
 			return sender.Instance{}, fmt.Errorf("logplex_request_timeout: %v is not a number", raw)
 		}
+		// Python's TimeoutAdapter substitutes the session default only when the
+		// per-request timeout is FALSY; a negative number is TRUTHY and is
+		// passed through to requests, which raises "the timeout cannot be set
+		// to a value less than or equal to 0". Strict-at-load deviation:
+		// reject it here instead of at send time.
+		if parsed < 0 {
+			return sender.Instance{}, fmt.Errorf("logplex_request_timeout: %v cannot be set to a value less than 0", parsed)
+		}
 		timeout = parsed
 	}
 	rawURL, present := args.Config["logplex_log_input_url"]
@@ -142,10 +149,12 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 
 // resolvedTimeout maps the configured logplex_request_timeout to the
 // effective per-connection timeout: requests substitutes the session's 60 s
-// default whenever the value is falsy (0 or negative), and Python's timeout
-// is an INACTIVITY timeout (connect and per-read), not a total deadline.
+// default only when the value is falsy — that is, exactly ZERO here, because
+// a negative number is truthy in Python and is rejected (see New) rather than
+// defaulted. Python's timeout is an INACTIVITY timeout (connect and per-read),
+// not a total deadline.
 func resolvedTimeout(timeoutSeconds float64) time.Duration {
-	if timeoutSeconds <= 0 {
+	if timeoutSeconds == 0 {
 		return time.Duration(defaultSessionTimeout * float64(time.Second))
 	}
 	return time.Duration(timeoutSeconds * float64(time.Second))
@@ -173,12 +182,11 @@ func newHTTPClient(timeoutSeconds float64) *http.Client {
 			}
 			return &idleTimeoutConn{Conn: conn, idle: idle}, nil
 		},
-		// Read the proxy environment at request time (httpproxy, the same
-		// logic net/http.ProxyFromEnvironment uses, but without its
-		// process-wide sync.Once cache).
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
-		},
+		// Match requests.Session's proxy selection (resolve_proxies +
+		// select_proxy over urllib.getproxies()), reading the environment per
+		// request — not net/http.ProxyFromEnvironment, whose precedence,
+		// ALL_PROXY handling and loopback bypass all differ.
+		Proxy: proxyForRequest,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, //nolint:gosec // verify=False is the ported Python behavior (spec §2)
 		},
@@ -202,6 +210,114 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 func (c *idleTimeoutConn) Write(b []byte) (int, error) {
 	_ = c.SetWriteDeadline(time.Now().Add(c.idle))
 	return c.Conn.Write(b)
+}
+
+// proxyForRequest reproduces requests.Session's proxy resolution for one
+// request (requests.utils.resolve_proxies + select_proxy over
+// urllib.request.getproxies). It deliberately does NOT use
+// net/http.ProxyFromEnvironment (httpproxy): that helper gives uppercase
+// variables precedence, ignores the ALL_PROXY fallback, and unconditionally
+// bypasses loopback addresses — three differences from requests.
+func proxyForRequest(req *http.Request) (*url.URL, error) {
+	u := req.URL
+	if u == nil || u.Hostname() == "" {
+		return nil, nil
+	}
+	if shouldBypassProxies(u) {
+		return nil, nil
+	}
+	proxies := proxyEnvironment()
+	proxy := proxies[u.Scheme]
+	if proxy == "" {
+		proxy = proxies["all"]
+	}
+	if proxy == "" {
+		return nil, nil
+	}
+	return url.Parse(proxy)
+}
+
+// shouldBypassProxies mirrors requests.utils.should_bypass_proxies (minus the
+// platform-specific proxy_bypass call, which is a no-op on Linux: requests
+// clears no_proxy around it when no explicit no_proxy was supplied). The
+// no_proxy lookup is lowercase-first with an uppercase fallback
+// (`os.environ.get("no_proxy") or os.environ.get("NO_PROXY")`). Loopback
+// targets are NOT special-cased: they are proxied unless no_proxy matches.
+func shouldBypassProxies(u *url.URL) bool {
+	noProxy := os.Getenv("no_proxy")
+	if noProxy == "" {
+		noProxy = os.Getenv("NO_PROXY")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return true
+	}
+	if noProxy == "" {
+		return false
+	}
+	entries := strings.Split(strings.ReplaceAll(noProxy, " ", ""), ",")
+	if ip := net.ParseIP(host); ip != nil {
+		for _, entry := range entries {
+			if entry == "" {
+				continue
+			}
+			if _, network, err := net.ParseCIDR(entry); err == nil {
+				if network.Contains(ip) {
+					return true
+				}
+				continue
+			}
+			if other := net.ParseIP(entry); other != nil && other.Equal(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	hostWithPort := host
+	if port := u.Port(); port != "" {
+		hostWithPort = host + ":" + port
+	}
+	for _, entry := range entries {
+		if entry == "" {
+			continue
+		}
+		if strings.HasSuffix(host, entry) || strings.HasSuffix(hostWithPort, entry) {
+			return true
+		}
+	}
+	return false
+}
+
+// proxyEnvironment builds the scheme -> proxy map like urllib's
+// getproxies_environment: every *_proxy variable contributes under its
+// lowercase scheme name, and a LOWERCASE variable wins over its uppercase
+// twin (an empty lowercase value removes the entry). The second pass inspects
+// the ORIGINAL name, so an uppercase *_PROXY never overrides a lowercase one.
+func proxyEnvironment() map[string]string {
+	proxies := make(map[string]string)
+	for _, kv := range os.Environ() {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, "_proxy") && value != "" {
+			proxies[strings.TrimSuffix(lower, "_proxy")] = value
+		}
+	}
+	for _, kv := range os.Environ() {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasSuffix(name, "_proxy") {
+			continue
+		}
+		key := strings.TrimSuffix(strings.ToLower(name), "_proxy")
+		if value != "" {
+			proxies[key] = value
+		} else {
+			delete(proxies, key)
+		}
+	}
+	return proxies
 }
 
 // formatMsg ports logplex.py:20-29 into the CLEAN frame (sanctioned
@@ -339,31 +455,39 @@ func pyStr(v any) string {
 }
 
 // pyRepr renders repr(value), used inside list/object interpolation. Strings
-// are single-quoted with the common escapes (Python's repr).
+// follow Python's repr exactly: single quotes unless the string contains a
+// single quote and no double quote (then double quotes), with backslash
+// escaping of the chosen quote, backslash, the short escapes \t \n \r, and
+// \xNN for every other control character (including NUL and DEL).
 func pyRepr(v any) string {
 	s, ok := v.(string)
 	if !ok {
 		return pyStr(v)
 	}
+	quote := byte('\'')
+	if strings.Contains(s, "'") && !strings.Contains(s, `"`) {
+		quote = '"'
+	}
 	var b strings.Builder
-	b.WriteByte('\'')
+	b.WriteByte(quote)
 	for _, r := range s {
-		switch r {
-		case '\\':
-			b.WriteString(`\\`)
-		case '\'':
-			b.WriteString(`\'`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
+		switch {
+		case r == rune(quote) || r == '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case r == '\t':
 			b.WriteString(`\t`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r < 0x20 || r == 0x7f:
+			_, _ = fmt.Fprintf(&b, `\x%02x`, r)
 		default:
 			b.WriteRune(r)
 		}
 	}
-	b.WriteByte('\'')
+	b.WriteByte(quote)
 	return b.String()
 }
 

@@ -330,14 +330,26 @@ func parseFrame(t *testing.T, frame string) frameFields {
 }
 
 // parseContent parses a length-prefix-free clean frame (the fixture's frames
-// are stored repr-stripped, without the prefix).
+// are stored repr-stripped, without the prefix). PRI and version are parsed
+// from the "<PRI>VERSION " head rather than assumed, so the fixture comparison
+// genuinely checks them.
 func parseContent(t *testing.T, content string) frameFields {
 	t.Helper()
-	const head = "<190>1 "
-	if !strings.HasPrefix(content, head) {
-		t.Fatalf("content %q does not start with %q", content, head)
+	if !strings.HasPrefix(content, "<") {
+		t.Fatalf("content %q does not start with '<'", content)
 	}
-	parts := strings.SplitN(content[len(head):], " ", 6)
+	gt := strings.IndexByte(content, '>')
+	if gt < 0 {
+		t.Fatalf("content %q has no '>'", content)
+	}
+	pri := content[1:gt]
+	rest := content[gt+1:]
+	sp := strings.IndexByte(rest, ' ')
+	if sp < 0 {
+		t.Fatalf("content %q has no version separator", content)
+	}
+	version := rest[:sp]
+	parts := strings.SplitN(rest[sp+1:], " ", 6)
 	if len(parts) != 6 {
 		t.Fatalf("content %q: %d space-separated fields, want 6", content, len(parts))
 	}
@@ -345,8 +357,8 @@ func parseContent(t *testing.T, content string) frameFields {
 		t.Fatalf("content %q: msgid/sd tail %q does not start with -", content, parts[5])
 	}
 	return frameFields{
-		pri:       "190",
-		version:   "1",
+		pri:       pri,
+		version:   version,
 		timestamp: parts[0],
 		hostname:  parts[1],
 		token:     parts[2],
@@ -372,6 +384,8 @@ func TestFixtureStructuralParity(t *testing.T) {
 	var fixture struct {
 		Frames  []string `json:"frames"`
 		Request struct {
+			Method  string            `json:"method"`
+			Path    string            `json:"path"`
 			Headers map[string]string `json:"headers"`
 		} `json:"request"`
 	}
@@ -381,13 +395,17 @@ func TestFixtureStructuralParity(t *testing.T) {
 	if len(fixture.Frames) == 0 {
 		t.Fatal("fixture has no frames")
 	}
-	if got := fixture.Request.Headers["content-type"]; got != "application/logplex-1" {
-		t.Fatalf("fixture content-type = %q", got)
+	if len(fixture.Request.Headers) == 0 {
+		t.Fatal("fixture request has no headers")
 	}
 
 	var body []byte
+	var captured http.Header
+	var method, path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ = io.ReadAll(r.Body)
+		captured = r.Header.Clone()
+		method, path = r.Method, r.URL.Path
 		w.WriteHeader(http.StatusInternalServerError) // status must still be ignored
 	}))
 	defer srv.Close()
@@ -418,23 +436,35 @@ func TestFixtureStructuralParity(t *testing.T) {
 	if strings.Contains(string(body), "b'") {
 		t.Fatalf("captured body reproduces the sanitized-away bytes-repr bug: %q", body)
 	}
+	// The captured request must match the fixture's request (method, path and
+	// every fixture header), not hard-coded constants.
+	if method != fixture.Request.Method || path != fixture.Request.Path {
+		t.Fatalf("captured %s %s, want %s %s", method, path, fixture.Request.Method, fixture.Request.Path)
+	}
+	for key, want := range fixture.Request.Headers {
+		if got := captured.Get(key); got != want {
+			t.Fatalf("captured header %s = %q, want %q", key, got, want)
+		}
+	}
 	got := parseFrames(t, body)
 	if len(got) != len(want) {
 		t.Fatalf("captured %d frames, want %d", len(got), len(want))
 	}
 	for i := range want {
 		g, w := got[i], want[i]
+		// Compare every non-clock field directly against the fixture's parsed
+		// values; the clock is the only field the capture cannot pin.
 		if g.pri != w.pri || g.version != w.version {
 			t.Fatalf("frame %d PRI/version = %q/%q, want %q/%q", i, g.pri, g.version, w.pri, w.version)
 		}
-		if g.hostname != "localhost" || g.pid != "localhost" {
-			t.Fatalf("frame %d hostname/pid = %q/%q, want localhost/localhost", i, g.hostname, g.pid)
+		if g.hostname != w.hostname || g.pid != w.pid {
+			t.Fatalf("frame %d hostname/pid = %q/%q, want %q/%q", i, g.hostname, g.pid, w.hostname, w.pid)
 		}
-		if g.token != "token" {
-			t.Fatalf("frame %d token = %q, want token", i, g.token)
+		if g.token != w.token {
+			t.Fatalf("frame %d token = %q, want %q", i, g.token, w.token)
 		}
-		if g.msgID != "-" || g.sd != "-" {
-			t.Fatalf("frame %d msgid/sd = %q/%q, want -/-", i, g.msgID, g.sd)
+		if g.msgID != w.msgID || g.sd != w.sd {
+			t.Fatalf("frame %d msgid/sd = %q/%q, want %q/%q", i, g.msgID, g.sd, w.msgID, w.sd)
 		}
 		if g.message != w.message {
 			t.Fatalf("frame %d message = %q, want %q", i, g.message, w.message)
@@ -471,6 +501,34 @@ func TestHostnamePIDFromExtras(t *testing.T) {
 			parsed := parseContent(t, mustCutPrefix(t, frame))
 			if parsed.hostname != tc.wantHost || parsed.pid != tc.wantPid {
 				t.Fatalf("hostname/pid = %q/%q, want %q/%q", parsed.hostname, parsed.pid, tc.wantHost, tc.wantPid)
+			}
+		})
+	}
+}
+
+// TestPyStrMatchesPython pins pyStr/pyRepr against Python str()/repr() for
+// container-valued _HOSTNAME/_PID extras: strings use Python's quote selection
+// (double quotes when the string contains ' and not ") and escape control
+// characters (\xNN) and backslashes rather than emitting them literally.
+func TestPyStrMatchesPython(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want string
+	}{
+		{"apostrophe selects double quotes", []any{"a'b"}, `["a'b"]`},
+		{"double quote keeps single", []any{`a"b`}, `['a"b']`},
+		{"both quotes keeps single", []any{`a'b"c`}, `['a\'b"c']`},
+		{"nul and apostrophe", []any{"a'b", "nul\x00"}, `["a'b", 'nul\x00']`},
+		{"control chars", []any{"tab\tend", "nl\nend", "cr\rend", "bell\x07", "del\x7f"}, `['tab\tend', 'nl\nend', 'cr\rend', 'bell\x07', 'del\x7f']`},
+		{"backslash", []any{`back\slash`}, `['back\\slash']`},
+		{"scalars", []any{1, 2.5, true, nil}, `[1, 2.5, True, None]`},
+		{"object", map[string]any{"k": "a'b"}, `{'k': "a'b"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pyStr(tc.in); got != tc.want {
+				t.Fatalf("pyStr(%#v) = %s, want %s", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -557,15 +615,27 @@ func TestStalledBodyTimesOut(t *testing.T) {
 }
 
 // TestResolvedTimeoutUsesSessionDefault: logplex_request_timeout = 0 (falsy)
-// must become requests' 60 s session default, not "no timeout".
+// must become requests' 60 s session default, not "no timeout". Only ZERO is
+// falsy here: a negative value is truthy in Python and is rejected at load.
 func TestResolvedTimeoutUsesSessionDefault(t *testing.T) {
 	for _, tc := range []struct {
 		in   float64
 		want time.Duration
-	}{{0, 60 * time.Second}, {-1, 60 * time.Second}, {2, 2 * time.Second}, {0.5, 500 * time.Millisecond}} {
+	}{{0, 60 * time.Second}, {2, 2 * time.Second}, {0.5, 500 * time.Millisecond}} {
 		if got := resolvedTimeout(tc.in); got != tc.want {
 			t.Fatalf("resolvedTimeout(%v) = %s, want %s", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestNegativeTimeoutRejected: a negative logplex_request_timeout is truthy in
+// Python, so TimeoutAdapter passes it through and requests raises "the timeout
+// cannot be set to a value less than or equal to 0"; Go rejects it at load.
+func TestNegativeTimeoutRejected(t *testing.T) {
+	cfg := baseConfig()
+	cfg["logplex_request_timeout"] = -1
+	if _, err := New(sender.ConstructorArgs{Name: "x", Config: cfg}); err == nil {
+		t.Fatal("New accepted a negative logplex_request_timeout; want an error")
 	}
 }
 
@@ -604,36 +674,107 @@ func TestIncrementalDeliveryExceedsTotalTimeout(t *testing.T) {
 	}
 }
 
-// TestProxyFromEnvironment: the production client honors HTTP_PROXY.
-func TestProxyFromEnvironment(t *testing.T) {
-	var proxied int32
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&proxied, 1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer proxy.Close()
-	t.Setenv("HTTP_PROXY", proxy.URL)
-	t.Setenv("http_proxy", "")
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
+// proxyEnvVars is every proxy-related variable the selector reads.
+var proxyEnvVars = []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
 
-	cfg := baseConfig()
-	cfg["logplex_log_input_url"] = "http://logplex.invalid/input"
-	inst, err := New(sender.ConstructorArgs{Name: "x", Config: cfg})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+// syncProxyEnv UNSETS every proxy variable (restoring them at cleanup) and
+// then sets exactly the requested ones, so a proxy test is independent of the
+// ambient environment. Unsetting — rather than setting to "" — matters: an
+// empty lowercase http_proxy removes the entry in requests, so it must only be
+// present when a test deliberately supplies it.
+func syncProxyEnv(t *testing.T, vars map[string]string) {
+	t.Helper()
+	for _, name := range proxyEnvVars {
+		name := name
+		old, had := os.LookupEnv(name)
+		t.Cleanup(func() {
+			if had {
+				_ = os.Setenv(name, old)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
 	}
-	s := inst.Transport.(*Sender)
-	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err != nil {
-		t.Fatalf("SendMessages through the proxy: %v", err)
-	}
-	if atomic.LoadInt32(&proxied) != 1 {
-		t.Fatalf("proxy hits = %d, want 1", proxied)
+	for name, value := range vars {
+		if err := os.Setenv(name, value); err != nil {
+			t.Fatalf("set %s: %v", name, err)
+		}
 	}
 }
 
-// TestNoProxyBypass: NO_PROXY bypasses the proxy for matching hosts.
-func TestNoProxyBypass(t *testing.T) {
+// TestProxySelectionMatchesRequests unit-tests the requests-faithful selector:
+// a lowercase http_proxy wins over an uppercase HTTP_PROXY (and an empty
+// lowercase value removes the entry), and ALL_PROXY is the scheme fallback.
+func TestProxySelectionMatchesRequests(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "http://logplex.example.invalid/input", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string // "" means no proxy
+	}{
+		{"uppercase only", map[string]string{"HTTP_PROXY": "http://up:1"}, "http://up:1"},
+		{"lowercase wins", map[string]string{"http_proxy": "http://lo:1", "HTTP_PROXY": "http://up:1"}, "http://lo:1"},
+		{"empty lowercase removes", map[string]string{"HTTP_PROXY": "http://up:1", "http_proxy": ""}, ""},
+		{"ALL_PROXY fallback", map[string]string{"ALL_PROXY": "http://all:1"}, "http://all:1"},
+		{"scheme beats ALL_PROXY", map[string]string{"HTTP_PROXY": "http://up:1", "ALL_PROXY": "http://all:1"}, "http://up:1"},
+		{"none", map[string]string{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			syncProxyEnv(t, tc.env)
+			got, err := proxyForRequest(req)
+			if err != nil {
+				t.Fatalf("proxyForRequest: %v", err)
+			}
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("proxy = %v, want none", got)
+				}
+				return
+			}
+			if got == nil || got.String() != tc.want {
+				t.Fatalf("proxy = %v, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNoProxySelection: no_proxy (lowercase-first) bypasses matching hosts.
+func TestNoProxySelection(t *testing.T) {
+	bypassed := func(url string, env map[string]string) bool {
+		t.Helper()
+		syncProxyEnv(t, env)
+		req, err := http.NewRequest(http.MethodPost, url, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		got, err := proxyForRequest(req)
+		if err != nil {
+			t.Fatalf("proxyForRequest: %v", err)
+		}
+		return got == nil
+	}
+	if !bypassed("http://logplex.example.invalid/input", map[string]string{"HTTP_PROXY": "http://up:1", "no_proxy": "logplex.example.invalid"}) {
+		t.Fatal("no_proxy hostname match did not bypass")
+	}
+	if bypassed("http://logplex.example.invalid/input", map[string]string{"HTTP_PROXY": "http://up:1"}) {
+		t.Fatal("a non-loopback target with a proxy set was bypassed; loopback is not special-cased")
+	}
+	if !bypassed("http://127.0.0.1/input", map[string]string{"HTTP_PROXY": "http://up:1", "NO_PROXY": "127.0.0.1"}) {
+		t.Fatal("NO_PROXY=127.0.0.1 did not bypass a loopback target")
+	}
+}
+
+// TestProxyUsedForLoopbackTarget is the non-vacuous loopback control: unlike
+// net/http.ProxyFromEnvironment, the requests-faithful selector does NOT bypass
+// loopback, so a loopback target IS proxied when no no_proxy matches.
+func TestProxyUsedForLoopbackTarget(t *testing.T) {
 	var proxied, direct int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&proxied, 1)
@@ -645,20 +786,44 @@ func TestNoProxyBypass(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer target.Close()
-	t.Setenv("HTTP_PROXY", proxy.URL)
-	t.Setenv("http_proxy", "")
-	t.Setenv("NO_PROXY", "127.0.0.1")
-	t.Setenv("no_proxy", "")
+	syncProxyEnv(t, map[string]string{"HTTP_PROXY": proxy.URL})
 
 	s := productionSender(t, target.URL, 2)
 	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err != nil {
 		t.Fatalf("SendMessages: %v", err)
 	}
-	if atomic.LoadInt32(&proxied) != 0 {
-		t.Fatalf("proxy hits = %d, want 0 (NO_PROXY bypass)", proxied)
+	if atomic.LoadInt32(&proxied) != 1 || atomic.LoadInt32(&direct) != 0 {
+		t.Fatalf("proxied/direct = %d/%d, want 1/0 (loopback must be proxied)", proxied, direct)
 	}
-	if atomic.LoadInt32(&direct) != 1 {
-		t.Fatalf("direct hits = %d, want 1", direct)
+}
+
+// TestNoProxyBypass: no_proxy matching a non-loopback target bypasses the
+// proxy, so the request is attempted directly (and fails DNS); the proxy sees
+// nothing. The negative control (proxy IS used without no_proxy) is covered by
+// TestProxyUsedForLoopbackTarget.
+func TestNoProxyBypass(t *testing.T) {
+	var proxied int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&proxied, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+	syncProxyEnv(t, map[string]string{"HTTP_PROXY": proxy.URL, "NO_PROXY": "logplex.example.invalid"})
+
+	cfg := baseConfig()
+	cfg["logplex_log_input_url"] = "http://logplex.example.invalid/input"
+	inst, err := New(sender.ConstructorArgs{Name: "x", Config: cfg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := inst.Transport.(*Sender)
+	// The direct attempt cannot resolve the non-loopback host, so an error is
+	// expected; what matters is that the proxy was not used.
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err == nil {
+		t.Fatal("SendMessages against an unresolvable non-loopback host succeeded; want a direct-connect error")
+	}
+	if atomic.LoadInt32(&proxied) != 0 {
+		t.Fatalf("proxy hits = %d, want 0 (no_proxy bypass)", proxied)
 	}
 }
 
