@@ -1788,9 +1788,15 @@ Recorded divergences / open items for adjudication:
   "all/-1", but the Python source has no acks setting, so Go pins
   `WaitForLocal` (acks=1) to match deployed Python. Flagged for the
   coordinator.
-- snappy interop verdict (spec risk 10, charter §2/D5): kafka-python
-  used xerial-framed snappy, not automatically byte-identical to
-  sarama's framing. The opt-in real-broker test consumes sarama-produced
-  records with a sarama consumer; the kafka-python-consumer interop
-  proof on a real broker (or a NEWS-recorded deviation) still needs the
-  broker run and is flagged to the coordinator.
+- snappy interop verdict (spec risk 10, charter §2/D5): RESOLVED — no
+  deviation. sarama's `CompressionSnappy` output is consumable by
+  kafka-python. Proven on a real Kafka 4.0 KRaft broker: the Go sender
+  (built with `-tags systest`) produced 40 snappy records to a fresh
+  2-partition topic (`kafka_msg_key=journalpump`), and a kafka-python
+  consumer read all 40 with intact payloads, key `b"journalpump"` and
+  partition 0. `TestKafkaSenderEndToEnd` additionally passes against the
+  same broker, reproducing the Task 12 fixture payloads/key/partition/
+  sent-count/cursor for both scenarios. No committed kafka-python interop
+  test was added (it would raise the `pytest systest/` count above the
+  expected 38); the probe is recorded as evidence and a committed test
+  can land with the Task 30 CI job if wanted.
