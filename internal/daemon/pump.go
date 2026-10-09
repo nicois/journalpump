@@ -428,6 +428,10 @@ type ReaderRuntime struct {
 
 	muCursor sync.Mutex
 	cursor   string // "" = Python None
+	// resumeCursor is the cursor the reader was constructed with (the
+	// state-file resume position); it seeds each sender loop's durable
+	// baseline so the delivery-checkpoint cursor never regresses below it.
+	resumeCursor string
 
 	// hitsDirty marks the read_messages recording points for the
 	// supervisor's merge (Python's `hits` dict, journalpump.py:1046-1047).
@@ -504,6 +508,7 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 		resolved:            make([]resolvedSender, 0, len(cfg.Senders)),
 		readyFlag:           true, // journalpump.py:186
 		cursor:              cursor,
+		resumeCursor:        cursor,
 	}
 
 	rt.stats = reader.NewStats(name, taggedReader.MakeTags(nil), p.stats, log, func() {
@@ -641,6 +646,16 @@ func (rt *ReaderRuntime) setCursor(cursor string) {
 // happens only after a successful open (updateStatus) — Python clears
 // self.initial_position after ANY successful get_reader
 // (journalpump.py:476-478) and retries failed opens with it intact.
+// resumeCursorPtr returns the reader's resume cursor as a pointer, or nil
+// for the empty (Python None) position.
+func (rt *ReaderRuntime) resumeCursorPtr() *string {
+	if rt.resumeCursor == "" {
+		return nil
+	}
+	cursor := rt.resumeCursor
+	return &cursor
+}
+
 func (rt *ReaderRuntime) takeInitial() reader.InitialPosition {
 	if !rt.initialSet {
 		return reader.InitialPosition{}
@@ -780,6 +795,9 @@ func (rt *ReaderRuntime) initSenders() {
 			Tags:  rt.senderTags(resolved.name),
 			Log:   rt.pump.log,
 		}, inst, buf.Chan())
+		// Delivery-checkpoint baseline: a durable sender's persisted
+		// cursor must not regress below the position this run resumed from.
+		loop.SetResumeCursor(rt.resumeCursorPtr())
 		buf.Attach(loop)
 		if inst.ConnectOnInit {
 			// The file sender opens its output and marks itself
@@ -1294,9 +1312,11 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 // (Python's sigterm handler would crash there), the joined reader
 // errors (a cancellation must not mask a reader failure), the joined
 // sender errors, and a failed final flush. A failed final delivery is
-// surfaced as an error and its sent cursor is rolled back to the last
-// persisted state, so the state file never claims undelivered bytes
-// were delivered (see the flush ordering below).
+// surfaced as an error; the persisted sent cursor of a checkpointed
+// (durable) sender already lags to the flushed boundary, while a
+// non-checkpointed buffered sender is rolled back to the last persisted
+// state (see the flush ordering below) — so the state file never claims
+// undelivered bytes were delivered.
 func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() error) error {
 	// The STOPPING notification error is preserved as Run's result but
 	// must NOT skip cleanup: Python's sigterm handler would crash the
@@ -1360,7 +1380,15 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 			p.log.Printf("Final delivery failed for sender %q: %v", l.entry.name, err)
 			l.entry.loop.MarkDisconnected(err)
 			flushErr = errors.Join(flushErr, fmt.Errorf("sender %q final flush: %w", l.entry.name, err))
-			flushFailures = append(flushFailures, flushFailure{reader: l.reader, name: l.entry.name})
+			// A checkpointed (durable) sender's cursor ALREADY lags to
+			// the flushed boundary, so the failed flush is reflected in
+			// its State() without any rollback — the interpreter's second
+			// contract must not double-correct it. Non-checkpointed
+			// buffered senders keep the interim rollback to the last
+			// persisted state.
+			if _, durable := l.entry.inst.Transport.(sender.DurableReporter); !durable {
+				flushFailures = append(flushFailures, flushFailure{reader: l.reader, name: l.entry.name})
+			}
 		}
 	}
 

@@ -78,6 +78,31 @@ type Finalizer interface {
 	Finalize() error
 }
 
+// Discarder is an OPTIONAL transport capability (Task 17 reload): release
+// the sink WITHOUT flushing buffered-but-unpersisted output, so retiring
+// a reader on reload drops exactly the lines the delivery checkpoint
+// never claimed (Python's request_stop drops the old SenderThread's
+// buffered messages the same way).
+type Discarder interface {
+	CloseDiscarding() error
+}
+
+// DurableReporter is an OPTIONAL transport capability — the delivery
+// checkpoint (Task 17, user-approved deviation): FlushedPayloadBytes
+// reports the cumulative payload bytes that have reached the durable
+// sink, a PREFIX watermark of the payload bytes accepted by
+// SendMessages (the sink may buffer, so this lags the logical send
+// position until a flush boundary). When a transport implements it, the
+// persisted sent cursor lags to this durable boundary instead of the
+// send-completion position, so the state file never claims undelivered
+// bytes; a failed final flush leaves the cursor at the last durable
+// boundary and a restart replays the unflushed tail (no gaps, at most a
+// duplicate tail — the chosen trade-off: durable delivery, not send()
+// completion).
+type DurableReporter interface {
+	FlushedPayloadBytes() int64
+}
+
 // Classifier is the per-sender retriable(error) seam — the Go
 // equivalent of Python's per-sender except-clauses
 // (e.g. kafka_sender's KAFKA_CONN_ERRORS set). The loop routes a
@@ -254,6 +279,20 @@ type Loop struct {
 	bufferCursor json.RawMessage
 	bufferEntry  int64
 	bufferBytes  int64
+	// durable is the transport's delivery-checkpoint reporter when it
+	// implements DurableReporter, else nil.
+	durable DurableReporter
+	// durableCursor is the last cursor whose payload bytes have flushed. It
+	// is seeded with the resume cursor the reader started from (so it never
+	// regresses below that before new durable progress) and is sticky
+	// across State() calls, so a later call with no new acks does not lose
+	// the position after the acked entries below are consumed. Guarded by
+	// mu.
+	durableCursor *string
+	// acked records the acked items' cumulative payload byte ends and
+	// cursors, so State can map the transport's flushed watermark back to
+	// a cursor (only maintained when durable != nil). Guarded by mu.
+	acked []ackedItem
 	// held is the not-yet-acked tail of the current drain (retry from
 	// its head on the next flush); loop-goroutine only.
 	held []Item
@@ -263,6 +302,18 @@ type Loop struct {
 	// reset. Set before Run; loop-goroutine only.
 	onDequeue func([]Item)
 }
+
+// ackedItem is one acked item's cumulative payload end and cursor.
+type ackedItem struct {
+	payloadEnd int64
+	cursor     string
+}
+
+// SetResumeCursor seeds the durable-cursor baseline with the cursor the
+// reader resumed from. Must be called before Run; the baseline keeps the
+// persisted cursor from regressing below the pre-run position while the
+// first new items are still unflushed.
+func (l *Loop) SetResumeCursor(cursor *string) { l.durableCursor = cursor }
 
 // MaxSendInterval reports the sender's configured idle-flush interval
 // (Python max_send_interval). The supervisor's shutdown grace window
@@ -301,6 +352,10 @@ func NewLoop(cfg LoopConfig, inst Instance, in <-chan Item) *Loop {
 	if classifier == nil {
 		classifier = defaultClassifier{}
 	}
+	var durable DurableReporter
+	if dr, ok := inst.Transport.(DurableReporter); ok {
+		durable = dr
+	}
 	return &Loop{
 		cfg:              cfg,
 		inst:             inst,
@@ -312,6 +367,7 @@ func NewLoop(cfg LoopConfig, inst Instance, in <-chan Item) *Loop {
 		maintenanceRetry: MaintenanceFailRetry,
 		maxBatchSize:     maxBatchSize,
 		messageOverhead:  overhead,
+		durable:          durable,
 		running:          true, // base.py __init__: self.running = True
 		connectedChanged: time.Now(),
 		lastSend:         time.Now(),
@@ -586,6 +642,9 @@ func (l *Loop) markSent(batch []Item) {
 	l.sentCount += int64(len(batch))
 	for _, item := range batch {
 		l.sentBytes += int64(len(item.Payload))
+		if l.durable != nil {
+			l.acked = append(l.acked, ackedItem{payloadEnd: l.sentBytes, cursor: item.Cursor})
+		}
 	}
 	cursor := batch[len(batch)-1].Cursor
 	l.sentCursor = &cursor
@@ -643,6 +702,12 @@ func (l *Loop) State() state.SenderState {
 	defer l.mu.Unlock()
 	running, connected := l.running, l.connected
 	status := health(running, connected)
+	sentCursor := l.sentCursor
+	if l.durable != nil {
+		// Delivery checkpoint: the persisted cursor is the durable
+		// (flushed) boundary, lagging the logical send position.
+		sentCursor = l.durableCursorLocked()
+	}
 	return state.SenderState{
 		Type: l.inst.Type,
 		Buffer: state.BufferState{
@@ -652,7 +717,7 @@ func (l *Loop) State() state.SenderState {
 			CurrentQueue: int64(len(l.in)),
 		},
 		Sent: state.SentState{
-			Cursor: l.sentCursor,
+			Cursor: sentCursor,
 			Count:  l.sentCount,
 			Bytes:  l.sentBytes,
 		},
@@ -680,6 +745,28 @@ func (l *Loop) RefreshStats() {
 	l.cfg.Stats.GaugeInt("journal.sent_bytes", sentBytes, tags)
 	l.cfg.Stats.GaugeInt("journal.sent_lines", sentCount, tags)
 	l.cfg.Stats.GaugeInt("journal.status", int64(health(running, connected).gauge), tags)
+}
+
+// durableCursorLocked maps the transport's flushed payload watermark to
+// the cursor of the last acked item whose payload bytes have reached the
+// durable sink, falling back to the resume baseline before any new item
+// is durable. Consumed entries are dropped so the tracking stays bounded
+// by the unflushed tail. Caller holds l.mu.
+func (l *Loop) durableCursorLocked() *string {
+	flushed := l.durable.FlushedPayloadBytes()
+	consumed := 0
+	for _, item := range l.acked {
+		if item.payloadEnd > flushed {
+			break
+		}
+		c := item.cursor
+		l.durableCursor = &c
+		consumed++
+	}
+	if consumed > 0 {
+		l.acked = append(l.acked[:0], l.acked[consumed:]...)
+	}
+	return l.durableCursor
 }
 
 // rawString renders a cursor string as raw JSON bytes for the

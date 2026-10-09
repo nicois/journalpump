@@ -613,6 +613,105 @@ func TestCursorAdvanceOnAckOnly(t *testing.T) {
 	})
 }
 
+// durableFakeTransport mimics the file sender's delivery checkpoint at
+// the loop layer: it acks batches (logical send() completion), reports a
+// controllable flushed watermark, and exposes the logical payload total.
+type durableFakeTransport struct {
+	mu      sync.Mutex
+	logical int64
+	flushed int64
+}
+
+func (d *durableFakeTransport) SendMessages(_ context.Context, batch [][]byte, _ string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, m := range batch {
+		d.logical += int64(len(m))
+	}
+	return nil
+}
+
+func (d *durableFakeTransport) MaintenanceOperations(context.Context) error { return nil }
+
+func (d *durableFakeTransport) FlushedPayloadBytes() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.flushed
+}
+
+func (d *durableFakeTransport) setFlushed(n int64) {
+	d.mu.Lock()
+	d.flushed = n
+	d.mu.Unlock()
+}
+
+// TestDurableCursorTracksFlushedWatermark locks the delivery-checkpoint
+// mapping (Task 17): for a DurableReporter transport, the sender's
+// reported sent cursor is the cursor of the last acked item whose payload
+// bytes have actually flushed, lagging the logical mark_sent position
+// until the bytes reach the sink.
+func TestDurableCursorTracksFlushedWatermark(t *testing.T) {
+	t.Parallel()
+	tr := &durableFakeTransport{}
+	loop := NewLoop(
+		LoopConfig{Name: "out"},
+		Instance{Transport: tr, MaxSendInterval: time.Hour, Type: "DurableSender"},
+		make(chan Item, 8),
+	)
+
+	// "a" then "bb": logical payload ends are 1 and 3.
+	loop.markSent([]Item{
+		{Payload: []byte("a"), Cursor: "c0"},
+		{Payload: []byte("bb"), Cursor: "c1"},
+	})
+
+	// Nothing flushed: no durable cursor yet (no resume baseline either),
+	// even though mark_sent already moved the logical cursor to c1.
+	if cur := loop.State().Sent.Cursor; cur != nil {
+		t.Fatalf("durable cursor = %v, want nil before any flush", *cur)
+	}
+
+	// The first line's bytes are durable, the second's are not: the cursor
+	// stops at c0 rather than skipping ahead to the logical c1.
+	tr.setFlushed(1)
+	if cur := loop.State().Sent.Cursor; cur == nil || *cur != "c0" {
+		t.Fatalf("durable cursor = %v, want c0", cur)
+	}
+
+	// The full payload is durable: the cursor catches up to c1.
+	tr.setFlushed(3)
+	if cur := loop.State().Sent.Cursor; cur == nil || *cur != "c1" {
+		t.Fatalf("durable cursor = %v, want c1", cur)
+	}
+}
+
+// TestDurableCursorNeverRegressesBelowBaseline locks the resume-cursor
+// baseline: before ANY new item is durable, the persisted cursor stays at
+// the position the run resumed from (never nil/older), so a save during
+// the unflushed window cannot force a full resync on restart.
+func TestDurableCursorNeverRegressesBelowBaseline(t *testing.T) {
+	t.Parallel()
+	tr := &durableFakeTransport{}
+	loop := NewLoop(
+		LoopConfig{Name: "out"},
+		Instance{Transport: tr, MaxSendInterval: time.Hour, Type: "DurableSender"},
+		make(chan Item, 8),
+	)
+	baseline := "resume"
+	loop.SetResumeCursor(&baseline)
+
+	loop.markSent([]Item{{Payload: []byte("a"), Cursor: "c0"}})
+	if cur := loop.State().Sent.Cursor; cur == nil || *cur != "resume" {
+		t.Fatalf("durable cursor = %v, want resume (baseline)", cur)
+	}
+
+	// Once the new item is durable the cursor advances past the baseline.
+	tr.setFlushed(1)
+	if cur := loop.State().Sent.Cursor; cur == nil || *cur != "c0" {
+		t.Fatalf("durable cursor = %v, want c0", cur)
+	}
+}
+
 func TestLoopState(t *testing.T) {
 	t.Parallel()
 

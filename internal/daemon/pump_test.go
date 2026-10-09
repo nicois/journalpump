@@ -25,6 +25,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/reader"
 	"github.com/Aiven-Open/journalpump/internal/sender"
+	senderfile "github.com/Aiven-Open/journalpump/internal/sender/file"
 	"github.com/Aiven-Open/journalpump/internal/state"
 )
 
@@ -152,6 +153,24 @@ func registerFakeSenders() {
 				ConnectOnInit:   true,
 			}, nil
 		})
+		// durable exposes the delivery-checkpoint contract (DurableReporter
+		// + Finalizer) with a controllable flush.
+		sender.Register("durable", func(sender.ConstructorArgs) (sender.Instance, error) {
+			tr := &durableTransport{}
+			durableMu.Lock()
+			durableSent = tr
+			durableMu.Unlock()
+			return sender.Instance{
+				Transport:       tr,
+				MaxSendInterval: 50 * time.Millisecond,
+				Type:            "DurableSender",
+				ConnectOnInit:   true,
+			}, nil
+		})
+		// file is the production file sender, registered so the reload
+		// retire path can be exercised against the real Discarder
+		// (CloseDiscarding) implementation.
+		sender.Register("file", senderfile.New)
 	})
 }
 
@@ -252,6 +271,77 @@ func gatedTransportRef() *gatedTransport {
 	gatedMu.Lock()
 	defer gatedMu.Unlock()
 	return gatedSent
+}
+
+// durableTransport models a sender with the file sender's delivery
+// checkpoint: SendMessages only records the logical payload total,
+// FlushedPayloadBytes reports the durable watermark (advancing on a
+// successful Finalize), and Finalize can be made to fail. It lets the
+// daemon tests exercise the persisted-cursor-is-the-flushed-boundary
+// contract without real files.
+type durableTransport struct {
+	mu       sync.Mutex
+	logical  int64
+	flushed  int64
+	flushErr error
+}
+
+func (d *durableTransport) SendMessages(_ context.Context, batch [][]byte, _ string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, m := range batch {
+		d.logical += int64(len(m))
+	}
+	return nil
+}
+
+func (d *durableTransport) MaintenanceOperations(context.Context) error { return nil }
+
+func (d *durableTransport) FlushedPayloadBytes() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.flushed
+}
+
+func (d *durableTransport) Finalize() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.flushErr != nil {
+		return d.flushErr
+	}
+	d.flushed = d.logical
+	return nil
+}
+
+func (d *durableTransport) setFlushed(n int64) {
+	d.mu.Lock()
+	d.flushed = n
+	d.mu.Unlock()
+}
+
+func (d *durableTransport) setFlushErr(err error) {
+	d.mu.Lock()
+	d.flushErr = err
+	d.mu.Unlock()
+}
+
+func (d *durableTransport) logicalBytes() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.logical
+}
+
+// durableSent is the transport built for the most recent "durable"
+// construction; the checkpoint tests read and steer it.
+var (
+	durableMu   sync.Mutex
+	durableSent *durableTransport
+)
+
+func durableTransportRef() *durableTransport {
+	durableMu.Lock()
+	defer durableMu.Unlock()
+	return durableSent
 }
 
 // captureLog records the pump's log lines for assertion.
@@ -1154,6 +1244,262 @@ func TestFailedFinalFlushRollsBackState(t *testing.T) {
 			t.Errorf("persisted sent cursor = %v, want nil", got)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// delivery checkpoint (durable sender cursor)
+
+// liveSenderByName returns the live sender entry for reader/name.
+func liveSenderByName(t *testing.T, p *Pump, reader, name string) *senderEntry {
+	t.Helper()
+	p.senderMu.Lock()
+	defer p.senderMu.Unlock()
+	for _, e := range p.senders[reader] {
+		if e.name == name {
+			return e
+		}
+	}
+	t.Fatalf("sender %s/%s not found", reader, name)
+	return nil
+}
+
+// stopSendersNow cancels and joins every live sender immediately. Used as
+// a defer inside synctest bubbles so a failing assertion cannot leave a
+// sender goroutine blocked and deadlock the bubble during teardown.
+func stopSendersNow(p *Pump) {
+	p.senderMu.Lock()
+	var entries []*senderEntry
+	for _, es := range p.senders {
+		entries = append(entries, es...)
+	}
+	p.senderMu.Unlock()
+	for _, e := range entries {
+		if e.cancel != nil {
+			e.cancel()
+		}
+	}
+	_ = p.senderGroup.Wait()
+}
+
+// waitSent advances time until the named sender has acked want messages
+// (mark_sent ran), so the durable-cursor mapping has items to map.
+func waitSent(t *testing.T, p *Pump, reader, name string, want int64) {
+	t.Helper()
+	for i := 0; i < 400; i++ {
+		time.Sleep(5 * time.Millisecond)
+		if got := liveSenderByName(t, p, reader, name).loop.State().Sent.Count; got >= want {
+			return
+		}
+	}
+	t.Fatalf("sender %s/%s never acked %d messages", reader, name, want)
+}
+
+// processEntries feeds entries through the reader runtime's handler, so
+// they land in the running senders' buffers.
+func processEntries(t *testing.T, rt *ReaderRuntime, cursors ...string) {
+	t.Helper()
+	for _, c := range cursors {
+		entry := journal.Entry{Cursor: c, Fields: []journal.Field{{Key: "MESSAGE", Value: c}}}
+		if _, _, _, err := rt.process(context.Background(), entry); err != nil {
+			t.Fatalf("process %s: %v", c, err)
+		}
+	}
+}
+
+// persistedSenderCursor reads the state file's sent cursor for a sender.
+func persistedSenderCursor(t *testing.T, statePath, reader, name string) *string {
+	t.Helper()
+	st, err := state.Read(statePath)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	rs := st.Readers[reader]
+	if rs == nil {
+		t.Fatalf("reader %s missing from state", reader)
+	}
+	for i := range rs.Senders {
+		if rs.Senders[i].Name == name {
+			return rs.Senders[i].State.Sent.Cursor
+		}
+	}
+	t.Fatalf("sender %s missing from state", name)
+	return nil
+}
+
+// TestDurableShutdownFlushAdvancesCursor locks the happy path: while the
+// lines are buffered the durable cursor is pinned at the resume baseline
+// even though mark_sent advanced the logical position; a successful
+// shutdown flush (D9) advances the persisted cursor to the full sent
+// position.
+func TestDurableShutdownFlushAdvancesCursor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{
+			"r": fakeReaderConfig(map[string]any{"s": map[string]any{"output_type": "durable"}}),
+		})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfg.JSONStateFilePath = statePath
+		p, rt := newTestRuntime(t, cfg, &captureLog{})
+		p.statePath = statePath
+		rt.resumeCursor = "resume"
+		rt.initSenders()
+		defer stopSendersNow(p)
+
+		processEntries(t, rt, "c1", "c2")
+		waitSent(t, p, "r", "s", 2)
+
+		// Logical position reached, nothing flushed: the durable cursor
+		// is pinned at the resume baseline, not the logical c2.
+		if cur := liveSenderByName(t, p, "r", "s").loop.State().Sent.Cursor; cur == nil || *cur != "resume" {
+			t.Fatalf("pre-flush durable cursor = %v, want resume", cur)
+		}
+
+		if err := p.shutdown(func() {}, func() error { return nil }); err != nil {
+			t.Fatalf("shutdown: %v", err)
+		}
+		if cur := persistedSenderCursor(t, statePath, "r", "s"); cur == nil || *cur != "c2" {
+			t.Fatalf("persisted cursor after a successful shutdown flush = %v, want c2", cur)
+		}
+	})
+}
+
+// TestDurableFailedFlushAfterPeriodicSaveResumesFromFlushedBoundary locks
+// the restart contract: a periodic save persisted the flushed boundary
+// (c1); a later line (c2) is sent but never flushed, and the final flush
+// fails. The persisted cursor must stay at the flushed boundary c1 — so a
+// restart RESUMES from c1 and replays c2, never skipping it.
+func TestDurableFailedFlushAfterPeriodicSaveResumesFromFlushedBoundary(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{
+			"r": fakeReaderConfig(map[string]any{"s": map[string]any{"output_type": "durable"}}),
+		})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfg.JSONStateFilePath = statePath
+		p, rt := newTestRuntime(t, cfg, &captureLog{})
+		p.statePath = statePath
+		rt.resumeCursor = "resume"
+		rt.initSenders()
+		defer stopSendersNow(p)
+		tr := durableTransportRef()
+
+		processEntries(t, rt, "c1")
+		waitSent(t, p, "r", "s", 1)
+		// The first line's bytes reached the sink (buffer auto-flush).
+		tr.setFlushed(tr.logicalBytes())
+		if cur := liveSenderByName(t, p, "r", "s").loop.State().Sent.Cursor; cur == nil || *cur != "c1" {
+			t.Fatalf("durable cursor after the first flush = %v, want c1", cur)
+		}
+		// A periodic save persists that flushed boundary.
+		if err := p.saveState(); err != nil {
+			t.Fatalf("saveState: %v", err)
+		}
+		if cur := persistedSenderCursor(t, statePath, "r", "s"); cur == nil || *cur != "c1" {
+			t.Fatalf("persisted cursor after the periodic save = %v, want c1", cur)
+		}
+
+		// A second line is accepted but never flushed.
+		processEntries(t, rt, "c2")
+		waitSent(t, p, "r", "s", 2)
+		tr.setFlushErr(errors.New("flush boom"))
+
+		err := p.shutdown(func() {}, func() error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "flush boom") {
+			t.Fatalf("shutdown err = %v, want the flush error", err)
+		}
+
+		// No rollback for a durable sender: its cursor already lagged to
+		// the flushed boundary.
+		if cur := persistedSenderCursor(t, statePath, "r", "s"); cur == nil || *cur != "c1" {
+			t.Fatalf("persisted cursor after the failed flush = %v, want c1", cur)
+		}
+		// Restarting resumes from c1 (replaying c2): no skip.
+		st, readErr := state.Read(statePath)
+		if readErr != nil {
+			t.Fatalf("read state: %v", readErr)
+		}
+		resume, resumeErr := state.ResumeCursor(st.Readers["r"], "r", nil)
+		if resumeErr != nil {
+			t.Fatalf("ResumeCursor: %v", resumeErr)
+		}
+		if resume == nil || *resume != "c1" {
+			t.Fatalf("restart resumes from %v, want c1", resume)
+		}
+	})
+}
+
+// TestDurableFailedFlushBeforeFirstSaveShowsPreRunPosition locks the
+// no-progress case: a failed flush BEFORE any periodic save leaves the
+// persisted cursor at the PRE-RUN position (the resume baseline), so the
+// state file never claims delivery that did not happen.
+func TestDurableFailedFlushBeforeFirstSaveShowsPreRunPosition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{
+			"r": fakeReaderConfig(map[string]any{"s": map[string]any{"output_type": "durable"}}),
+		})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfg.JSONStateFilePath = statePath
+		p, rt := newTestRuntime(t, cfg, &captureLog{})
+		p.statePath = statePath
+		rt.resumeCursor = "resume"
+		rt.initSenders()
+		defer stopSendersNow(p)
+		durableTransportRef().setFlushErr(errors.New("flush boom"))
+
+		processEntries(t, rt, "c1")
+		waitSent(t, p, "r", "s", 1)
+
+		err := p.shutdown(func() {}, func() error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "flush boom") {
+			t.Fatalf("shutdown err = %v, want the flush error", err)
+		}
+		if cur := persistedSenderCursor(t, statePath, "r", "s"); cur == nil || *cur != "resume" {
+			t.Fatalf("persisted cursor after an unflushed run = %v, want resume", cur)
+		}
+	})
+}
+
+// TestReloadRetireDiscardsUnflushedFileTail locks the reload/restart
+// interaction with the real file sender: a line acked into the file
+// sender's buffer (not yet on disk) is DROPPED when a SIGHUP reload
+// retires the reader (sender.Discarder → CloseDiscarding), so the reload
+// never delivers a line the persisted cursor does not cover.
+func TestReloadRetireDiscardsUnflushedFileTail(t *testing.T) {
+	registerFakeSenders()
+	overrideReopener(t)
+	outPath := filepath.Join(t.TempDir(), "out.log")
+	initial := decodeConfig(t, fmt.Sprintf(`{"readers":{"r1":{"senders":{"s":{"output_type":"file","file_output":%q}}}}}`, outPath))
+	updated := decodeConfig(t, fmt.Sprintf(`{"readers":{"r2":{"senders":{"s":{"output_type":"file","file_output":%q}}}}}`, outPath))
+	p, err := NewPump(initial, PumpDeps{Log: &captureLog{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel := startReaderGroup(p)
+	defer cancel()
+
+	rt := p.readers[0]
+	rt.initSenders()
+	rt.journaldReader = &fakeReader{}
+	processEntries(t, rt, "c1")
+	waitSent(t, p, "r1", "s", 1)
+
+	// The line is acked but still buffered, not on disk.
+	if info, statErr := os.Stat(outPath); statErr != nil {
+		t.Fatalf("stat: %v", statErr)
+	} else if info.Size() != 0 {
+		t.Fatalf("unflushed tail visible on disk: size = %d", info.Size())
+	}
+
+	// A changed readers blob retires r1 and its file sender.
+	if err := p.handleNewConfig(updated); err != nil {
+		t.Fatalf("handleNewConfig: %v", err)
+	}
+	// The unclaimed tail must be discarded, not flushed: a replay after
+	// the reload is then safe (no duplicate, no gap).
+	if info, statErr := os.Stat(outPath); statErr != nil {
+		t.Fatalf("stat after reload: %v", statErr)
+	} else if info.Size() != 0 {
+		t.Errorf("reload retire flushed the unclaimed tail: size = %d", info.Size())
+	}
+	retireAll(p)
 }
 
 // ---------------------------------------------------------------------------

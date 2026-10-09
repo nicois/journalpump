@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Aiven-Open/journalpump/internal/sender"
@@ -34,11 +36,52 @@ const pythonBufferSize = 131072
 // The handle is opened once at construction and outlives the scope by
 // design — every send writes to it (file.py:9-10). Writes go through a
 // BufferedWriter-equivalent buffer (Python's open "ab" semantics); the
-// only explicit flush happens on Close during the D9 shutdown grace
-// window.
+// only explicit flush happens at Finalize/Close, and the buffer also
+// auto-flushes when it fills (bufio semantics, like Python's
+// BufferedWriter).
+//
+// Delivery checkpoint (Task 17, user-approved deviation): the sender
+// tracks, per accepted line, the raw byte end and the cumulative payload
+// byte end, and a counting writer over the real file reports the raw
+// bytes actually flushed. FlushedPayloadBytes maps the raw watermark back
+// to a payload-byte watermark (a prefix — lines are written in order, so
+// if a line's bytes are flushed, every earlier line's are too), which the
+// shared loop turns into the persisted sent cursor. The result: the state
+// file's cursor reflects DELIVERY (bytes on disk), not send() completion.
 type Sender struct {
 	output *os.File
 	buf    *bufio.Writer
+	count  *countingWriter
+
+	// mu guards buf, count.n and the flush queue (SendMessages runs on the
+	// loop goroutine; State, Finalize and Close run on the supervisor).
+	mu sync.Mutex
+	// queue holds the not-yet-flushed line marks, oldest first.
+	queue []flushMark
+	// rawEnd and payloadEnd are cumulative totals of accepted lines (raw
+	// bytes including the newline; payload bytes excluding it).
+	rawEnd     int64
+	payloadEnd int64
+	// flushedPayload is the payload watermark derived from count.n.
+	flushedPayload int64
+}
+
+// flushMark is one accepted line's cumulative byte ends.
+type flushMark struct {
+	rawEnd     int64
+	payloadEnd int64
+}
+
+// countingWriter counts the raw bytes handed to the underlying writer.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // SendMessages implements sender.Sender: append each message with a
@@ -54,7 +97,15 @@ func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error
 		line := make([]byte, 0, len(msg)+1)
 		line = append(line, msg...)
 		line = append(line, '\n')
-		if _, err := s.buf.Write(line); err != nil {
+		s.mu.Lock()
+		_, err := s.buf.Write(line)
+		if err == nil {
+			s.rawEnd += int64(len(line))
+			s.payloadEnd += int64(len(msg))
+			s.queue = append(s.queue, flushMark{rawEnd: s.rawEnd, payloadEnd: s.payloadEnd})
+		}
+		s.mu.Unlock()
+		if err != nil {
 			return fmt.Errorf("file sender: write: %w", err)
 		}
 	}
@@ -65,23 +116,65 @@ func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error
 // none (no base.py override in file.py).
 func (s *Sender) MaintenanceOperations(context.Context) error { return nil }
 
+// FlushedPayloadBytes implements sender.DurableReporter: the payload
+// bytes whose lines have reached the file (a prefix watermark). It
+// advances when the buffer auto-flushes on fill and on a successful
+// Finalize.
+func (s *Sender) FlushedPayloadBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushedLocked()
+}
+
+// flushedLocked advances flushedPayload over the queued line marks whose
+// raw bytes have been flushed, dropping the consumed marks. Caller holds
+// s.mu.
+func (s *Sender) flushedLocked() int64 {
+	n := s.count.n
+	for len(s.queue) > 0 && s.queue[0].rawEnd <= n {
+		s.flushedPayload = s.queue[0].payloadEnd
+		s.queue = s.queue[1:]
+	}
+	return s.flushedPayload
+}
+
 // Finalize flushes the buffered tail without releasing the handle. The
 // supervisor calls it at shutdown BEFORE the final state save (the D9
 // deviation: Python's BufferedWriter is never flushed and its buffered
 // bytes are lost when the process exits on SIGTERM; Go flushes them
-// within the shutdown grace window) so a failed flush is surfaced and
-// the persisted sent cursor is rolled back rather than claiming the
-// buffered bytes were delivered.
+// within the shutdown grace window). A successful flush advances
+// FlushedPayloadBytes so the persisted cursor catches up to the full sent
+// position; a failed flush leaves the durable cursor at the last flushed
+// boundary (the tail is replayed on restart).
 func (s *Sender) Finalize() error {
-	return s.buf.Flush()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.buf.Flush()
+	_ = s.flushedLocked()
+	return err
 }
 
 // Close flushes the buffered tail and releases the output handle.
 func (s *Sender) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.buf.Flush(); err != nil {
 		_ = s.output.Close()
 		return err
 	}
+	return s.output.Close()
+}
+
+// CloseDiscarding implements sender.Discarder: it drops the buffered,
+// not-yet-flushed tail and releases the handle, so a reload retire does
+// not persist lines the delivery checkpoint never claimed (Python
+// request_stop drops the old sender's buffered messages identically).
+func (s *Sender) CloseDiscarding() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// bufio.Reset discards any buffered, unflushed data.
+	s.buf.Reset(s.count)
+	s.queue = nil
 	return s.output.Close()
 }
 
@@ -124,8 +217,9 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	if err != nil {
 		return sender.Instance{}, fmt.Errorf("opening %s: %w", path, err)
 	}
+	count := &countingWriter{w: output}
 	return sender.Instance{
-		Transport: &Sender{output: output, buf: bufio.NewWriterSize(output, pythonBufferSize)},
+		Transport: &Sender{output: output, buf: bufio.NewWriterSize(count, pythonBufferSize), count: count},
 		// file.py:8-11 — mark_disconnected() (already disconnected,
 		// no-op) then mark_connected() right after the open.
 		ConnectOnInit:   true,

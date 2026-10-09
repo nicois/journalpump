@@ -17,6 +17,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/config"
 	"github.com/Aiven-Open/journalpump/internal/filter"
 	"github.com/Aiven-Open/journalpump/internal/geoip"
+	"github.com/Aiven-Open/journalpump/internal/sender"
 	"github.com/Aiven-Open/journalpump/internal/state"
 	"github.com/Aiven-Open/journalpump/internal/statsd"
 	"github.com/Aiven-Open/journalpump/internal/tagged"
@@ -244,8 +245,15 @@ func (p *Pump) retireReader(rt *ReaderRuntime) {
 		if entry.done != nil {
 			<-entry.done
 		}
-		if closer, ok := entry.inst.Transport.(io.Closer); ok {
-			_ = closer.Close()
+		switch transport := entry.inst.Transport.(type) {
+		case sender.Discarder:
+			// Drop the buffered-but-unpersisted tail (the checkpoint
+			// never claimed it): a reload retire must not deliver lines
+			// the persisted cursor does not cover, or replay would
+			// duplicate them.
+			_ = transport.CloseDiscarding()
+		case io.Closer:
+			_ = transport.Close()
 		}
 	}
 }

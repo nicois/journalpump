@@ -6,6 +6,7 @@
 package file
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -206,6 +207,113 @@ func TestBufferedVisibilityAndFlushOnClose(t *testing.T) {
 	}
 	if got := string(raw); got != "a\nb\n" {
 		t.Errorf("output = %q, want \"a\\nb\\n\"", got)
+	}
+}
+
+// newTestSender builds a file Sender writing to a temp path.
+func newTestSender(t *testing.T) (*Sender, string) {
+	t.Helper()
+	outPath := filepath.Join(t.TempDir(), "out.log")
+	inst, err := New(sender.ConstructorArgs{
+		Name:   "s",
+		Config: map[string]any{"output_type": "file", "file_output": outPath},
+		Tags:   tagged.New(nil),
+	})
+	if err != nil {
+		t.Fatalf("file.New: %v", err)
+	}
+	tr, ok := inst.Transport.(*Sender)
+	if !ok {
+		t.Fatalf("transport type %T", inst.Transport)
+	}
+	return tr, outPath
+}
+
+// TestFlushedPayloadBytesLagsUntilFlush locks the delivery checkpoint at
+// the file layer: accepted (sent) lines are not durable while they sit in
+// the buffer, so the reported flushed watermark stays at zero until the
+// explicit Finalize flush (the D9 shutdown grace). This is what makes the
+// persisted cursor reflect bytes on disk, not send() completion.
+func TestFlushedPayloadBytesLagsUntilFlush(t *testing.T) {
+	tr, _ := newTestSender(t)
+
+	if err := tr.SendMessages(context.Background(), [][]byte{[]byte("a"), []byte("bb")}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	// Both lines are accepted but buffered: no payload byte is durable.
+	if got := tr.FlushedPayloadBytes(); got != 0 {
+		t.Errorf("flushed = %d, want 0 (still buffered)", got)
+	}
+
+	if err := tr.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if got := tr.FlushedPayloadBytes(); got != 3 {
+		t.Errorf("flushed = %d after Finalize, want 3 (a + bb)", got)
+	}
+}
+
+// TestFlushedPayloadBytesAdvancesWhenBufferFills locks the auto-flush
+// boundary: like Python's BufferedWriter, the output flushes when the
+// 131072-byte buffer fills, so the durable watermark advances without an
+// explicit Finalize while the tail stays unflushed.
+func TestFlushedPayloadBytesAdvancesWhenBufferFills(t *testing.T) {
+	tr, _ := newTestSender(t)
+
+	const chunkSize = 20000
+	const chunks = 8 // 160000 > pythonBufferSize (131072)
+	chunk := bytes.Repeat([]byte("x"), chunkSize)
+	batch := make([][]byte, chunks)
+	for i := range batch {
+		batch[i] = chunk
+	}
+	if err := tr.SendMessages(context.Background(), batch, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+
+	total := int64(chunkSize) * chunks
+	flushed := tr.FlushedPayloadBytes()
+	if flushed <= 0 {
+		t.Fatalf("flushed = %d, want > 0 once the buffer filled", flushed)
+	}
+	if flushed >= total {
+		t.Fatalf("flushed = %d, want < %d (the tail is still buffered)", flushed, total)
+	}
+
+	if err := tr.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if got := tr.FlushedPayloadBytes(); got != total {
+		t.Errorf("flushed = %d after Finalize, want %d", got, total)
+	}
+}
+
+// TestCloseDiscardingDropsUnflushedTail locks the reload-retire contract:
+// the unflushed tail is DROPPED (not flushed to disk), matching the fact
+// that the persisted cursor never claimed those lines — so a replay after
+// the reload is safe and cannot duplicate them.
+func TestCloseDiscardingDropsUnflushedTail(t *testing.T) {
+	tr, outPath := newTestSender(t)
+
+	if err := tr.SendMessages(context.Background(), [][]byte{[]byte("dropped")}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	if got := tr.FlushedPayloadBytes(); got != 0 {
+		t.Fatalf("flushed = %d, want 0 (buffered)", got)
+	}
+
+	if err := tr.CloseDiscarding(); err != nil {
+		t.Fatalf("CloseDiscarding: %v", err)
+	}
+	info, err := os.Stat(outPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("size after discarding = %d, want 0 (tail dropped)", info.Size())
+	}
+	if got := tr.FlushedPayloadBytes(); got != 0 {
+		t.Errorf("flushed = %d after discarding, want 0", got)
 	}
 }
 
