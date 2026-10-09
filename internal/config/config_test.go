@@ -457,6 +457,36 @@ func TestCaptureSearchTagOrderDuplicateSearches(t *testing.T) {
 	}
 }
 
+// TestCaptureSearchTagOrderDuplicateReader locks the reader-level
+// duplicate-key alignment: a duplicate reader NAME visits walkReader
+// twice while the map decode keeps only the LAST occurrence, so the
+// rows captured for the first occurrence must not leak into the kept
+// one.
+func TestCaptureSearchTagOrderDuplicateReader(t *testing.T) {
+	t.Parallel()
+	cfg := mustDecode(t, `{
+        "readers": {
+            "r": {
+                "searches": [
+                    {"name": "a", "tags": {"x": "1"}},
+                    {"name": "b", "tags": {"y": "1"}}
+                ],
+                "senders": {}
+            },
+            "r": {
+                "searches": [
+                    {"name": "only", "tags": {"q": "1"}}
+                ],
+                "senders": {}
+            }
+        }
+    }`)
+	want := [][]string{{"q"}} // aligned with the LAST occurrence (map decode wins)
+	if got := cfg.Readers["r"].SearchTagOrder; !reflect.DeepEqual(got, want) {
+		t.Errorf("r.SearchTagOrder = %v want %v", got, want)
+	}
+}
+
 // TestCaptureStatsdTagOrder pins the statsd.tags document-order capture:
 // Python's dict order reaches the statsd wire, so the client must emit
 // the global tags in config order, not sorted order.

@@ -251,9 +251,11 @@ Source of truth: `journalpump/statsd.py`; consumer seam: `internal/statsd`
 - **Disabled client is exact**: `None in self._dest_addr` → a missing host OR
   port disables every send (the config decode models host PRESENCE with
   `*string`: nil = the key is absent). An explicitly EMPTY host is enabled,
-  like Python: `sendto(("", port))` resolves via getaddrinfo("") to 0.0.0.0
-  and the kernel delivers locally — Go resolves the empty host to a nil IP
-  and substitutes 0.0.0.0 (golden-tested against a loopback listener).
+  like Python: CPython's setipaddr special-cases the empty host to INADDR_ANY
+  (0.0.0.0) without calling getaddrinfo — which would raise [Errno -5] — so
+  `sendto(("", port))` sends to 0.0.0.0 and the kernel delivers locally. Go
+  resolves the empty host to a nil IP and substitutes 0.0.0.0 (golden-tested
+  against a loopback listener).
 - **Send failures log, never crash**: Python catches `OSError` around
   `sendto` and logs `"Stats UDP send failed: %s"` at INFO (statsd.py:59-60);
   Go does the same around the lazy address resolution and the unconnected

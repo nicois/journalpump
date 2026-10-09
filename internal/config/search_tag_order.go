@@ -173,6 +173,10 @@ func (w *tagOrderWalker) walkStatsd() error {
 func (w *tagOrderWalker) walkReader(name string) error {
 	previousReader, previousIndex := w.reader, w.searchIndex
 	w.reader, w.searchIndex = name, 0
+	// A duplicate reader name visits this function twice while the map
+	// decode keeps only the LAST occurrence; truncate the rows captured
+	// for a previous occurrence so they do not leak into the kept one.
+	w.out.readers[name] = nil
 	defer func() { w.reader, w.searchIndex = previousReader, previousIndex }()
 	d, ok, err := w.openContainer()
 	if err != nil || !ok || d != '{' {

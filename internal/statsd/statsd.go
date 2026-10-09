@@ -39,8 +39,9 @@ func (discardLogger) Printf(_ string, _ ...any) {}
 // statsd.py:46-48); journalpump.py passes the config values straight
 // through via stats.get("host")/stats.get("port"), so an absent host or
 // port means "no stats" and every send is a no-op. An explicitly EMPTY
-// host string is enabled: Python's sendto(("", port)) resolves via
-// getaddrinfo("") to 0.0.0.0 and the kernel delivers locally.
+// host string is enabled: CPython's setipaddr special-cases the empty
+// host to INADDR_ANY (0.0.0.0) without calling getaddrinfo, so
+// sendto(("", port)) sends to 0.0.0.0 and the kernel delivers locally.
 type Client struct {
 	disabled bool
 	host     string
@@ -290,9 +291,11 @@ func (c *Client) write(b []byte) {
 			c.log.Printf("Stats UDP send failed: %s", err)
 			return
 		}
-		// Python's sendto(("", port)) resolves via getaddrinfo("") to
-		// 0.0.0.0 and the kernel delivers locally; Go resolves the empty
-		// host to a nil IP, so substitute 0.0.0.0 explicitly.
+		// Python's sendto(("", port)) targets INADDR_ANY: CPython's
+		// setipaddr special-cases the empty host to 0.0.0.0 without
+		// calling getaddrinfo, and the kernel delivers locally. Go
+		// resolves the empty host to a nil IP, so substitute 0.0.0.0
+		// explicitly.
 		if addr.IP == nil {
 			addr.IP = net.IPv4zero
 		}

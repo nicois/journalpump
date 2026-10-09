@@ -385,7 +385,7 @@ from git log alone.
 | 4 | Journal entry model, repr UTF-8 fallback, JSON serialization | done | 3fbfe92 + 45d003c + 1d678cb | approved (1 major + 6 minors fixed across two review rounds; golden fixture Python-generated, 8 cases, byte-identical; 2.2M-exec fuzz clean)⁴ |
 | 5 | Filters (field/unit-log-level/secret/search) | done | ef53aac + c999ebb | approved (3 majors + 9 minors fixed; one finding rebutted with evidence and upheld — Python accepts a missing search fields key via setdefault; two new sanctioned deviations: runtime entry-value tolerance, regex warn-and-disable) |
 | 6 | Geohash encoder + GeoIP + tag callables | done | 5122ff2 + 283e87e | approved (3 majors + 5 minors fixed; NaN guard, document-order tag visibility via JSON token walk, deviation extension recorded per coordinator ruling; 225-case golden battery) |
-| 7 | statsd client + Tagged sanitization | not-started | - | - |
+| 7 | statsd client + Tagged sanitization | done | 5b343e2 + 10ffc40 | approved (1 major + 5 minors fixed; global statsd tag order exact via capture, per-call appended sorted = sanctioned deviation; empty-host/udp4 parity locked) |
 | 8 | State file I/O (ordered decode, sorted encode, interop tests) | not-started | - | - |
 | 9 | sd_notify, watchdog, signals (NotifyContext + SIGHUP channel) | not-started | - | - |
 | 10 | Implementation-agnostic systest harness + running-config/reload suites | not-started | - | - |
