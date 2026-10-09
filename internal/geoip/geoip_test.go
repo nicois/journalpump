@@ -1,0 +1,176 @@
+// Copyright 2026, Aiven, https://aiven.io/
+//
+// This file is under the Apache License, Version 2.0.
+// See the file `LICENSE` for details.
+
+package geoip_test
+
+import (
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/Aiven-Open/journalpump/internal/filter"
+	"github.com/Aiven-Open/journalpump/internal/geoip"
+	"github.com/Aiven-Open/journalpump/internal/tagged"
+)
+
+// expectation is one row of geoip_expectations.json, produced by
+// testdata/generate_mmdb.py (expected values computed with the REAL
+// journalpump.geohash encoder over the fixture's coordinates).
+type expectation struct {
+	IP       string   `json:"ip"`
+	Args     []string `json:"args"`
+	Expected string   `json:"expected"`
+}
+
+func openTestDB(t *testing.T) *geoip.DB {
+	t.Helper()
+	db, err := geoip.Open("testdata/geoip_test.mmdb")
+	if err != nil {
+		t.Fatalf("geoip.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// TestIPToGeohashGolden locks ip_to_geohash against Python's behavior on
+// a real .mmdb fixture: located IPs (several precisions incl. the
+// default 8), a record without location (Python AttributeError branch),
+// PRESENT zero coordinates (must not be confused with absent — the
+// geoip2/v2 pointer fields make that distinction exact), a wrapping
+// longitude, an IP absent from the DB (Python AddressNotFoundError) and
+// invalid IP strings — the crash paths all return "".
+func TestIPToGeohashGolden(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile("testdata/geoip_expectations.json")
+	if err != nil {
+		t.Fatalf("read expectations: %v", err)
+	}
+	var cases []expectation
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatalf("parse expectations: %v", err)
+	}
+	db := openTestDB(t)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.IP+"/"+strings.Join(tc.Args, ","), func(t *testing.T) {
+			t.Parallel()
+			got := db.IPToGeohash(map[string]string{"ip_tag": tc.IP}, tc.Args)
+			if got != tc.Expected {
+				t.Errorf("ip_to_geohash(%v, %v) = %q want %q", tc.IP, tc.Args, got, tc.Expected)
+			}
+		})
+	}
+}
+
+// TestIPToGeohashNoDB locks Python's `if self.geoip is None: return ""`
+// short-circuit: no geoip_database configured means empty tags, not an
+// error (spec risk 9's failure mode is the Python-defined one).
+func TestIPToGeohashNoDB(t *testing.T) {
+	t.Parallel()
+	var nilDB *geoip.DB
+	if got := nilDB.IPToGeohash(map[string]string{"ip_tag": "10.0.0.7"}, []string{"ip_tag", "5"}); got != "" {
+		t.Errorf("nil DB = %q want empty", got)
+	}
+	if got := (&geoip.DB{}).IPToGeohash(map[string]string{"ip_tag": "10.0.0.7"}, []string{"ip_tag", "5"}); got != "" {
+		t.Errorf("closed/empty DB = %q want empty", got)
+	}
+}
+
+// TestIPToGeohashMissingTag locks the Python KeyError branch: the named
+// tag is absent from the groupdict (group did not match).
+func TestIPToGeohashMissingTag(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	if got := db.IPToGeohash(map[string]string{}, []string{"ip_tag", "5"}); got != "" {
+		t.Errorf("missing tag = %q want empty", got)
+	}
+}
+
+// TestOpenMissingDB locks the handle_new_config surface: a configured
+// geoip_database that cannot be opened is a load-time error (Python
+// constructs geoip2.database.Reader there and the failure propagates).
+func TestOpenMissingDB(t *testing.T) {
+	t.Parallel()
+	if _, err := geoip.Open("testdata/no-such-file.mmdb"); err == nil {
+		t.Error("missing .mmdb must fail to open")
+	}
+}
+
+// recordingStats captures the metrics calls the Searcher makes.
+type recordingStats struct {
+	increases []struct {
+		metric string
+		tags   map[string]string
+	}
+}
+
+func (r *recordingStats) Increase(metric string, tags map[string]string) {
+	r.increases = append(r.increases, struct {
+		metric string
+		tags   map[string]string
+	}{metric, tags})
+}
+
+func (r *recordingStats) Gauge(_ string, _ float64, _ map[string]string) {}
+
+// TestSearcherWiresTagFunc is the spec-risk-9 acceptance test: a
+// `searches` config using ip_to_geohash produces the same tag value as
+// Python, end to end through the Searcher.
+func TestSearcherWiresTagFunc(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	searches, err := filter.NewSearches([]any{
+		map[string]any{
+			"name": "geoip",
+			"fields": map[string]any{
+				"MESSAGE": `connected from (?P<ip_address>10\.\d+\.\d+\.\d+)`,
+			},
+			"tags": map[string]any{"geohash": "ip_to_geohash(ip_address,5)"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewSearches: %v", err)
+	}
+	stats := &recordingStats{}
+	searcher, err := filter.NewSearcher(searches, 0.001, stats, tagged.New(map[string]string{"reader": "r"}), nil,
+		map[string]filter.TagFunc{"ip_to_geohash": db.IPToGeohash})
+	if err != nil {
+		t.Fatalf("NewSearcher: %v", err)
+	}
+	if !searcher.PerformSearches(map[string]any{"MESSAGE": "connected from 10.0.0.7 today"}) {
+		t.Fatal("want match")
+	}
+	if len(stats.increases) != 1 {
+		t.Fatalf("increases = %v want one", stats.increases)
+	}
+	// Python: geohash.encode(52.3759, 4.8975, 5) — see the expectations
+	// file generated by testdata/generate_mmdb.py.
+	if got := stats.increases[0].tags["geohash"]; got != "u173z" {
+		t.Errorf("geohash tag = %q want u173z", got)
+	}
+}
+
+// TestSearcherUnwiredTagFunc locks the spec-risk-9 guard: a search
+// referencing a tag function the wiring did not provide is rejected at
+// construction instead of silently producing empty tags (Python's funcs
+// dict always binds its callables, so this state cannot exist there).
+func TestSearcherUnwiredTagFunc(t *testing.T) {
+	t.Parallel()
+	searches, err := filter.NewSearches([]any{
+		map[string]any{
+			"name":   "geoip",
+			"fields": map[string]any{"MESSAGE": `ip`},
+			"tags":   map[string]any{"geohash": "ip_to_geohash(ip_address,5)"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewSearches: %v", err)
+	}
+	if _, err := filter.NewSearcher(searches, 0.001, nil, tagged.New(nil), nil, nil); err == nil ||
+		!strings.Contains(err.Error(), "not wired") {
+		t.Errorf("want 'not wired' error, got %v", err)
+	}
+}

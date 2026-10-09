@@ -32,9 +32,10 @@ import (
 
 // TagFunc is a search tag callable: Python builds `lambda tags:
 // f(tags, args)` for tag values like "ip_to_geohash(ip_address,5)"
-// (journalpump.py:526-542). The registry is provided by the wiring
-// (ip_to_geohash arrives with Task 6); construction-time validation
-// happens against the fixed function name set of journalpump.py:513.
+// (journalpump.py:526-542). The implementations are wired by the pump at
+// reader construction (ip_to_geohash comes from internal/geoip) and
+// passed to NewSearcher; construction-time name validation happens
+// against the fixed function name set of journalpump.py:513.
 type TagFunc func(tags map[string]string, args []string) string
 
 // knownTagFuncs mirrors journalpump.py:513-515 funcs dict keys.
@@ -247,6 +248,12 @@ type Searcher struct {
 	stats            Stats
 	tagged           *tagged.Tagged
 	log              Logger
+	// tagFuncs holds the callables of journalpump.py:513's funcs dict,
+	// wired by the pump at construction (ip_to_geohash from
+	// internal/geoip). A Searcher field, not a package global: the
+	// charter prefers explicit wiring, and Python's funcs dict is built
+	// per-reader too.
+	tagFuncs map[string]TagFunc
 	// Now is the monotonic clock used for slow-regex measurement;
 	// replaceable in tests.
 	Now func() time.Time
@@ -254,15 +261,29 @@ type Searcher struct {
 
 // NewSearcher builds the reader-side search runner. Python's reader is
 // Tagged(tags, reader=name); the base tags feed the slow-regex gauge.
-func NewSearcher(searches []*Search, thresholdSeconds float64, stats Stats, tags *tagged.Tagged, log Logger) *Searcher {
+//
+// tagFuncs must contain every tag function the searches reference:
+// Python's funcs dict always binds its callables (a missing geoip DB
+// still yields a callable that returns ""), so a Go wiring gap would be
+// invisible until it silently produced empty tags (spec risk 9) — it is
+// rejected here instead.
+func NewSearcher(searches []*Search, thresholdSeconds float64, stats Stats, tags *tagged.Tagged, log Logger, tagFuncs map[string]TagFunc) (*Searcher, error) {
+	for _, search := range searches {
+		for _, spec := range search.tags {
+			if spec.funcName != "" && tagFuncs[spec.funcName] == nil {
+				return nil, fmt.Errorf("tag function %s referenced by search %s is not wired", pythonRepr(spec.funcName), pythonRepr(search.name))
+			}
+		}
+	}
 	return &Searcher{
 		searches:         searches,
 		thresholdSeconds: thresholdSeconds,
 		stats:            stats,
 		tagged:           tags,
 		log:              log,
+		tagFuncs:         tagFuncs,
 		Now:              time.Now,
-	}
+	}, nil
 }
 
 // Searches exposes the compiled searches (reader get_state persists
@@ -311,11 +332,8 @@ func (s *Searcher) PerformSearches(entry map[string]any) bool {
 		// Add static tags + possible callables (journalpump.py:629-634).
 		for tag, spec := range search.tags {
 			if spec.funcName != "" {
-				if fn := tagFuncRegistry[spec.funcName]; fn != nil {
-					tags[tag] = fn(tags, spec.args)
-				}
-				// Unregistered callables (ip_to_geohash until Task 6) are
-				// skipped; construction already validated the name.
+				// Construction guaranteed the callable is wired.
+				tags[tag] = s.tagFuncs[spec.funcName](tags, spec.args)
 				continue
 			}
 			tags[tag] = spec.static
@@ -347,19 +365,6 @@ func measureSearch(s *Searcher, regex *regexp.Regexp, line string) []string {
 		}
 	}
 	return match
-}
-
-// tagFuncRegistry holds the callable implementations; journalpump.py
-// builds them from JournalPump methods (ip_to_geohash, Task 6).
-//
-// TODO(Task 6): when ip_to_geohash is wired, move this package global
-// into a Searcher field populated at construction — the charter prefers
-// explicit wiring over package-level mutable state.
-var tagFuncRegistry = map[string]TagFunc{}
-
-// RegisterTagFunc registers a tag callable implementation.
-func RegisterTagFunc(name string, fn TagFunc) {
-	tagFuncRegistry[name] = fn
 }
 
 // searchFieldValue mirrors journalpump.py:587-606: missing or empty

@@ -40,7 +40,11 @@ func newTestSearcher(t *testing.T, raw []any, stats filter.Stats) *filter.Search
 	if err != nil {
 		t.Fatalf("NewSearches: %v", err)
 	}
-	return filter.NewSearcher(searches, 0.001, stats, tagged.New(map[string]string{"reader": "r"}), nil)
+	searcher, err := filter.NewSearcher(searches, 0.001, stats, tagged.New(map[string]string{"reader": "r"}), nil, nil)
+	if err != nil {
+		t.Fatalf("NewSearcher: %v", err)
+	}
+	return searcher
 }
 
 func mustDecodeUTF8(t *testing.T, s string) []byte {

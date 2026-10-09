@@ -1,0 +1,89 @@
+[
+ {
+  "ip": "10.0.0.7",
+  "args": [
+   "ip_tag",
+   "5"
+  ],
+  "expected": "u173z"
+ },
+ {
+  "ip": "10.0.0.7",
+  "args": [
+   "ip_tag",
+   "8"
+  ],
+  "expected": "u173zqwr"
+ },
+ {
+  "ip": "10.0.0.7",
+  "args": [
+   "ip_tag",
+   "12"
+  ],
+  "expected": "u173zqwr8p2t"
+ },
+ {
+  "ip": "10.0.0.7",
+  "args": [
+   "ip_tag"
+  ],
+  "expected": "u173zqwr"
+ },
+ {
+  "ip": "10.1.0.9",
+  "args": [
+   "ip_tag",
+   "8"
+  ],
+  "expected": ""
+ },
+ {
+  "ip": "10.2.0.4",
+  "args": [
+   "ip_tag",
+   "8"
+  ],
+  "expected": "s0000000"
+ },
+ {
+  "ip": "10.3.0.1",
+  "args": [
+   "ip_tag",
+   "6"
+  ],
+  "expected": "bpbj0h"
+ },
+ {
+  "ip": "10.4.0.2",
+  "args": [
+   "ip_tag",
+   "6"
+  ],
+  "expected": "b3npz4"
+ },
+ {
+  "ip": "10.9.9.9",
+  "args": [
+   "ip_tag",
+   "8"
+  ],
+  "expected": ""
+ },
+ {
+  "ip": "not-an-ip",
+  "args": [
+   "ip_tag",
+   "8"
+  ],
+  "expected": ""
+ },
+ {
+  "ip": "",
+  "args": [
+   "ip_tag",
+   "8"
+  ],
+  "expected": ""
+ }
+]

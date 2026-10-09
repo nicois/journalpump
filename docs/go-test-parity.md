@@ -132,3 +132,49 @@ Deviations and notes:
   a documented superset skew).
 - Python's `lru_cache` on `_unit_match_level_glob` is pure memoization
   and is not reproduced.
+
+## Task 6 — geohash encoder, GeoIP loading, ip_to_geohash tag callable
+
+Source: `journalpump/geohash.py` (the whole file) and
+`journalpump.py:488-504` (ip_to_geohash), `957-965` (geoip_database
+loading in handle_new_config). No Python unit test covers either, so the
+parity fixtures are Python-generated:
+`internal/geohash/testdata/generate_golden.py` runs the real
+`journalpump.geohash.encode` over a (lat, lon, precision) battery →
+`geohash_golden.json` (217 cases incl. the error cases);
+`internal/geoip/testdata/generate_mmdb.py` writes a real GeoLite2-City
+.mmdb with `mmdb_writer` and computes the expected `ip_to_geohash` tag
+values with the real Python encoder → `geoip_expectations.json`.
+
+| Python behavior | Status | Go counterpart |
+|---|---|---|
+| geohash.encode (float.hex fixed-point bit interleave, longitude wrap into [-180,180), `latitude >= 90 or latitude < -90` raise) | ported, byte-identical | `internal/geohash` `Encode` — same IEEE-754 mantissa/exponent arithmetic via big.Int (golden-locked incl. precision -1/0 slicing semantics and the wrap float path) |
+| `ip_to_geohash(ip_tag_name, precision)` (default precision 8) | ported | `internal/geoip` `DB.IPToGeohash`, wired into the searches' tag-function registry (`filter.NewSearcher` takes the funcs map — Python's `funcs` dict is per-reader, so the registry is a Searcher field, not a package global) |
+| `geoip_database` .mmdb loading at config time | ported | `geoip.Open` (oschwald/geoip2-golang/v2, same .mmdb format); open failures surface at load like Python's Reader() construction |
+
+Deviations and notes:
+- **Crash-free ip_to_geohash failure paths (sanctioned, charter §2)**:
+  Python raises mid-run for every failure mode — `int(precision)`
+  ValueError, missing tag KeyError, geoip2 AddressValueError (invalid IP
+  string), AddressNotFoundError (IP not in the DB), AttributeError when
+  a record has NO location object (`loc.latitude` on None), and
+  geohash's ValueError for out-of-range coordinates. Go returns "" for
+  all of them (empty tag, processing continues).
+- **No-DB behavior is Python-faithful, not "fixed"**: `geoip_database`
+  unconfigured → Python returns "" (the config keeps working with empty
+  geohash tags) and Go does the same (`self.geoip is None`
+  short-circuit). Spec risk 9 (silently empty tags from a forgotten
+  port) is guarded by construction instead: the tag-function registry is
+  wired per Searcher and `NewSearcher` rejects a search referencing an
+  unwired function.
+- **Absent vs zero coordinates are exact**: geoip2-golang/v2 exposes
+  Latitude/Longitude as pointer fields, so a PRESENT (0.0, 0.0) record
+  produces `s0000000` like Python while an absent location returns ""
+  (the fixture has both).
+- **Subnormal latitude**: Python's `_float_hex_to_int` asserts on
+  subnormal `latitude/90` (AssertionError mid-run); Go's `Encode`
+  returns an error for the same inputs (unreachable through
+  `ip_to_geohash` for practical GeoIP data).
+- **Huge longitudes**: Python wraps with a subtract-360 loop; the loop
+  is ported verbatim (identical float results; absurd magnitudes would
+  loop in Python too, and GeoIP records cannot produce them).
