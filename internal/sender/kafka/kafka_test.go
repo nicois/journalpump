@@ -456,6 +456,7 @@ func TestRetriableClassification(t *testing.T) {
 		{"nil", nil, false},
 		{"out of brokers", sarama.ErrOutOfBrokers, true},
 		{"leader not available", sarama.ErrLeaderNotAvailable, true},
+		{"unknown server error", sarama.ErrUnknown, true},
 		{"network exception", sarama.ErrNetworkException, true},
 		{"request timed out", sarama.ErrRequestTimedOut, true},
 		{"producer error wraps retriable", &sarama.ProducerError{Err: sarama.ErrNotLeaderForPartition}, true},

@@ -1734,7 +1734,7 @@ Send path (thread A7):
 - `Producer.RequiredAcks = WaitForLocal` (kafka-python's default
   `acks=1`).
 - `Retriable` classifies a send error like Python's `KAFKA_CONN_ERRORS`:
-  retriable KErrors (unknown-topic/leader-not-available/not-leader/
+  retriable KErrors (unknown-server-error/unknown-topic/leader-not-available/not-leader/
   request-timed-out/broker-not-available/network-exception/
   not-enough-replicas×2/rebalance-in-progress/storage-error),
   `sarama.ErrOutOfBrokers`, timeouts, EOF, ECONNREFUSED/ECONNRESET/EPIPE
@@ -1786,6 +1786,10 @@ Recorded divergences / open items for adjudication:
   `sarama.ParseKafkaVersion`.
 - `reconnect_backoff_max_ms` (10 s) has no direct sarama analogue;
   `reconnect_backoff_ms` maps to `Metadata.Retry.Backoff` (1 s).
+- a missing `kafka_address` yields no brokers; Python's
+  `KafkaProducer(bootstrap_servers=None)` raises a configuration error
+  (generic path), while sarama's no-brokers error is retriable. Edge
+  case, not exercised by the ported tests.
 - acks: kafka-python's default is `acks=1`; the coordinator note said
   "all/-1", but the Python source has no acks setting, so Go pins
   `WaitForLocal` (acks=1) to match deployed Python. Flagged for the

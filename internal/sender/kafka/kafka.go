@@ -618,7 +618,8 @@ func Retriable(err error) bool {
 // retriable (the transient metadata/broker conditions).
 func retriableKError(err sarama.KError) bool {
 	switch err {
-	case sarama.ErrUnknownTopicOrPartition,
+	case sarama.ErrUnknown,
+		sarama.ErrUnknownTopicOrPartition,
 		sarama.ErrLeaderNotAvailable,
 		sarama.ErrNotLeaderForPartition,
 		sarama.ErrRequestTimedOut,
