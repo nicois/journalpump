@@ -1298,3 +1298,97 @@ is (re)captured, the green bar is every suite that loads it, not only
 the suite that wrote it. The assertion is fixed to compare matching
 prefixes (the file sender flushes only a prefix mid-run), keeping the
 expanded 40-line fixture.
+
+## Task 20 — rsyslog sender (spec §5)
+
+`internal/sender/rsyslog` ports `journalpump/senders/rsyslog.py` on top
+of the Task 19 syslogframing client. It is the first real Constructor in
+the Task 13 wiring map (`sender.Register("rsyslog", rsyslog.New)`), and
+the sender logger that base.py:119 attaches
+(`logging.getLogger(f"LogSender:{reader.name}")`) is now carried on
+`sender.ConstructorArgs.Log` and populated by the pump's `initSenders`.
+
+Payload mapping (rsyslog.py:78-100): facility = `int(SYSLOG_FACILITY)`
+with the list first-element rule and an IndexError/TypeError/ValueError
+fallback to `default_facility`; severity = the UNGUARDED
+`int(message.get("PRIORITY", default_severity))` (a non-int PRIORITY is
+the error path); timestamp = `raw[:26] + "Z"` for a truthy `timestamp`,
+else a WARNING plus `datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
++ "Z"`; appname = the nested
+`SYSLOG_IDENTIFIER → SYSTEMD_UNIT → PROCESS_NAME` default chain; pid =
+the truthiness-then-`str()` rule (falsy → NILVALUE); msg = MESSAGE.
+
+Error classification and reconnection:
+
+- The per-sender classifier (Task 13's `retriable(error)` seam) is
+  installed via `Instance.Classifier`: `RSYSLOG_CONN_ERRORS`
+  (`socket.timeout`, `ConnectionRefusedError`, `TimeoutError`) → the
+  silent retriable path; anything else → Python's generic
+  `except Exception` path (`mark_disconnected`, `unexpected_exception`
+  stats, backoff, re-init). `TestInstanceClassifierRoutesConnErrors`
+  proves the classifier is installed and routes both ways.
+- `_init_rsyslog_client` (rsyslog.py:25-70) is ported as `initClient`:
+  on a retriable connect failure it logs the same warning, waits the
+  base.py jittered exponential backoff PLUS the flat 5 s sleep, and
+  retries until the client comes up or the context is cancelled; a
+  non-retriable failure (e.g. a missing `rsyslog_server`) returns
+  immediately for the unexpected-exception path. The wait is a
+  cancelable seam so shutdown never hangs.
+  `TestInitLoopRetriesRetriableConnectErrors` (2 failures → 2 sleeps,
+  each ≥ 5 s), `TestInitLoopCancelledDuringBackoff`,
+  `TestInitLoopNonRetriableReturnsImmediately` pin it.
+- On any send failure the client is dropped so the next attempt
+  reconnects (Python's `close()` + `= None`); the shared loop owns the
+  batch hold/backoff/retry.
+
+Ground truth:
+
+- `test/test_rsyslog_sender_groundtruth.py` drives the REAL Python
+  `RsyslogSender` against an in-process recording TCP server and commits
+  the wire bytes to
+  `internal/sender/rsyslog/testdata/wire_groundtruth.json` (7 cases:
+  priorities, non-transparent/octet-counted/escape-newlines multiline,
+  oversize octet-counted truncation, custom logline, facility-list +
+  structured-data). Regenerate with `GROUNDTRUTH_UPDATE=1 pytest
+  test/test_rsyslog_sender_groundtruth.py`; the default run re-captures
+  and fails on drift. Every case carries an explicit timestamp so the
+  capture is deterministic (the fallback is wall-clock).
+- `internal/sender/rsyslog/wire_groundtruth_test.go` replays the same
+  fixture through the Go sender (config + payloads → a byte-exact wire
+  comparison), so both implementations are pinned to one capture.
+- The six Python sender tests in
+  `test/unit/senders/test_rsyslog_sender.py` are ported (timestamp
+  present/absent, valid-ISO fallback, warning emission, truncated
+  payload, PRIORITY→severity), plus field mapping, structured data and
+  the init-loop/classifier tests above.
+
+### rsyslogd systest — process-spawn driver + a flagged ordering divergence
+
+`systest/test_rsyslog.py` is ported off the in-process `JournalPump` onto
+the Task 10 harness: the journalpump BINARY is spawned
+(`JOURNALPUMP_BIN` selects Python or the Go binary) and the 5
+parametrized cases inject into journald with `systemd.journal.send` and
+assert the rsyslogd logfile, so both implementations run the same
+black-box suite. The Python in-process helpers (`journalpump_initialized`,
+manual `request_stop`) are replaced by the harness's READY=1 wait and
+SIGTERM.
+
+**Divergence flagged for adjudication — READY=1 precedes reader open in
+Go.** The harness treats READY=1 as "ready for input". Python's
+`JournalPump.__init__` opens the journal (JournalReader.__init__ →
+get_reader performs the initial seek) before its first READY=1
+(daemon.py:113-114), but the Go daemon notifies READY=1 in `main` BEFORE
+`Pump.Run` starts the reader goroutines that call `reopener.Ensure()`. With
+`initial_position: "tail"` the seek pins the tail at open time, so any
+journal line written between READY=1 and the Go reader attaching is
+skipped — verified directly: a line injected ~0.2 s after start is lost,
+one injected ~1 s after is delivered. This is a real startup-window
+divergence (Go's reader-open window extends past READY, Python's does
+not), not a sender bug; it belongs to the daemon/reader startup ordering
+(not Task 20's file scope) and is flagged rather than silently fixed.
+The ported driver keeps the wire assertions deterministic meanwhile via a
+bounded readiness probe (`_wait_for_reader_ready`): it re-sends a
+throwaway journal entry until one reaches the wire (tail pin taken)
+before injecting the real batch; the probe text never matches an
+assertion pattern. If a daemon-side fix moves reader-open before READY,
+the probe becomes a no-op.
