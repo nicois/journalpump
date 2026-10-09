@@ -106,6 +106,27 @@
     "wire_hex": "3c31343e4a616e2030312030303a30303a30302068202d5b3130305d3a20496e666f206d657373616765207b257d202d0a"
   },
   {
+    "config": {},
+    "messages": [
+      {
+        "HOSTNAME": "h",
+        "MESSAGE": "numeric pid",
+        "PID": 100,
+        "PRIORITY": 6,
+        "SYSLOG_FACILITY": 3,
+        "timestamp": "2025-01-01T00:00:00.000000"
+      },
+      {
+        "MESSAGE": "zero pid is nilvalue",
+        "PID": 0,
+        "PRIORITY": 2,
+        "timestamp": "2025-01-01T00:00:00.000000"
+      }
+    ],
+    "name": "numeric_pid_and_fields",
+    "wire_hex": "3c33303e3120323032352d30312d30315430303a30303a30302e3030303030305a2068202d20313030202d206e756d65726963207069640a3c31303e3120323032352d30312d30315430303a30303a30302e3030303030305a202d202d202d202d207a65726f20706964206973206e696c76616c75650a"
+  },
+  {
     "config": {
       "default_facility": 3,
       "structured_data": "x=\"y\""

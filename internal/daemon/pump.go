@@ -978,6 +978,7 @@ func (rt *ReaderRuntime) run(ctx context.Context) error {
 			rt.journaldReader = nil
 		}
 	}()
+	first := true
 	for {
 		// Event wait phase. With a live reader, honor journal events
 		// (Python's poller on the inotify fd with poll_timeout_ms);
@@ -991,11 +992,18 @@ func (rt *ReaderRuntime) run(ctx context.Context) error {
 				return err
 			}
 			rt.pending = maxEvent(rt.pending, evt)
-		} else {
+		} else if !first {
 			if err := sleepCtx(ctx, pollInterval); err != nil {
 				return nil
 			}
 		}
+		// Python initializes poll_timeout_ms = 0.0 (journalpump.py:1104), so
+		// the FIRST iteration polls with a zero timeout and opens the
+		// reader immediately; only later iterations wait the full poll
+		// interval. Waiting here on the first iteration would add an
+		// operator-visible skipped-message window after READY with
+		// initial_position "tail".
+		first = false
 
 		// Process pending events (journalpump.py:1153-1173): only ready
 		// readers drain; INVALIDATE recreates after the drain.

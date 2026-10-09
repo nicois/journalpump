@@ -287,52 +287,76 @@ func TestSendFailureDropsClient(t *testing.T) {
 	}
 }
 
-// TestInitLoopRetriesRetriableConnectErrors ports the retry arm of
-// rsyslog.py:_init_rsyslog_client: a retriable connection failure logs a
-// warning, sleeps backoff+5s, and retries until the client comes up.
-func TestInitLoopRetriesRetriableConnectErrors(t *testing.T) {
-	s, client, logger := newTestSender(t, baseConfig())
-	attempts := 0
+// TestSendFailureRefusedReconnectThenSuccess covers the whole reconnect
+// cycle the reviewer asked for: a send failure drops the client, a
+// REFUSED reconnect returns a retriable error after the flat 5 s init
+// sleep (no private retry counter — the shared loop owns the backoff),
+// and a subsequent successful reconnect delivers the batch. The error is
+// retriable so the loop routes it through mark_disconnected (health
+// errors) + shared backoff.
+func TestSendFailureRefusedReconnectThenSuccess(t *testing.T) {
+	s, first, logger := newTestSender(t, baseConfig())
+	first.failWith = errors.New("write failed")
 	var slept []time.Duration
 	s.sleep = func(_ context.Context, d time.Duration) bool {
 		slept = append(slept, d)
 		return true
 	}
+	second := &recordClient{}
+	attempts := 0
 	s.newClient = func(context.Context) (logClient, error) {
 		attempts++
-		if attempts < 3 {
-			return nil, syscall.ECONNREFUSED
+		switch attempts {
+		case 1:
+			return first, nil
+		case 2:
+			return nil, syscall.ECONNREFUSED // refused reconnect
+		default:
+			return second, nil // successful reconnect
 		}
-		return client, nil
 	}
 	msg := []byte(`{"MESSAGE": "hello", "PRIORITY": "6", "timestamp": "t"}`)
-	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
-		t.Fatalf("SendMessages: %v", err)
+
+	// 1) A send failure drops the client so the next attempt reconnects.
+	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err == nil {
+		t.Fatal("SendMessages succeeded, want the send failure")
+	}
+	if first.closed == 0 {
+		t.Fatal("failed client was not closed/dropped")
+	}
+
+	// 2) The refused reconnect returns a RETRIABLE error (loop path) after
+	// exactly the flat 5 s init sleep — no private exponential backoff.
+	err := s.SendMessages(context.Background(), [][]byte{msg}, "c2")
+	if err == nil {
+		t.Fatal("SendMessages succeeded, want the refused reconnect")
+	}
+	if !Retriable(err) {
+		t.Fatalf("ECONNREFUSED reconnect error must classify retriable, got %v", err)
+	}
+	if len(slept) != 1 || slept[0] != initRetrySleep {
+		t.Fatalf("init sleeps = %v, want [%s] (loop owns the exponential backoff)", slept, initRetrySleep)
+	}
+	if len(logger.warnings) != 1 {
+		t.Fatalf("init warnings = %d, want 1", len(logger.warnings))
+	}
+
+	// 3) A successful reconnect delivers the batch through the new client.
+	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c3"); err != nil {
+		t.Fatalf("SendMessages after reconnect: %v", err)
 	}
 	if attempts != 3 {
 		t.Fatalf("connect attempts = %d, want 3", attempts)
 	}
-	if len(slept) != 2 {
-		t.Fatalf("init sleeps = %d, want 2", len(slept))
-	}
-	for _, d := range slept {
-		// Python's _backoff() jittered sleep PLUS the flat 5 s sleep.
-		if d < 5*time.Second {
-			t.Fatalf("init sleep %s shorter than the 5 s extra sleep", d)
-		}
-	}
-	if len(logger.warnings) != 2 {
-		t.Fatalf("init warnings = %d, want 2", len(logger.warnings))
-	}
-	if len(client.calls) != 1 {
-		t.Fatalf("log calls = %d, want 1", len(client.calls))
+	if len(second.calls) != 1 {
+		t.Fatalf("reconnected client log calls = %d, want 1", len(second.calls))
 	}
 }
 
-// TestInitLoopCancelledDuringBackoff proves the init loop is interruptible:
-// a cancellation during the backoff+5s wait stops the retry and surfaces
-// the context error (shutdown must not hang).
-func TestInitLoopCancelledDuringBackoff(t *testing.T) {
+// TestInitRetriableFailureCancelledDuringSleep proves the flat 5 s init
+// wait is interruptible: cancellation surfaces the context error so
+// shutdown never hangs on a down server.
+func TestInitRetriableFailureCancelledDuringSleep(t *testing.T) {
 	s, _, _ := newTestSender(t, baseConfig())
 	ctx, cancel := context.WithCancel(context.Background())
 	s.sleep = func(_ context.Context, _ time.Duration) bool {
@@ -378,6 +402,91 @@ func TestInstanceClassifierRoutesConnErrors(t *testing.T) {
 	}
 	if inst.Classifier.Retriable(errors.New("boom")) {
 		t.Fatal("a generic error must take the unexpected-exception path")
+	}
+}
+
+// TestNumericFieldsKeepIntegerIdentity is the regression for the
+// json.Unmarshal float64 collapse: an INTEGER JSON PID must render
+// exactly Python's str(100) == "100", not "100.0"; a FLOAT PID keeps its
+// fraction (Python str(100.0) == "100.0"). Numeric PRIORITY and
+// SYSLOG_FACILITY are exercised too.
+func TestNumericFieldsKeepIntegerIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		pid  any
+	}{
+		{"integer pid", `{"MESSAGE":"m","PRIORITY":6,"timestamp":"t","PID":100}`, "100"},
+		{"float pid", `{"MESSAGE":"m","PRIORITY":6,"timestamp":"t","PID":100.0}`, "100.0"},
+		{"negative integer pid", `{"MESSAGE":"m","PRIORITY":6,"timestamp":"t","PID":-7}`, "-7"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, client, _ := newTestSender(t, baseConfig())
+			if err := s.SendMessages(context.Background(), [][]byte{[]byte(tc.msg)}, "c1"); err != nil {
+				t.Fatalf("SendMessages: %v", err)
+			}
+			if got := client.calls[0].PID; got != tc.pid {
+				t.Fatalf("pid = %v, want %v", got, tc.pid)
+			}
+		})
+	}
+
+	t.Run("numeric priority and facility", func(t *testing.T) {
+		s, client, _ := newTestSender(t, baseConfig())
+		msg := []byte(`{"MESSAGE":"m","PRIORITY":3,"timestamp":"t","SYSLOG_FACILITY":20}`)
+		if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
+			t.Fatalf("SendMessages: %v", err)
+		}
+		got := client.calls[0]
+		if got.Severity != 3 || got.Facility != 20 {
+			t.Fatalf("severity/facility = %d/%d, want 3/20", got.Severity, got.Facility)
+		}
+	})
+}
+
+// TestEmptyCACertsStillSelectsTLS is the sender-side half of the
+// ca_certs presence rule: an explicitly empty ca_certs must map to
+// CACertsPresent (Python's `cacerts is not None`), so it cannot silently
+// select plaintext; an absent or null ca_certs does not.
+func TestEmptyCACertsStillSelectsTLS(t *testing.T) {
+	cases := []struct {
+		name    string
+		config  map[string]any
+		present bool
+		ssl     bool
+	}{
+		{"present empty string", map[string]any{"ca_certs": ""}, true, false},
+		{"present path", map[string]any{"ca_certs": "/etc/ca.pem"}, true, false},
+		{"absent", map[string]any{}, false, false},
+		{"present null", map[string]any{"ca_certs": nil}, false, false},
+		{"ssl with absent ca_certs", map[string]any{"ssl": true}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			for k, v := range tc.config {
+				cfg[k] = v
+			}
+			inst, err := New(sender.ConstructorArgs{Name: "t", Config: cfg})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			rc, err := inst.Transport.(*Sender).resolvedConfig()
+			if err != nil {
+				t.Fatalf("resolvedConfig: %v", err)
+			}
+			if rc.client.CACertsPresent != tc.present {
+				t.Fatalf("CACertsPresent = %v, want %v", rc.client.CACertsPresent, tc.present)
+			}
+			wantProto := "PLAINTEXT"
+			if tc.ssl {
+				wantProto = "SSL"
+			}
+			if rc.client.Protocol != wantProto {
+				t.Fatalf("Protocol = %q, want %q", rc.client.Protocol, wantProto)
+			}
+		})
 	}
 }
 

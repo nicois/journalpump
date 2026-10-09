@@ -11,11 +11,11 @@
 package rsyslog
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -41,14 +41,6 @@ const (
 // initRetrySleep is rsyslog.py:70's flat time.sleep(5.0) after every
 // retriable connection failure inside _init_rsyslog_client.
 const initRetrySleep = 5 * time.Second
-
-// backoffBase and backoffCap mirror base.py:_backoff defaults (0.5 s,
-// 1800 s); maxBackoffExponent bounds the 2**n term (base.py caps at 100).
-const (
-	backoffBase        = 500 * time.Millisecond
-	backoffCap         = 1800 * time.Second
-	maxBackoffExponent = 100
-)
 
 // logClient is the consumer-side seam onto the syslog transport (thread B
 // custom-fake rule): *syslogframing.Client implements it in production,
@@ -179,6 +171,14 @@ func parseConfig(raw map[string]any) (*clientConfig, error) {
 	if isTrue(raw["ssl"]) {
 		protocol = "SSL"
 	}
+	// Python's `cacerts is not None` (rsyslog.py:135): the TLS context is
+	// built whenever ca_certs is supplied with a non-null value — an
+	// explicitly empty string included. config.get returns None for both
+	// an absent key and an explicit null, so only present+non-nil counts.
+	caCertsPresent := false
+	if v, present := raw["ca_certs"]; present && v != nil {
+		caCertsPresent = true
+	}
 	cfg := syslogframing.Config{
 		Server:              serverStr,
 		Port:                port,
@@ -186,6 +186,7 @@ func parseConfig(raw map[string]any) (*clientConfig, error) {
 		MaxMsg:              maxMsg,
 		Protocol:            protocol,
 		CACerts:             optionalConfigString(raw, "ca_certs"),
+		CACertsPresent:      caCertsPresent,
 		KeyFile:             optionalConfigString(raw, "client_key"),
 		CertFile:            optionalConfigString(raw, "client_cert"),
 		LogFormat:           optionalConfigString(raw, "logline"),
@@ -242,10 +243,20 @@ func (s *Sender) connect(ctx context.Context) (logClient, error) {
 	return c, nil
 }
 
-// ensureClient returns the live client, connecting on first use via the
-// Python init loop. The connect call runs WITHOUT holding s.mu (the
-// production connect reads the parsed config under the same lock;
-// holding it here would deadlock).
+// ensureClient returns the live client, connecting on first use. The
+// connect call runs WITHOUT holding s.mu (the production connect reads
+// the parsed config under the same lock; holding it here would deadlock).
+//
+// Reconnection is integrated with the shared Task 13 loop: on a retriable
+// connection failure the sender logs rsyslog.py:62-66's warning, waits
+// out the flat 5 s sleep (rsyslog.py:70), and RETURNS the error so the
+// loop owns the mark_disconnected transition (populating the health error
+// ring), the jittered exponential backoff — one shared counter, so a
+// send-failure backoff and a subsequent reconnect-failure backoff
+// continue the same exponent instead of restarting — and the reset on
+// the next successful batch. The sender keeps no private backoff state.
+// A non-retriable failure (missing rsyslog_server, bad format) returns
+// immediately for the loop's "unexpected exception" path.
 func (s *Sender) ensureClient(ctx context.Context) (logClient, error) {
 	s.mu.Lock()
 	if s.client != nil {
@@ -254,64 +265,32 @@ func (s *Sender) ensureClient(ctx context.Context) (logClient, error) {
 		return c, nil
 	}
 	s.mu.Unlock()
-	return s.initClient(ctx)
-}
 
-// initClient ports rsyslog.py:25-70 (_init_rsyslog_client): try to
-// connect; on a retriable RSYSLOG_CONN_ERRORS failure log a warning,
-// wait out the jittered exponential backoff PLUS the flat 5 s sleep, and
-// retry until the client is up or ctx is cancelled. A non-retriable
-// failure (e.g. a missing rsyslog_server or a bad format) returns
-// immediately — the shared loop routes it to the "unexpected exception"
-// path, which is Python's generic except clause.
-func (s *Sender) initClient(ctx context.Context) (logClient, error) {
 	s.logf("Initializing Rsyslog Client %s", s.name())
-	attempt := 0
-	for {
-		c, err := s.newClient(ctx)
-		if err == nil {
-			s.mu.Lock()
-			if s.client == nil {
-				s.client = c
-			} else {
-				// Another path connected first; keep theirs.
-				c.Close()
-			}
-			res := s.client
-			s.mu.Unlock()
-			if cfg, cerr := s.resolvedConfig(); cerr == nil {
-				s.logf("Initialized Rsyslog Client %s, server: %s, port: %d", s.name(), cfg.client.Server, cfg.client.Port)
-			}
-			return res, nil
-		}
+	c, err := s.newClient(ctx)
+	if err != nil {
 		if !Retriable(err) {
 			return nil, err
 		}
 		s.warn("Retryable error during Rsyslog Client initialization: %s: %s, sleeping", fmt.Sprintf("%T", err), err)
-		attempt++
-		if !s.sleep(ctx, backoffDuration(attempt)+initRetrySleep) {
+		if !s.sleep(ctx, initRetrySleep) {
 			return nil, ctx.Err()
 		}
+		return nil, err
 	}
-}
-
-// backoffDuration reproduces the pre-sleep term of base.py:_backoff:
-// t = min(cap, base * 2**min(100, attempt)) / 2; _backoff then sleeps a
-// uniform draw from [t, 2t). Kept local so the init loop's "backoff + 5 s
-// extra sleep" cadence (rsyslog.py:68-70) is owned by this sender.
-func backoffDuration(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
+	s.mu.Lock()
+	if s.client == nil {
+		s.client = c
+	} else {
+		// Another path connected first; keep theirs.
+		c.Close()
 	}
-	doubled := backoffBase
-	for range min(maxBackoffExponent, attempt) - 1 {
-		doubled *= 2
-		if doubled >= backoffCap/2 {
-			doubled = backoffCap / 2
-			break
-		}
+	res := s.client
+	s.mu.Unlock()
+	if cfg, cerr := s.resolvedConfig(); cerr == nil {
+		s.logf("Initialized Rsyslog Client %s, server: %s, port: %d", s.name(), cfg.client.Server, cfg.client.Port)
 	}
-	return doubled + time.Duration(rand.Float64()*float64(doubled))
+	return res, nil
 }
 
 // sleepCtx waits d, returning false if ctx is cancelled first.
@@ -387,8 +366,15 @@ func (s *Sender) Close() error {
 // logInput maps one journald JSON payload to SyslogTcpClient.log kwargs
 // (rsyslog.py:60-99).
 func (s *Sender) logInput(msg []byte) (syslogframing.LogInput, error) {
+	// Decode with UseNumber so an integer field (JSON `100`) keeps its
+	// integer identity instead of collapsing to float64(100) and rendering
+	// "100.0" — Python's json.loads yields int(100), str(100) == "100".
+	// The json.Number literal preserves the int/float distinction through
+	// pythonStr/pythonInt.
 	var m map[string]any
-	if err := json.Unmarshal(msg, &m); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(msg))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
 		return syslogframing.LogInput{}, fmt.Errorf("rsyslog sender: decode payload: %w", err)
 	}
 	cfg, err := s.resolvedConfig()
@@ -554,7 +540,7 @@ func pythonStr(v any) string {
 	case int64:
 		return strconv.FormatInt(t, 10)
 	case json.Number:
-		return t.String()
+		return jsonNumberStr(t)
 	case []any:
 		parts := make([]string, len(t))
 		for i, item := range t {
@@ -564,6 +550,20 @@ func pythonStr(v any) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+// jsonNumberStr renders str(value) for a JSON number kept as json.Number:
+// a literal with no fraction/exponent is an int in Python (str is the
+// literal, so PID 100 → "100"); otherwise Python parsed a float and str
+// uses Python's float repr (so 100.0 → "100.0").
+func jsonNumberStr(n json.Number) string {
+	s := n.String()
+	if strings.ContainsAny(s, ".eE") {
+		if f, err := n.Float64(); err == nil {
+			return journal.PythonFloatRepr(f)
+		}
+	}
+	return s
 }
 
 // pythonRepr renders repr(value), used inside list rendering. Strings are
@@ -607,11 +607,15 @@ func pythonInt(v any) (int, error) {
 	case float64:
 		return int(t), nil
 	case json.Number:
-		n, err := t.Int64()
-		if err != nil {
-			return 0, fmt.Errorf("%v is not an integer", t)
+		if n, err := t.Int64(); err == nil {
+			return int(n), nil
 		}
-		return int(n), nil
+		// Python's int() accepts a float and truncates toward zero.
+		f, err := t.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("invalid literal for int(): %q", t)
+		}
+		return int(f), nil
 	case bool:
 		if t {
 			return 1, nil

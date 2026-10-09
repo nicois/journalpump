@@ -1024,9 +1024,9 @@ func TestRunLoopAndShutdownGrace(t *testing.T) {
 		go func() { done <- rt.run(ctx) }()
 
 		synctest.Wait()
-		// The first idle iteration waits one poll interval before
-		// update_status opens the reader; advance the fake clock over
-		// that wait so the append is drained.
+		// The reader opens on the FIRST iteration (no initial poll
+		// delay); advance the fake clock over the subsequent reader wait
+		// so the append is drained.
 		time.Sleep(2 * pollInterval)
 		synctest.Wait()
 		if !rt.ready() {
@@ -1113,6 +1113,40 @@ func TestRunLoopFirstWaitInvalidateRecreates(t *testing.T) {
 		}
 		if got := rt.currentCursor(); got != "c3" {
 			t.Errorf("cursor = %q, want c3 (backlog drained before recreation)", got)
+		}
+	})
+}
+
+// TestRunLoopOpensReaderWithoutInitialPollDelay locks Python's immediate
+// first poll (poll_timeout_ms initialised to 0.0, journalpump.py:1104): the
+// reader is opened on the FIRST loop iteration, before any poll interval
+// elapses. If the old initial delay returns (sleeping one pollInterval
+// before update_status opens the reader), ensureCalls stays 0 until the
+// fake clock advances and this fails — with initial_position "tail" that
+// delay is an operator-visible skipped-message window after READY. It is
+// independent of the systest driver's readiness probe.
+func TestRunLoopOpensReaderWithoutInitialPollDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+		_, rt := newTestRuntime(t, cfg, &captureLog{})
+		src := &fakeSource{reader: &fakeReader{
+			nopPoll: true,
+			entries: []journal.Entry{{Cursor: "c1", Fields: []journal.Field{{Key: "MESSAGE", Value: "a"}}}},
+		}}
+		rt.reopener = src
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- rt.run(ctx) }()
+
+		synctest.Wait()
+		// No clock advance: the first iteration must already have opened.
+		if src.ensureCalls < 1 {
+			t.Fatalf("reader not opened before the first poll interval (ensureCalls=%d)", src.ensureCalls)
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("run returned %v, want nil on cancellation", err)
 		}
 	})
 }

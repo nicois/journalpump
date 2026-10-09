@@ -421,6 +421,28 @@ func poolFromPEM(t *testing.T, caPEM []byte) *x509.CertPool {
 	return pool
 }
 
+// TestNewClientEmptyCACertsStillSelectsTLS is the security guard for the
+// rsyslog.rsyslog.py:135 rule `if cacerts is not None or protocol ==
+// "SSL"`: an explicitly supplied but EMPTY ca_certs must still engage
+// TLS, never silently fall back to plaintext. The stub is not a net.Conn,
+// so a TLS-engaged construction fails with the TLS type error; the
+// control (CACertsPresent false) succeeds over the same stub.
+func TestNewClientEmptyCACertsStillSelectsTLS(t *testing.T) {
+	dial := func(context.Context) (Conn, error) { return &stubConn{}, nil }
+
+	if _, err := NewClient(context.Background(), Config{RFC: "RFC5424", Server: "s", Dial: dial, CACertsPresent: true}); err == nil {
+		t.Fatal("present-but-empty ca_certs did not engage TLS (plaintext silently selected)")
+	} else if !strings.Contains(err.Error(), "TLS") {
+		t.Fatalf("error = %v, want a TLS construction error", err)
+	}
+
+	c, err := NewClient(context.Background(), Config{RFC: "RFC5424", Server: "s", Dial: dial})
+	if err != nil {
+		t.Fatalf("control (no ca_certs) refused a plaintext connection: %v", err)
+	}
+	c.Close()
+}
+
 // TestNewClientTLSTrustedAndSNI proves the handshake is completed during
 // construction (not lazily at first write) and that SNI carries the
 // configured server name.

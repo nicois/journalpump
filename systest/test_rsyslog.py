@@ -114,20 +114,28 @@ class _TestRsyslogd:
 def _wait_for_reader_ready(logfile: Path, *, timeout: float = 10.0) -> None:
     """Block until the spawned daemon's journal reader is attached.
 
-    The harness's READY=1 is not sufficient for the tail-positioned reader:
-    the Python daemon opens the journal in JournalPump.__init__ (before its
-    first READY=1, daemon.py:113-114), but the Go daemon's reader goroutine
-    opens it inside Pump.Run, AFTER the READY=1 notifications. With
-    ``initial_position: "tail"`` a line injected before the reader attaches
-    is pinned away and lost, so the readiness probe below re-sends a
-    throwaway journal entry until one reaches the wire — proving the tail
-    pin is now taken — before the real batch is injected. The probe text
-    deliberately does not match any ``{Info,Warning,Error,Critical} message
-    for {identifier}`` assertion pattern.
+    READY=1 precedes the reader open in BOTH implementations: Python's
+    JournalReader.__init__ leaves ``journald_reader`` None and update_status
+    opens it inside ``run``, after both READY=1 notifications
+    (journalpump.py:204, 1143-1179; daemon.py:113-114), and the Go reader
+    goroutine likewise opens it inside Pump.Run. With ``initial_position:
+    "tail"`` a line injected before the reader attaches is pinned away and
+    lost, so both implementations need the reader attached before the real
+    batch — this is the harness-level replacement for the in-process
+    journalpump_initialized() wait of the original driver, not a workaround
+    for a Go-only ordering defect.
 
-    The Go READY-before-reader-open ordering is a divergence from Python
-    and is flagged for adjudication (see the Task 20 report); this wait
-    keeps the wire-parity assertions deterministic meanwhile.
+    The Go-specific defect the port exposed was different: the reader slept
+    a FULL poll interval before its first open, whereas Python's run loop
+    starts with ``poll_timeout_ms = 0.0`` (journalpump.py:1104) and opens
+    the reader on the immediate first poll. That initial delay is fixed in
+    the daemon (the first loop iteration polls immediately). The readiness
+    probe below re-sends a throwaway journal entry until one reaches the
+    wire (the tail pin is taken), keeping the wire assertions deterministic;
+    because it would also paper over a returning initial delay, the daemon
+    carries an independent regression guard
+    (TestRunLoopOpensReaderWithoutInitialPollDelay) that fails if the delay
+    comes back. The probe text never matches an assertion pattern.
     """
     deadline = monotonic() + timeout
     probe_identifier = "".join(random.sample(string.ascii_uppercase + string.digits, k=8))
@@ -158,8 +166,9 @@ def _run_pump_test(
     # Drive the journalpump BINARY through the implementation-agnostic
     # harness (systest/journalpump_process.py, plan Task 10/20): the
     # JOURNALPUMP_BIN selection picks the Python daemon (default) or the Go
-    # binary, so the same black-box suite pins both. READY=1 replaces the
-    # in-process journalpump_initialized() check, and SIGTERM (harness
+    # binary, so the same black-box suite pins both. The harness READY=1
+    # waits for daemon start; _wait_for_reader_ready replaces the in-process
+    # journalpump_initialized() reader-attached check; SIGTERM (harness
     # stop) replaces the manual reader/sender request_stop().
     with JournalpumpProcess() as journalpump:
         journalpump.start(config_path)

@@ -141,6 +141,16 @@ def _cases():
     )
     cases.append(
         {
+            "name": "numeric_pid_and_fields",
+            "config": {},
+            "messages": [
+                {"MESSAGE": "numeric pid", "PRIORITY": 6, "timestamp": ts, "HOSTNAME": "h", "PID": 100, "SYSLOG_FACILITY": 3},
+                {"MESSAGE": "zero pid is nilvalue", "PRIORITY": 2, "timestamp": ts, "PID": 0},
+            ],
+        }
+    )
+    cases.append(
+        {
             "name": "facility_list_and_structured_data",
             "config": {"structured_data": 'x="y"', "default_facility": 3},
             "messages": [

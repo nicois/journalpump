@@ -39,12 +39,18 @@ type writeDeadliner interface {
 // Config carries the SyslogTcpClient constructor arguments
 // (rsyslog.py:100-141).
 type Config struct {
-	Server              string
-	Port                int
-	RFC                 string // "RFC5424" | "RFC3164" | "CUSTOM"
-	MaxMsg              int    // 0 means DefaultMaxMsg; negatives preserved
-	Protocol            string // "" == "PLAINTEXT"
-	CACerts             string
+	Server   string
+	Port     int
+	RFC      string // "RFC5424" | "RFC3164" | "CUSTOM"
+	MaxMsg   int    // 0 means DefaultMaxMsg; negatives preserved
+	Protocol string // "" == "PLAINTEXT"
+	CACerts  string
+	// CACertsPresent records whether the ca_certs OPTION was supplied
+	// with a non-null value (Python's `cacerts is not None`), even when
+	// that value is an empty string. SyslogTcpClient builds the TLS
+	// context whenever `cacerts is not None` (rsyslog.py:135), so an
+	// explicitly empty ca_certs must still select TLS — not plaintext.
+	CACertsPresent      bool
 	KeyFile             string
 	CertFile            string
 	LogFormat           string
@@ -87,7 +93,10 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Protocol == "" {
 		cfg.Protocol = "PLAINTEXT"
 	}
-	if cfg.TLSConfig == nil && cfg.Dial == nil && (cfg.CACerts != "" || cfg.Protocol == "SSL") {
+	// TLS is selected exactly like Python's `cacerts is not None or
+	// protocol == "SSL"` (rsyslog.py:135): a supplied ca_certs option —
+	// even an explicitly empty one — enables TLS, not plaintext.
+	if cfg.TLSConfig == nil && (cfg.CACertsPresent || cfg.CACerts != "" || cfg.Protocol == "SSL") {
 		tlsCfg, err := buildTLSConfig(cfg)
 		if err != nil {
 			return nil, err
