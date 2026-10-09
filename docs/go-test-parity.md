@@ -1499,11 +1499,11 @@ Frame and config:
 - The production HTTP client disables TLS verification (`verify=False`,
   deliberate, spec §2), applies the timeout as an INACTIVITY timeout
   (`idleTimeoutConn` resets the dial/per-read deadlines; there is no
-  `http.Client.Timeout`, which would be a total deadline), maps a falsy
-  timeout (0/negative) to the 60 s session default
-  (`TimeoutAdapter` semantics), and honors the proxy environment
-  (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, read per request via
-  `golang.org/x/net/http/httpproxy`, like `requests.Session`).
+  `http.Client.Timeout`, which would be a total deadline), maps ONLY a zero
+  timeout (the falsy value) to the 60 s session default (`TimeoutAdapter`
+  semantics; a negative value is truthy in Python and is rejected at load,
+  see the review round), and resolves the proxy environment per request with
+  `requests.Session`'s own rules (see the review round).
 - `MESSAGE` is unguarded in Python (`entry["MESSAGE"]` → KeyError when
   absent; `str +=` → TypeError when non-string); `formatMsg` returns an
   error for both, and for invalid JSON.
@@ -1576,15 +1576,58 @@ Timeout semantics:
   `TestSlowResponseWithinTimeout` and
   `TestIncrementalDeliveryExceedsTotalTimeout` (6 chunks × 40 ms = 240 ms
   under a 100 ms inactivity timeout) pin the distinction.
-- A falsy `logplex_request_timeout` (0 or negative) maps to the 60 s
-  session default (`TimeoutAdapter` substitutes the session timeout for a
-  falsy per-request value). `TestResolvedTimeoutUsesSessionDefault` pins
-  `resolvedTimeout(0) == 60 s`.
+- ONLY a zero `logplex_request_timeout` maps to the 60 s session default
+  (`TimeoutAdapter` substitutes the session timeout only for a FALSY
+  per-request value, and zero is the only falsy number). A negative value
+  is TRUTHY in Python, so `TimeoutAdapter` passes it through and
+  `requests` raises "the timeout cannot be set to a value less than or
+  equal to 0"; Go rejects it at load instead (strict-at-load deviation).
+  `TestResolvedTimeoutUsesSessionDefault` pins `resolvedTimeout(0) == 60 s`
+  and `TestNegativeTimeoutRejected` pins the rejection.
 
-Proxy environment:
+Proxy environment (review round 2):
 
-- The custom Transport sets a `Proxy` function that reads the proxy
-  environment per request (`httpproxy.FromEnvironment().ProxyFunc()`),
-  including the `no_proxy` bypass, matching `requests.Session`.
-  `TestProxyFromEnvironment` (recording proxy) and `TestNoProxyBypass`
-  pin it.
+- The custom Transport's `Proxy` function reproduces
+  `requests.Session`'s selection (`resolve_proxies` + `select_proxy` over
+  `urllib.request.getproxies`), NOT `net/http.ProxyFromEnvironment`
+  (`httpproxy`), which differs three ways: it gives uppercase variables
+  precedence, ignores the `ALL_PROXY` fallback, and unconditionally
+  bypasses loopback addresses.
+- Rules implemented: a lowercase `*_proxy` variable wins over its
+  uppercase twin and an empty lowercase value removes the entry (the
+  second `getproxies_environment` pass inspects the ORIGINAL name, so
+  uppercase never overrides lowercase); the `no_proxy` lookup is
+  lowercase-first with an uppercase fallback; `ALL_PROXY` is the fallback
+  when no scheme-specific proxy is set; and loopback targets are NOT
+  special-cased — they are proxied unless `no_proxy` matches (the
+  platform-specific `proxy_bypass` is a no-op on Linux, where requests
+  clears `no_proxy` around it when none was supplied).
+- `TestProxySelectionMatchesRequests` unit-tests the precedence (lowercase
+  wins, empty lowercase removes), the `ALL_PROXY` fallback and the
+  scheme-beats-`ALL_PROXY` case; `TestNoProxySelection` unit-tests the
+  `no_proxy` hostname/IP matching. `TestProxyUsedForLoopbackTarget` is the
+  non-vacuous loopback control (a loopback target IS proxied when no
+  `no_proxy` matches — the old `httpproxy` selector would have bypassed it
+  and passed vacuously); `TestNoProxyBypass` uses a NON-loopback target and
+  asserts the proxy is NOT used.
+
+Interpolation of container-valued extras (review round 2):
+
+- `pyRepr` now follows Python's `repr` exactly: single quotes unless the
+  string contains `'` and no `"` (then double quotes), with backslash
+  escaping of the chosen quote, backslash, the short escapes `\t` `\n`
+  `\r`, and `\xNN` for every other control character (including NUL and
+  DEL) — previously it single-quoted unconditionally and emitted control
+  characters literally. `TestPyStrMatchesPython` pins apostrophe/quote
+  selection and control-character escaping for container values supplied
+  through `extra_field_values`.
+
+Fixture assertion at the HTTP boundary (review round 2):
+
+- `TestFixtureStructuralParity` compares hostname, PID, token, msgid and
+  structured-data directly against the fixture's parsed frame fields
+  (not hard-coded constants), and asserts the CAPTURED request method,
+  path and every `fixture.Request.Headers` entry. Constant-field
+  quirk-locks (`TestHostnamePIDAlwaysLocalhost`,
+  `TestPRIAndFieldConstants`) remain separate tests for the parts we
+  intentionally lock.
