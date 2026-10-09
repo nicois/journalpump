@@ -26,6 +26,10 @@ func TestParseSeqnumFromCursor(t *testing.T) {
 		{"s=abc;b=def;m=123;t=456;x=789", nil, false},       // no i= field
 		{"s=abc;i=;b=def;m=123;t=456;x=789", nil, false},    // empty i= value
 		{"s=abc;i=xyz;b=def;m=123;t=456;x=789", nil, false}, // non-hex i= value
+		{"s=abc;i=++0;b=def", nil, false},
+		{"s=abc;i=+-0;b=def", nil, false},
+		{"s=abc;i=--0;b=def", nil, false},
+		{"s=abc;i=-+0;b=def", nil, false},
 		{"", nil, false},
 	} {
 		got, ok := ParseSeqnumFromCursor(tc.cursor)

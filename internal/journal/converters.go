@@ -228,11 +228,11 @@ func pythonIntString(s string, base int) (any, bool) {
 
 // stripUnderscores removes Python int() underscores: allowed between
 // digits and right after the base prefix (afterPrefix), but not leading,
-// trailing, doubled, or adjacent to the sign.
+// trailing, doubled, or adjacent to the sign. Every character is
+// validated (no underscore-free short-circuit), so residual signs after
+// the initial sign strip — "++0", "+-0", "--0", "-+0" — are rejected like
+// Python int()'s ValueError instead of leaking into strconv.ParseInt.
 func stripUnderscores(s string, base int, afterPrefix bool) (string, bool) {
-	if !strings.Contains(s, "_") {
-		return s, true
-	}
 	var b strings.Builder
 	underscoreAllowed := afterPrefix
 	for i := 0; i < len(s); i++ {
