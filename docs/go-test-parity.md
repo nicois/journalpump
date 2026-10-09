@@ -1323,6 +1323,21 @@ least once per review round; a cached "ok" is not evidence that a
 concurrency assertion still holds. `make systest-go` caches, so the
 binding command is `go test -race -count=1 ...`.
 
+### Gate-integrity finding — a flaky fd-release assertion
+
+`TestGoRotationDeletedFileFdRelease` (Task 18) checked the daemon's open
+descriptors for a just-deleted rotated journal IMMEDIATELY after removing
+the file. The daemon handles the deletion asynchronously (journal
+notification), so the assertion raced the descriptor close and failed
+roughly one run in five with "deleted journal ... still open ...
+(deleted)"; it was observed during the Task 21 round-5 gate on otherwise
+unchanged code, then passed on re-run and 3/3 focused re-runs.
+
+**Fix:** `waitFdTargetGone` polls (bounded, 10 s) for the descriptor to be
+released before the no-open-fd assertion, preserving the intent while
+removing the timing race; five consecutive focused runs pass. Unrelated
+to Task 21; committed separately.
+
 ## Task 20 — rsyslog sender (spec §5)
 
 `internal/sender/rsyslog` ports `journalpump/senders/rsyslog.py` on top
@@ -1625,6 +1640,13 @@ Proxy environment (review round 2):
   the empty-lowercase-removes-uppercase-wildcard negative, leading dot,
   label boundary, port handling and CIDR/plain IP; `TestParseProxyURL`
   and `TestProxyConfiguredWithoutScheme` cover the scheme-less address.
+- Review round 5 split the ENTRY preprocessing too: layer 1 keeps
+  requests' rule (remove every ASCII space, no per-entry strip), while
+  layer 2 uses urllib's rule (split on commas, then Python `strip()` each
+  entry — space, `\t`, `\n`, `\r`, `\f`, `\v`), so a tab-padded entry
+  `no_proxy="\tExample.Com\t"` bypasses `example.com` (probe-verified).
+  `splitNoProxyEntries` (layer 1) and `splitFallbackEntries` (layer 2,
+  `strings.TrimSpace`) are now independent.
 - `TestProxySelectionMatchesRequests` unit-tests the precedence (lowercase
   wins, empty lowercase removes), the `ALL_PROXY` fallback and the
   scheme-beats-`ALL_PROXY` case; `TestNoProxySelection` unit-tests the
