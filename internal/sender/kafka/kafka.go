@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -158,6 +159,10 @@ type producerConfig struct {
 // config is resolved on the first connect (Python's deferred
 // _generate_producer_config).
 func New(args sender.ConstructorArgs) (sender.Instance, error) {
+	// kafka_sender.py:44 silences the client's internal logging
+	// (logging.getLogger("kafka").setLevel(CRITICAL)); sarama's
+	// package-level logger is the analogue.
+	sarama.Logger = log.New(io.Discard, "", 0)
 	seconds := defaultMaxSendInterval
 	if raw, present := args.Config["max_send_interval"]; present {
 		parsed, ok := intervalSeconds(raw)
