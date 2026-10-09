@@ -1299,6 +1299,30 @@ the suite that wrote it. The assertion is fixed to compare matching
 prefixes (the file sender flushes only a prefix mid-run), keeping the
 expanded 40-line fixture.
 
+### Gate-integrity finding — a cached run masked a data race
+
+`internal/filter.Search.hits` (Task 5) was a plain `int64` incremented by
+`PerformSearches` on the reader goroutine while the state/stats paths read
+it concurrently through `Hits()`. The unsynchronized read/write pair is a
+real data race that fails under `-race`; it went undetected because the
+per-task green runs were `go test` CACHED — the same cached-run-masked
+class as the `d51bb7d` regression above, and it surfaced only when the
+Task 21 gate ran the systest suite UNCACHED
+(`go test -race -count=1 -tags systest ./systest-go/...`, which reproduces
+it through `TestGoReloadPreservesDeliveryCursors`: `WARNING: DATA RACE`).
+
+**Fix:** the counter is now an `atomic.Int64`.
+`TestHitsConcurrentWithPerformSearches` reproduces the race
+DETERMINISTICALLY under `-race` (non-vacuous: reverting to plain `int64`
+fails it with a DATA RACE and PASS; the atomic implementation is green).
+This is tracked separately from Task 21 — it is a gate-integrity finding,
+not a logplex change.
+
+**Corrective (process):** the gate must run the race suites UNCACHED at
+least once per review round; a cached "ok" is not evidence that a
+concurrency assertion still holds. `make systest-go` caches, so the
+binding command is `go test -race -count=1 ...`.
+
 ## Task 20 — rsyslog sender (spec §5)
 
 `internal/sender/rsyslog` ports `journalpump/senders/rsyslog.py` on top
@@ -1458,17 +1482,28 @@ Frame and config:
   is the FORMAT time (`now(UTC)`) in `%Y-%m-%dT%H:%M:%S+00:00 ` shape, not
   the journal timestamp.
 - The named quirk-lock: `entry.get("_HOSTNAME", "localhost")` /
-  `entry.get("_PID", "localhost")` never match because the journal
-  processor strips leading underscores before the sender sees the payload
-  (journalpump.py:708-714), so hostname and pid are the literal
-  `"localhost"` even when the payload carries `HOSTNAME`/`PID`.
-  `TestHostnamePIDAlwaysLocalhost` pins it.
+  `entry.get("_PID", "localhost")` never match the JOURNAL fields because
+  the journal processor strips leading underscores before the sender sees
+  the payload (journalpump.py:708-714), so for journal input hostname and
+  pid are the literal `"localhost"` even when the payload carries
+  `HOSTNAME`/`PID`. `TestHostnamePIDAlwaysLocalhost` pins it. The claim is
+  QUALIFIED: `extra_field_values` are merged AFTER the underscore
+  stripping, so a sender extra CAN supply `_HOSTNAME`/`_PID`; those keys
+  ARE reachable and their values render through `pyStr` (Python `str()`)
+  — capitalized `True`/`False`, Python float repr, integer identity, and
+  list/object repr. `TestHostnamePIDFromExtras` pins the extras cases.
 - `New` requires `logplex_log_input_url` and `logplex_token` (Python's
   `config[...]` KeyErrors), reads `max_send_interval` (default 5.0) and
   `logplex_request_timeout` (default 2 s), and sets `ConnectOnInit` because
-  `LogplexSender.__init__` calls `mark_connected`. The production HTTP
-  client disables TLS verification (`verify=False`, deliberate, spec §2)
-  and applies the per-request timeout.
+  `LogplexSender.__init__` calls `mark_connected`.
+- The production HTTP client disables TLS verification (`verify=False`,
+  deliberate, spec §2), applies the timeout as an INACTIVITY timeout
+  (`idleTimeoutConn` resets the dial/per-read deadlines; there is no
+  `http.Client.Timeout`, which would be a total deadline), maps a falsy
+  timeout (0/negative) to the 60 s session default
+  (`TimeoutAdapter` semantics), and honors the proxy environment
+  (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, read per request via
+  `golang.org/x/net/http/httpproxy`, like `requests.Session`).
 - `MESSAGE` is unguarded in Python (`entry["MESSAGE"]` → KeyError when
   absent; `str +=` → TypeError when non-string); `formatMsg` returns an
   error for both, and for invalid JSON.
@@ -1488,8 +1523,13 @@ Framing deviation (charter §2/D6, user decision 2026-10-09):
   parsed fields (PRI, version, timestamp shape, localhost hostname/pid,
   token, msgid/sd, message) must equal what Python intends, and the clean
   frame must contain no `b'`.
-  `TestFixtureStructuralParity` + `TestFormatMessageCleanFrame` pin it
-  (non-vacuous: reproducing the repr makes both fail).
+  `TestFixtureStructuralParity` asserts this at the HTTP CAPTURE boundary:
+  the fixture-derived batch is sent through the production HTTP client and
+  EVERY captured length-prefixed frame is parsed and compared field by
+  field against the fixture's parsed values (not just `formatMsg` plus one
+  substring), rejecting bytes-repr framing.
+  `TestFormatMessageCleanFrame` pins the frame directly (non-vacuous:
+  reproducing the repr makes both fail).
 
 Fire-and-forget quirk lock:
 
@@ -1502,3 +1542,49 @@ Fire-and-forget quirk lock:
   and `health.status == "connected"`.
 - `TestSendPostsHeadersAndBody` / `TestHTTPServerEndToEnd` pin the POST
   headers and body against a fake doer and a real `httptest` server.
+
+### Task 21 review round (changes-required)
+
+Transport-error deviation (charter §2, coordinator ruling 2026-10-10):
+
+- On a TRANSPORT error (dial/read/timeout) Python's uncaught `requests`
+  exception aborts `get_and_send_messages`, silently drops the drained
+  batch, and leaves the sender healthy — silent data loss. Go instead
+  RETURNS the error, so the shared Task 13 loop retains the batch, retries
+  it, and marks the sender disconnected. This follows the framework-wide
+  retry semantics the approved spec mandates (the "Python is incorrect"
+  clause). Recorded as a sanctioned deviation; the HTTP-status behavior is
+  unchanged (a 500 is still ignored).
+- `TestTransportFailureRetainsAndRetries` runs the REAL `sender.Loop` with
+  a transport-failing doer and asserts the batch is retained + retried
+  (>=2 calls, `sent.count == 0` at the failure point) and health is marked
+  disconnected with a non-empty error ring.
+
+Response-body consumption:
+
+- `SendMessages` now CONSUMES the response body before returning and
+  PROPAGATES read failures (Python's `requests.post` consumes the body and
+  raises on a truncated/stalled one), while still ignoring the HTTP status.
+  `TestTruncatedBodyIsAnError` and `TestStalledBodyTimesOut` pin it.
+
+Timeout semantics:
+
+- The timeout is an INACTIVITY timeout: the dialer carries the connect
+  timeout and `idleTimeoutConn` resets the read/write deadline before every
+  socket operation, so a slow-but-progressing response does not trip it; a
+  total `http.Client.Timeout` is deliberately absent.
+  `TestSlowResponseWithinTimeout` and
+  `TestIncrementalDeliveryExceedsTotalTimeout` (6 chunks × 40 ms = 240 ms
+  under a 100 ms inactivity timeout) pin the distinction.
+- A falsy `logplex_request_timeout` (0 or negative) maps to the 60 s
+  session default (`TimeoutAdapter` substitutes the session timeout for a
+  falsy per-request value). `TestResolvedTimeoutUsesSessionDefault` pins
+  `resolvedTimeout(0) == 60 s`.
+
+Proxy environment:
+
+- The custom Transport sets a `Proxy` function that reads the proxy
+  environment per request (`httpproxy.FromEnvironment().ProxyFunc()`),
+  including the `no_proxy` bypass, matching `requests.Session`.
+  `TestProxyFromEnvironment` (recording proxy) and `TestNoProxyBypass`
+  pin it.
