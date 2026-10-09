@@ -490,8 +490,15 @@ required: <n>` / `-`). Any agent or future session reads this table
 first to locate the migration's current state; do not re-derive progress
 from git log alone.
 
-Last value demonstration: none — the Go binary has not yet run
-end-to-end (update when Task 16/18 produces the first run).
+Last value demonstration: 2026-10-09 — `systest-go/file_sender_e2e_test.go`
+(`TestFileSenderEndToEnd`, run via `make systest-go` or
+`go test -race -tags systest ./systest-go/`): real Go binary +
+production-format config + real libsystemd reader + fixture journals →
+40 output lines byte-identical to the Task 11 ground truth, sent
+cursor/count parity, exit 0 on SIGTERM. The evidence is the TEST-SHIM
+path (`JOURNALPUMP_FILES_AVAILABLE=1`, the analog of the Python
+ground-truth sitecustomize patch); production-path equivalence is the
+Task 18 harness's job.
 
 | Task | Description (short) | Status | Commit | Review verdict | Rounds | Minors |
 |---|---|---|---|---|---|---|
@@ -509,9 +516,9 @@ end-to-end (update when Task 16/18 produces the first run).
 | 12 | Kafka ground truth via real broker / recording proxy | done | 6e0c765 + eaee3cf | approved after one review round (5 minors fixed in eaee3cf; explicit skips: _free_port TOCTOU, base64 payload pinning — ASCII fail-loud guard instead): podman Kafka 4.0 KRaft captures (auto-create + manual-create/2-partitions), 40 payloads per run byte-reproducible (fixture sha1 48d65e4b), payload/key/partition/offsets/sent-cursor asserted, snappy pinned via zstandard-blocking shim (deployment-faithful; zstd-preference fact recorded in fixture notes for Task 22) | 1 | 5 |
 | 13 | Sender framework (error contract, wiring map, synctest) | done | 8b3e164 + 6e32971 | approved after one review round (5 minors fixed in 6e32971: post-jitter backoff log, per-route app-tag routing, %r-style quote parity, parity-doc forward notes). Fail-fast divergence independently verified by review: Python = silent unrecoverable sender wedge (base.py:117 daemon thread, no is_alive monitoring) while watchdog keeps passing — now a sanctioned deviation (§2) | 1 | 5 |
 | 14 | Per-sender buffer + reader backpressure (admission gate) | done | 08ad213 + 3ed7609 | approved after one review round (4 minors fixed in 3ed7609: budget passthrough for the msg_buffer_max_length=0 corner, runtime Attach guard, Task 16 forward note on the bytes_read measure; getsizeof byte budget ruled cosmetic with coordinator+reviewer concurrence) | 1 | 4 |
-| 15 | sdjournal reader (consumer-side seam, stats, match_key/value in handler) | done | 0fabf21 + 56f217a | changes-required → FIXED in 56f217a (one review round: 3 majors + 4 minors): FFI step ABI (sd_journal_next/previous return int — a uint64 wrapper zero-extended -errno into "entry present"; stepFromRc + test pin), match-add moved after the initial seek (Python order — match-then-seek silently lost the first matching entry after the resume cursor), LOCAL_ONLY default for plain/namespace opens restored (python-systemd journal.py:168-174; earlier false "no masking" probe claim corrected in the parity doc); minors: Wait timeout semantics (<0 indefinite, 0 non-blocking poll), symbol-resolution errors surfaced as named errors, match_value=None wiring guard + mid-open-failure divergence pinned in the parity doc. Native libsystemd dlopen binding deviation sanctioned (§2). Fixture acceptance: rotated_logs reproduces Python's probed ground truth (40 entries, entry-0 fields/types/key order); bad_msg corruption taxonomy probed (field-without-= vs Bad message layering) | 1 | 4 |
-| 16 | Run loop + per-sender pipeline + file sender | not-started | - | - |
-| 17 | Reload, resume, state save, shutdown (errgroup lifecycle) | not-started | - | - |
+| 15 | sdjournal reader (consumer-side seam, stats, match_key/value in handler) | done | 0fabf21 + 56f217a | changes-required → FIXED in 56f217a (one review round: 3 majors + 4 minors): FFI step ABI (sd_journal_next/previous return int — a uint64 wrapper zero-extended -errno into "entry present"; stepFromRc + test pin), match-add moved after the initial seek (Python order — match-then-seek silently lost the first matching entry after the resume cursor), LOCAL_ONLY default for plain/namespace opens restored (python-systemd journal.py:168-174; earlier false "no masking" probe claim corrected in the parity doc); minors: Wait timeout semantics (<0 indefinite, 0 non-blocking poll), symbol-resolution errors surfaced as named errors, match_value=None wiring guard + mid-open-failure divergence pinned in the parity doc. Native libsystemd dlopen binding deviation sanctioned (§2). Fixture acceptance: rotated_logs reproduces Python's probed ground truth (40 entries, entry-0 fields/types/key order); bad_msg corruption taxonomy probed (field-without-= vs Bad message layering). Metrics backfilled: 2 rounds (1 major round: 3M+4m, then confirm: 1 minor residual + accepted scope call) | 2 | 5 |
+| 16 | Run loop + per-sender pipeline + file sender | done | 6403ff0 + d51bb7d + 2846641 + 050a2bd | approved after 5 review rounds (round 1: 9 majors + 2 minors; round 2: 3 majors + 3 minors; round 3: 3 majors; round 4: 2 majors; round 5: approve), all fixed. Round-1 finds included four real parity bugs — sender document order, empty-filter {}, match_value None, SIGTERM chunk over-read — plus the buffered-flush ordering major. Value demonstration validated as the committed e2e test (systest-tagged shim path: all 40 lines + state + exit 0 independently confirmed) | 5 | 5 |
+| 17 | Reload, resume, state save, shutdown (errgroup lifecycle) | in-progress | - | - |
 | 18 | Core systest suites (rotation/sigterm Go-native, interop) | not-started | - | - |
 | 19 | Syslog framing package | not-started | - | - |
 | 20 | Rsyslog sender (+ ported rsyslog systest driver) | not-started | - | - |
