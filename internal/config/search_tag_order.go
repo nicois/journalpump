@@ -141,6 +141,10 @@ func (w *tagOrderWalker) walkReader(name string) error {
 		if err != nil || !ok || d != '[' {
 			return err // non-array searches: the main decode errors later
 		}
+		// A duplicate "searches" key visits this branch twice while the
+		// map decode keeps only the LAST array; restart the index so the
+		// rows align with whichever array the decode kept.
+		w.searchIndex = 0
 		for w.dec.More() {
 			if err := w.walkSearch(); err != nil {
 				return err
