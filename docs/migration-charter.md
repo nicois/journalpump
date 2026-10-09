@@ -386,7 +386,7 @@ from git log alone.
 | 5 | Filters (field/unit-log-level/secret/search) | done | ef53aac + c999ebb | approved (3 majors + 9 minors fixed; one finding rebutted with evidence and upheld — Python accepts a missing search fields key via setdefault; two new sanctioned deviations: runtime entry-value tolerance, regex warn-and-disable) |
 | 6 | Geohash encoder + GeoIP + tag callables | done | 5122ff2 + 283e87e | approved (3 majors + 5 minors fixed; NaN guard, document-order tag visibility via JSON token walk, deviation extension recorded per coordinator ruling; 225-case golden battery) |
 | 7 | statsd client + Tagged sanitization | done | 5b343e2 + 10ffc40 | approved (1 major + 5 minors fixed; global statsd tag order exact via capture, per-call appended sorted = sanctioned deviation; empty-host/udp4 parity locked) |
-| 8 | State file I/O (ordered decode, sorted encode, interop tests) | not-started | - | - |
+| 8 | State file I/O (ordered decode, sorted encode, interop tests) | done | b445b53 + 9ec632a | approved (1 major + 4 minors fixed; sent.cursor error scope matches Python's walk position incl. null-cursor abort; byte-identical sorted-key writer; file-order decode; lenient write-only fields per coordinator ruling; permanent Python interop test in test/test_state_file_interop.py; two non-blocking residuals noted: pythonReprString \xNN escapes unreachable, other write-only fields strictly typed but unreachable from Python-written files) |
 | 9 | sd_notify, watchdog, signals (NotifyContext + SIGHUP channel) | not-started | - | - |
 | 10 | Implementation-agnostic systest harness + running-config/reload suites | not-started | - | - |
 | 11 | Python ground-truth e2e: file/logplex/ES/websocket/state/replay fixtures | not-started | - | - |
