@@ -529,7 +529,16 @@ dump is parsed-JSON-equal to Python's json.dump(sort_keys=True) but not
 byte-identical — float rendering (60.0 → "60", 1e-05 → "0.00001",
 1e+20 → "100000000000000000000") and
 non-ASCII emitted as raw UTF-8 instead of ensure_ascii \uXXXX** (user
-decision, Task 3 review); no other behavior changes.
+decision, Task 3 review); **sanctioned deviation: runtime tolerance of
+malformed entry values — values that crash Python mid-run (truthy
+non-string MESSAGE in the secret-filter/apply paths, float/exotic search
+field values, non-numeric PRIORITY, non-string unit) are tolerated: the
+value is left untouched or the field does not match, and processing
+continues** (user decision, Task 5 review); **sanctioned deviation: the
+regex warn-and-disable policy — secret-filter patterns that are
+Python-valid but use constructs RE2 cannot compile are disabled with a
+startup warning instead of being rejected** (user decision, Task 5
+review); no other behavior changes.
 Acceptance: a user can follow the README to build, install, cut over, and
 roll back; every sanctioned deviation has a NEWS entry.
 Depends on: Task 27.

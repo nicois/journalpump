@@ -43,6 +43,10 @@ const goldenConfig = `{
         },
         "default_type": {
             "fields": ["MESSAGE"]
+        },
+        "null_type": {
+            "type": null,
+            "fields": ["MESSAGE"]
         }
     },
     "unit_log_levels": {
@@ -243,6 +247,12 @@ func assertGoldenFilters(t *testing.T, cfg *Config) {
 	}
 	if !cfg.FieldFilters["default_type"].Whitelist {
 		t.Error("absent type must default to whitelist")
+	}
+	// Python: config.get("type", "whitelist") == "whitelist" evaluates
+	// None == "whitelist" -> False, so a present-but-null type is
+	// blacklist mode, not the default.
+	if cfg.FieldFilters["null_type"].Whitelist {
+		t.Error("present-but-null type must decode as blacklist")
 	}
 
 	// Unit log levels.

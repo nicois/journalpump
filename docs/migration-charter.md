@@ -125,6 +125,21 @@ NEWS entry — plan Task 28):
   (`senders/base.py:117`) and `shutdown()` (`journalpump.py:972-981`)
   only sets running flags + saves state, so buffered messages ARE lost on
   SIGTERM. User decision: keep the flush window (D9). NEWS-recorded.
+- Runtime tolerance of malformed entry values: values that crash Python
+  mid-run (truthy non-string MESSAGE in the secret-filter/apply paths,
+  float/exotic search field values, non-numeric PRIORITY, non-string
+  unit) are tolerated by Go — the value is left untouched or the field
+  does not match, and processing continues. User decision (2026-10-09,
+  Task 5 review): sanctioned crash-free deviation. NEWS-recorded
+  (Task 28).
+- Regex warn-and-disable policy: secret-filter patterns that are
+  Python-valid but use constructs RE2 cannot compile (backreferences,
+  lookarounds, atomic groups, possessive quantifiers, `{,n}`, `\Z`,
+  `(?#)`, `(?u)`/`(?x)`, conditionals) are DISABLED with a startup
+  warning instead of crashing or rejecting (Python would accept them at
+  load). Python-INVALID patterns still hard-error at load with Python's
+  message. User decision (2026-10-09, Task 5 review): sanctioned.
+  NEWS-recorded (Task 28).
 
 ## 3. Resolved decisions (spec §9, user-confirmed 2026-10-09)
 

@@ -184,13 +184,20 @@ func decodeFieldFilters(raw map[string]any) (map[string]FieldFilterConfig, error
 			fields = append(fields, field)
 		}
 		whitelist := true
-		if typeValue, present := entry["type"]; present && typeValue != nil {
-			typeName, err := asString(typeValue, fmt.Sprintf("field_filters.%s.type", name))
-			if err != nil {
-				return nil, err
+		if typeValue, present := entry["type"]; present {
+			if typeValue == nil {
+				// Python: config.get("type", "whitelist") == "whitelist"
+				// evaluates None == "whitelist" -> False, i.e. blacklist
+				// mode; a present-but-null type is NOT the default.
+				whitelist = false
+			} else {
+				typeName, err := asString(typeValue, fmt.Sprintf("field_filters.%s.type", name))
+				if err != nil {
+					return nil, err
+				}
+				// Python: config.get("type", "whitelist") == "whitelist".
+				whitelist = typeName == "whitelist"
 			}
-			// Python: config.get("type", "whitelist") == "whitelist".
-			whitelist = typeName == "whitelist"
 		}
 		filters[name] = FieldFilterConfig{Name: name, Whitelist: whitelist, Fields: fields}
 	}

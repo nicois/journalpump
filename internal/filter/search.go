@@ -6,6 +6,7 @@
 package filter
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -118,7 +119,10 @@ func newSearch(raw any) (*Search, error) {
 		}
 	}
 	messagePattern := ""
-	if value, present := rawFields["MESSAGE"]; present {
+	if value, present := rawFields["MESSAGE"]; present && !pythonFalsy(value) {
+		// Python: `if message_pattern:` — a falsy non-string MESSAGE
+		// pattern (0/false/null/"") is popped and silently dropped, not
+		// compiled.
 		pattern, err := asPatternString(value, "search "+pythonRepr(name)+" fields.MESSAGE")
 		if err != nil {
 			return nil, err
@@ -273,8 +277,11 @@ func (s *Searcher) Searches() []*Search {
 // groups only feed the per-search hit metrics: Python's results dict is
 // used solely for its truthiness in process() and for stats tags, and
 // make_tags drops None values (unmatched groups), so unmatched groups
-// are omitted here. A matched-but-empty group stays (Python groupdict
-// yields "" then, which make_tags keeps).
+// are omitted here. Group values that are empty are dropped too: RE2
+// cannot distinguish a matched-empty group from an unmatched one, while
+// Python emits `tag=` (an empty value) into the datagram for a
+// matched-empty group and drops only the unmatched one — that delta is
+// the documented deviation.
 func (s *Searcher) PerformSearches(entry map[string]any) bool {
 	byteFields := make(map[string]string)
 	matched := false
@@ -334,7 +341,9 @@ func measureSearch(s *Searcher, regex *regexp.Regexp, line string) []string {
 				s.tagged.MakeTags(map[string]string{"regex": regex.String()}))
 		}
 		if s.log != nil {
-			s.log.Printf("Slow regex search: %s for duration %s seconds", regex.String(), duration)
+			// Python logs "for duration %s seconds" with the float
+			// perf_counter seconds, not a Duration rendering.
+			s.log.Printf("Slow regex search: %s for duration %v seconds", regex.String(), duration.Seconds())
 		}
 	}
 	return match
@@ -342,6 +351,10 @@ func measureSearch(s *Searcher, regex *regexp.Regexp, line string) []string {
 
 // tagFuncRegistry holds the callable implementations; journalpump.py
 // builds them from JournalPump methods (ip_to_geohash, Task 6).
+//
+// TODO(Task 6): when ip_to_geohash is wired, move this package global
+// into a Searcher field populated at construction — the charter prefers
+// explicit wiring over package-level mutable state.
 var tagFuncRegistry = map[string]TagFunc{}
 
 // RegisterTagFunc registers a tag callable implementation.
@@ -393,6 +406,33 @@ func searchFieldValue(field string, entry map[string]any, byteFields map[string]
 		// sanctioned crash-free deviation: no match.
 		return "", false
 	}
+}
+
+// pythonFalsy mirrors Python truthiness for the config values that can
+// appear in a search document (Python drops falsy MESSAGE patterns with
+// `if message_pattern:` and tolerates a missing fields/tags key because
+// `_build_searches` setdefaults them into the document).
+func pythonFalsy(v any) bool {
+	switch typed := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return !typed
+	case int64:
+		return typed == 0
+	case float64:
+		return typed == 0
+	case json.Number:
+		f, err := typed.Float64()
+		return err == nil && f == 0
+	case string:
+		return typed == ""
+	case map[string]any:
+		return len(typed) == 0
+	case []any:
+		return len(typed) == 0
+	}
+	return false
 }
 
 // decodeUTF8BestEffort mirrors Python bytes.decode("utf-8") rejection of

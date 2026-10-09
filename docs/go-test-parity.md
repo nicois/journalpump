@@ -86,7 +86,7 @@ of `journalpump.py:694`) over a (glob, string) battery →
 | test_log_level_filtering (severity sweep) | ported | `TestUnitLogLevelSeveritySweep` (all 8 severities against a configured level) |
 | test_tagged (6 param cases) | ported | `TestTaggedMakeTags` + CPython-verified quirk locks (unicode `\w` names kept, runs collapse to one `_`, `strip("_")`, `"___"` → empty) |
 | (no Python unit test) | Go-native | `TestTranslateReplacementGolden` / `TestTranslateReplacementErrors` — the Python replacement-template rules verified against CPython 3.14 (`\g<name>`, octal `\0`-`\377` escapes with the `\0`-branch masking, three-octal-digit rule for `\1`-`\9`, kept backslash before non-letters, `$$` escaping, group validation) |
-| (no Python unit test) | Go-native | `TestNewSecretFiltersUnsupported` — RE2-unsupported Python-valid constructs (backrefs, lookarounds, atomic groups, possessive quantifiers, `{,n}`, `\Z`, `(?#)`, `(?x)`/`(?L)`, conditionals) disable the filter with a startup warning; RE2-invalid patterns raise Python's `invalid secret_filters configuration - invalid regex` |
+| (no Python unit test) | Go-native | `TestNewSecretFiltersUnsupported` — RE2-unsupported Python-valid constructs (backrefs, lookarounds, atomic groups, possessive quantifiers, `{,n}`, `\Z`, `(?#)`, `(?u)`/`(?x)`, conditionals) disable the filter with a startup warning; Python-INVALID patterns (`(?L)`, bare `\N`, mid-pattern global flags like `a(?i)b`) raise Python's `invalid secret_filters configuration - invalid regex` with Python's message (`TestNewSecretFiltersInvalidPatterns`) |
 | (no Python unit test) | Go-native | `TestPerformSearches*` — sorted non-MESSAGE-then-MESSAGE field order, per-entry bytes decode cache, `str()` quirks (`True`/`False`), named-group tags (static tags overwrite), sanitization before `stats.increase`, per-search `hits` counters, `journal.perform_search_regex_duration` gauge with an injectable clock, `if self.stats:` guards |
 
 Deviations and notes:
@@ -95,24 +95,40 @@ Deviations and notes:
   substitution, unknown `unit_log_levels` severity names — Python KeyError
   at filter time) are rejected at construction with Python-equivalent
   messages.
-- **Warn-and-disable**: patterns using RE2-unsupported constructs are
-  Python-valid, so they cannot be rejected; the filter is disabled with a
-  startup warning. RE2-invalid patterns keep Python's hard error.
-- **Unmatched named groups** in searches: Python's `groupdict` yields
-  `None` and `make_tags` drops them; Go's RE2 cannot distinguish an
-  unmatched group from a matched-empty one, so empty values are omitted
-  (matched-empty groups are kept — the metrics-visible difference is
-  limited to optional groups that did not participate).
-- **Non-string truthy MESSAGE / non-numeric PRIORITY / non-string unit**:
-  Python raises TypeError mid-run; Go treats them as untouched / kept
-  (crash-free deviation, spec §6.1a family).
+- **Warn-and-disable (sanctioned, charter §2)**: patterns using
+  RE2-unsupported constructs are Python-valid, so they cannot be
+  rejected; the filter is disabled with a startup warning.
+  Python-INVALID patterns keep Python's hard error.
+- **Unmatched and empty named groups** in searches: Python's `groupdict`
+  yields `None` for an unmatched group (dropped by `make_tags`) and `""`
+  for a matched-but-empty one (emitted as `tag=` in the datagram). Go's
+  RE2 cannot distinguish a matched-empty group from an unmatched one, so
+  BOTH are dropped here — the metrics-visible delta is limited to
+  matched-empty groups of optional groups that did not capture text.
+- **Crash-free runtime tolerance (sanctioned, charter §2)**: malformed
+  entry values that crash Python mid-run (truthy non-string MESSAGE in
+  the secret-filter/apply paths, non-numeric PRIORITY, non-string unit,
+  float/exotic search field values) are tolerated by Go — the value is
+  left untouched or the field does not match, and processing continues.
+- **Tagged name-class skew**: Go `[\pL\pN_]` is a SUPERSET of Python
+  `\w` — Go's newer Unicode tables classify 4657 additional codepoints
+  as letters/numbers that Python's `\w` misses (no codepoint is
+  matched by Python but not Go), so no tag NAME that Python keeps is
+  dropped and vice versa is impossible; extra Go-kept names only appear
+  for astral/rare codepoints. The `\s`/value class is exact. No
+  differential test is committed; the sweep that produced the 4657
+  count is not part of the repository.
+- **Nested bracket classes in globs**: Python 3.12+'s `re` parses a
+  nested class (`[a[b]`) as the union `{a, b}`; the Go port translates
+  the glob text for RE2, which parses the same text as `{a, [}`. This
+  affects only pathological unit-level globs — no differential row
+  covers it and Python itself changed this behavior across versions.
 - **`search.setdefault` mutation**: Python mutates the parsed config
   (running-config dump gains empty `"tags"`/`"fields"` keys on
   searches lacking them); Go does not mutate the parsed document.
 - **Regex engine semantics**: RE2 ASCII `\w`/`\s`/`\d`/`\b` in user
   patterns (spec §5 sanctions stdlib RE2 semantics); the Tagged
-  sanitization classes ARE exact (`\w` ≡ `[\pL\pN_]`, `\s` ≡
-  `[\t-\r\x1c-\x1f\x85\pZ]`, both verified by a full-codepoint
-  differential test).
+  sanitization classes are covered above (value class exact, name class
+  a documented superset skew).
 - Python's `lru_cache` on `_unit_match_level_glob` is pure memoization
   and is not reproduced.

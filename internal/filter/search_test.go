@@ -175,7 +175,12 @@ func TestPerformSearches(t *testing.T) {
 
 	t.Run("field order sorted non-MESSAGE then MESSAGE", func(t *testing.T) {
 		t.Parallel()
-		_, err := filter.NewSearches([]any{
+		// The iteration order is observable through the slow-regex gauge
+		// emission order (Python rebuilds the fields dict sorted with
+		// MESSAGE last, journalpump.py:520-524): make every field slow and
+		// assert the gauges arrive alpha, zeta, MESSAGE.
+		stats := &recordingStats{}
+		searcher := newTestSearcher(t, []any{
 			map[string]any{
 				"name": "s",
 				"fields": map[string]any{
@@ -184,13 +189,26 @@ func TestPerformSearches(t *testing.T) {
 					"alpha":   `a`,
 				},
 			},
-		})
-		if err != nil {
-			t.Fatalf("NewSearches: %v", err)
+		}, stats)
+		current := time.Now()
+		searcher.Now = func() time.Time {
+			current = current.Add(10 * time.Millisecond)
+			return current
 		}
-		// The order is observable via the slow-regex metric ordering in
-		// TestPerformSearchesSlowRegex; here just assert construction
-		// succeeds with mixed order.
+		if !searcher.PerformSearches(map[string]any{"MESSAGE": "m", "zeta": "z", "alpha": "a"}) {
+			t.Fatal("want match")
+		}
+		if len(stats.gauges) != 3 {
+			t.Fatalf("gauges = %v want three (one per field)", stats.gauges)
+		}
+		// The gauge's regex tag carries the pattern; alpha/zeta/MESSAGE
+		// order with distinct patterns proves the field order.
+		wantOrder := []string{"a", "z", "m"}
+		for i, want := range wantOrder {
+			if got := stats.gauges[i].tags["regex"]; got != want {
+				t.Errorf("gauge %d regex tag = %q want %q", i, got, want)
+			}
+		}
 	})
 
 	t.Run("static tags override groupdict", func(t *testing.T) {

@@ -13,15 +13,19 @@ import (
 )
 
 // unsafeTagNameChars mirrors base.py:unsafe_tag_name_chars
-// (`[^\w_\-]+`). Python's \w is Unicode-aware and matches exactly the
-// letters, numbers and underscore (verified by a full-codepoint
-// differential test), so the Go equivalent is [\pL\pN_].
+// (`[^\w_\-]+`). Python's \w is Unicode-aware and matches the letters,
+// numbers and underscore; [\pL\pN_] is a superset of that: Go's Unicode
+// tables (a newer Unicode version than the runtime's Python) classify
+// 4657 additional codepoints as \pL/\pN that Python's \w misses (no
+// codepoint is matched by Python but not by Go). The skew is confined to
+// codepoints that appear only in tag NAMES; no differential test is
+// committed — this is a documented divergence, not an exact match.
 var unsafeTagNameChars = regexp.MustCompile(`[^\pL\pN_\-]+`)
 
 // unsafeTagValueChars mirrors base.py:unsafe_tag_value_chars
-// (`[\s\|=:]+`). Python's \s matches exactly [\t-\r\x1c-\x1f\x85] plus
-// the Unicode space categories (verified by a full-codepoint
-// differential test), so the Go equivalent is the explicit class below —
+// (`[\s\|=:]+`). Python's \s matches [\t-\r\x1c-\x1f\x85] plus
+// the Unicode space categories (the \s half is exact per a full-codepoint
+// sweep), so the Go equivalent is the explicit class below —
 // not Go's ASCII-only \s.
 var unsafeTagValueChars = regexp.MustCompile(`[\t-\r\x1c-\x1f\x85\pZ|=:]`)
 

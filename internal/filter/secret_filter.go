@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/Aiven-Open/journalpump/internal/config"
 )
@@ -48,10 +49,17 @@ type SecretFilter struct {
 func NewSecretFilters(filters []config.SecretFilterConfig) (compiled []*SecretFilter, warnings []string, err error) {
 	compiled = make([]*SecretFilter, 0, len(filters))
 	for _, cfg := range filters {
-		if desc := findUnsupportedConstruct(cfg.Pattern); desc != "" {
+		unsupported, invalid := findUnsupportedConstruct(cfg.Pattern)
+		if invalid != "" {
+			// Python rejects the pattern at reader construction with the
+			// same ValueError; the detail carries the scanner's reason
+			// so the failure does not depend on RE2's error text.
+			return nil, nil, fmt.Errorf("invalid secret_filters configuration - invalid regex: %s", invalid)
+		}
+		if unsupported != "" {
 			warnings = append(warnings, fmt.Sprintf(
 				"secret filter pattern %q uses %s, which the Go regexp engine does not support; the filter was disabled",
-				cfg.Pattern, desc,
+				cfg.Pattern, unsupported,
 			))
 			continue
 		}
@@ -92,12 +100,21 @@ func subexpNames(regex *regexp.Regexp) map[string]int {
 	return names
 }
 
-// findUnsupportedConstruct reports the first Python-valid construct in
-// the pattern that RE2 cannot compile, or "" when the pattern is fully
-// expressible. The scan tracks character-class context because inside
-// [...] Python's \1 is an octal escape, not a backreference, and class
-// bodies cannot contain the group constructs.
-func findUnsupportedConstruct(pattern string) string {
+// findUnsupportedConstruct scans the pattern for constructs Python
+// handles differently from RE2 and reports two disjoint findings, or ""
+// for each when the pattern is fully expressible:
+//   - unsupported: Python-valid but RE2 cannot compile it — the filter is
+//     disabled with a startup warning (rejecting would deviate from
+//     Python's acceptance).
+//   - invalid: Python itself rejects the pattern (hard error) — reported
+//     so the compile step can raise Python's
+//     "invalid secret_filters configuration - invalid regex" without
+//     relying on RE2's error text.
+//
+// The scan tracks character-class context because inside [...] Python's
+// \1 is an octal escape, not a backreference, and class bodies cannot
+// contain the group constructs.
+func findUnsupportedConstruct(pattern string) (unsupported string, invalid string) {
 	i, n := 0, len(pattern)
 	inClass := false
 	for i < n {
@@ -107,18 +124,19 @@ func findUnsupportedConstruct(pattern string) string {
 			if i+1 >= n {
 				// Trailing backslash: invalid in Python too; let the
 				// compiler produce the real error.
-				return ""
+				return "", ""
 			}
 			if !inClass {
-				if desc := unsupportedEscape(pattern[i+1]); desc != "" {
-					return desc
+				u, inv := unsupportedEscape(pattern[i+1:])
+				if u != "" || inv != "" {
+					return u, inv
 				}
 			}
 			i += 2
 		case !inClass && c == '(' && i+1 < n && pattern[i+1] == '?':
-			desc, advance := unsupportedGroupConstruct(pattern[i+2:])
-			if desc != "" {
-				return desc
+			u, inv, advance := unsupportedGroupConstruct(pattern[i+2:], i == 0)
+			if u != "" || inv != "" {
+				return u, inv
 			}
 			i += 2 + advance
 		case c == '[':
@@ -135,22 +153,22 @@ func findUnsupportedConstruct(pattern string) string {
 			inClass = false
 			i++
 		case !inClass && (c == '*' || c == '+' || c == '?') && i+1 < n && pattern[i+1] == '+':
-			return "a possessive quantifier"
+			return "a possessive quantifier", ""
 		case !inClass && c == '{':
 			// Brace repeats: Python accepts {,n} (empty minimum,
 			// RE2-invalid) and {n,m}+ (possessive, RE2-invalid). Braces
 			// that are not a Python quantifier are literal characters in
 			// both engines and need no check.
-			desc, advance := unsupportedBraceConstruct(pattern, i)
-			if desc != "" {
-				return desc
+			u, advance := unsupportedBraceConstruct(pattern, i)
+			if u != "" {
+				return u, ""
 			}
 			i += advance
 		default:
 			i++
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // unsupportedBraceConstruct reports RE2-incompatible brace quantifiers
@@ -171,50 +189,67 @@ func unsupportedBraceConstruct(pattern string, i int) (string, int) {
 	return "", end + 1
 }
 
-// unsupportedEscape reports constructs behind an out-of-class backslash.
-func unsupportedEscape(next byte) string {
-	if next >= '1' && next <= '9' {
-		return "a backreference (\"\\" + string(next) + "\")"
+// unsupportedEscape reports constructs behind an out-of-class backslash:
+// Python-valid-but-RE2-unsupported (first result) or Python-invalid
+// (second result, so the hard error does not depend on RE2's wording).
+func unsupportedEscape(rest string) (string, string) {
+	switch next := rest[0]; {
+	case next >= '1' && next <= '9':
+		return "a backreference (\"\\" + string(next) + "\")", ""
+	case next == 'Z':
+		return "the \\Z anchor", ""
+	case next == 'N':
+		if len(rest) > 1 && rest[1] == '{' {
+			// Python: \N{UNICODE NAME} escapes; RE2 has no equivalent.
+			return "the \\N{...} escape", ""
+		}
+		// Python: "missing {" — invalid, not unsupported.
+		return "", "bad escape \\N"
 	}
-	if next == 'Z' {
-		return "the \\Z anchor"
-	}
-	if next == 'N' {
-		return "the \\N escape"
-	}
-	return ""
+	return "", ""
 }
 
 // unsupportedGroupConstruct reports RE2-incompatible constructs behind
 // "(?" (rest starts after those two characters) and returns how many
-// extra characters the scanner must skip.
-func unsupportedGroupConstruct(rest string) (string, int) {
+// extra characters the scanner must skip. Python rejects the L flag for
+// str patterns outright, rejects global (non-scoped) flag groups that
+// are not at the start of the expression, and RE2 cannot compile u/x
+// (Go's U means ungreedy); i, m, s are fine in both.
+func unsupportedGroupConstruct(rest string, atStart bool) (string, string, int) {
 	switch {
 	case strings.HasPrefix(rest, "="), strings.HasPrefix(rest, "!"):
-		return "a lookahead assertion", 0
+		return "a lookahead assertion", "", 0
 	case strings.HasPrefix(rest, "<="), strings.HasPrefix(rest, "<!"):
-		return "a lookbehind assertion", 0
+		return "a lookbehind assertion", "", 0
 	case strings.HasPrefix(rest, ">"):
-		return "an atomic group", 0
+		return "an atomic group", "", 0
 	case strings.HasPrefix(rest, "("):
-		return "a conditional group", 0
+		return "a conditional group", "", 0
 	case strings.HasPrefix(rest, "P="):
-		return "a backreference", 0
+		return "a backreference", "", 0
 	case strings.HasPrefix(rest, "#"):
-		return "a comment group", 0
+		return "a comment group", "", 0
 	case len(rest) > 0 && strings.IndexByte("aiLmsux", rest[0]) >= 0:
-		// (?flags) or (?flags:...). Flags invalid for RE2: L (locale),
-		// u (Python's Unicode flag; Go's U means ungreedy), x (verbose).
-		// i, m, s are fine in both.
 		flags := rest[:flagsEnd(rest)]
-		for _, flag := range flags {
-			if flag == 'L' || flag == 'u' || flag == 'x' {
-				return "the (?" + string(flag) + ") flag", 0
-			}
+		scoped := len(rest) > len(flags) && rest[len(flags)] == ':'
+		if strings.IndexByte(flags, 'L') >= 0 {
+			return "", "bad inline flags: cannot use 'L' flag with a str pattern", 0
 		}
-		return "", len(flags)
+		if !scoped {
+			if !atStart {
+				return "", "global flags not at the start of the expression", 0
+			}
+			if strings.ContainsAny(flags, "ux") {
+				return "the (?" + flags + ") flag", "", 0
+			}
+			return "", "", len(flags)
+		}
+		if strings.ContainsAny(flags, "ux") {
+			return "the (?" + flags + ":...) flag", "", 0
+		}
+		return "", "", len(flags)
 	default:
-		return "", 0
+		return "", "", 0
 	}
 }
 
@@ -300,25 +335,15 @@ func translateReplacement(repl string, numGroups int, groupNames map[string]int)
 			if err != nil {
 				return "", err
 			}
-			if isASCIIDecimal(name) {
-				index, err := strconv.Atoi(name)
-				if err != nil {
-					return "", fmt.Errorf("invalid group reference %s", name)
-				}
-				// Python MAXGROUPS = 100.
-				if index >= 100 {
-					return "", fmt.Errorf("invalid group reference %d", index)
-				}
-				if index > numGroups {
-					return "", fmt.Errorf("invalid group reference %d", index)
-				}
-			} else if _, ok := groupNames[name]; !ok {
-				return "", fmt.Errorf("unknown group name %s", pythonRepr(name))
+			if err := validateGroupName(name, numGroups, groupNames); err != nil {
+				return "", err
 			}
 			out.WriteString("${" + name + "}")
 			i += 3 + len(name) + 1
 		case next == '0':
-			j := i + 1
+			// \0 plus up to TWO more octal digits (three octal digits
+			// total), masked to 0xff like Python's `chr(int(..., 8) & 0xff)`.
+			j := i + 2
 			for count, k := 0, j; count < 2 && k < n && isOctalDigit(repl[k]); count, k = count+1, k+1 {
 				j++
 			}
@@ -368,6 +393,35 @@ func translateReplacement(repl string, numGroups int, groupNames map[string]int)
 	return out.String(), nil
 }
 
+// validateGroupName applies Python's \g<name> validation rules: decimal
+// names are group numbers (MAXGROUPS = 100, then <= numGroups);
+// non-identifier names raise "bad character in group name"; identifier
+// names must exist in the pattern.
+func validateGroupName(name string, numGroups int, groupNames map[string]int) error {
+	if isASCIIDecimal(name) {
+		index, err := strconv.Atoi(name)
+		if err != nil {
+			return fmt.Errorf("invalid group reference %s", name)
+		}
+		// Python MAXGROUPS = 100.
+		if index >= 100 {
+			return fmt.Errorf("invalid group reference %d", index)
+		}
+		if index > numGroups {
+			return fmt.Errorf("invalid group reference %d", index)
+		}
+		return nil
+	}
+	if !isPythonIdentifier(name) {
+		// Python: s.checkgroupname raises for non-identifier names.
+		return fmt.Errorf("bad character in group name %s", pythonRepr(name))
+	}
+	if _, ok := groupNames[name]; !ok {
+		return fmt.Errorf("unknown group name %s", pythonRepr(name))
+	}
+	return nil
+}
+
 // parseTemplateName parses "\g<...>" at repl[i:] and returns the name.
 func parseTemplateName(repl string, i int) (string, error) {
 	if i+2 >= len(repl) || repl[i+2] != '<' {
@@ -391,6 +445,30 @@ func isDecimalDigit(c byte) bool { return c >= '0' && c <= '9' }
 
 func isASCIILetter(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+// isPythonIdentifier approximates Python's str.isidentifier (XID_Start /
+// XID_Continue) with the Go letter/digit/underscore classes, which agrees
+// for group names in practice (e.g. "café" is an identifier in both).
+func isPythonIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if r == '_' {
+			continue
+		}
+		if i == 0 {
+			if !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // isASCIIDecimal reports whether s consists only of ASCII digits
@@ -442,23 +520,31 @@ func pythonRepr(s string) string {
 // secret_filter_matches counter when the change reporting is enabled
 // (Python increments once per entry regardless of how many filters
 // matched).
+//
+// The change is tracked while substituting instead of comparing the
+// before/after values: a []byte MESSAGE would panic on the interface
+// comparison (Go "comparing uncomparable types"), and this function
+// promises crash-free tolerance of malformed entry values (sanctioned
+// deviation).
 func ApplySecretFilters(data map[string]any, filters []*SecretFilter) bool {
 	msg := data["MESSAGE"] // Python: data.get("MESSAGE")
-	original := msg
-	if truthy(msg) {
-		if text, ok := msg.(string); ok {
-			for _, f := range filters {
-				text = f.regex.ReplaceAllString(text, f.replacement)
-			}
-			msg = text
-		}
+	if !truthy(msg) {
+		return false
+	}
+	text, ok := msg.(string)
+	if !ok {
 		// A truthy non-string MESSAGE makes Python's re.sub raise
 		// TypeError mid-run; sanctioned crash-free deviation: leave the
 		// value untouched.
+		return false
 	}
-	if msg != original {
-		data["MESSAGE"] = msg
-		return true
+	original := text
+	for _, f := range filters {
+		text = f.regex.ReplaceAllString(text, f.replacement)
 	}
-	return false
+	if text == original {
+		return false
+	}
+	data["MESSAGE"] = text
+	return true
 }

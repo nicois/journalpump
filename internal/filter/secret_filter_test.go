@@ -168,7 +168,6 @@ func TestNewSecretFiltersUnsupported(t *testing.T) {
 		{name: "python end anchor", pattern: `foo\Z`},
 		{name: "comment group", pattern: `foo(?#comment)bar`},
 		{name: "verbose flag", pattern: `(?x)foo`},
-		{name: "locale flag", pattern: `(?L)foo`},
 		{name: "conditional group", pattern: `(a)?b(?(1)c|d)`},
 	}
 	for _, tc := range tests {
@@ -189,6 +188,35 @@ func TestNewSecretFiltersUnsupported(t *testing.T) {
 			}
 			if len(compiled) != 0 {
 				t.Errorf("disabled filter still compiled: %v", compiled)
+			}
+		})
+	}
+}
+
+// TestNewSecretFiltersInvalidPatterns locks the Python-INVALID patterns
+// that must hard-error at load with Python's own message (not the
+// warn-and-disable path): Python raises re.error/ValueError at reader
+// construction for these.
+func TestNewSecretFiltersInvalidPatterns(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		pattern  string
+		fragment string
+	}{
+		{name: "locale flag", pattern: `(?L)foo`, fragment: "cannot use 'L' flag with a str pattern"},
+		{name: "bare N escape", pattern: `\Nfoo`, fragment: "bad escape \\N"},
+		{name: "global flags mid-pattern", pattern: `a(?i)b`, fragment: "global flags not at the start of the expression"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, err := filter.NewSecretFilters([]config.SecretFilterConfig{
+				{Pattern: tc.pattern, Replacement: "[REDACTED]"},
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid regex") || !strings.Contains(err.Error(), tc.fragment) {
+				t.Errorf("want 'invalid regex' error containing %q, got %v", tc.fragment, err)
 			}
 		})
 	}
@@ -216,8 +244,10 @@ func TestTranslateReplacementGolden(t *testing.T) {
 		{in: `a$b`, want: "a$b"},
 		{in: `\0`, want: "\x00"},
 		{in: `\01`, want: "\x01"},
+		{in: `\012`, want: "\n"}, // \0 + two more octal digits: 0o12
 		{in: `\08`, want: "\x00" + "8"},
-		{in: `\123`, want: "S"}, // \123 -> octal 0o123 = 'S'
+		{in: `\0377`, want: "\x1f" + "7"}, // 0o37 then literal "7"
+		{in: `\123`, want: "S"},           // \123 -> octal 0o123 = 'S'
 	}
 	for _, tc := range replacements {
 		filters, warnings, err := filter.NewSecretFilters([]config.SecretFilterConfig{
@@ -259,6 +289,7 @@ func TestTranslateReplacementErrors(t *testing.T) {
 		{name: "two-digit group out of range", pattern: "(a)", replacement: `\12`, fragment: "invalid group reference"},
 		{name: "g reference out of range", pattern: "(a)", replacement: `\g<2>`, fragment: "invalid group reference"},
 		{name: "unknown group name", pattern: "(?P<a>x)", replacement: `\g<b>`, fragment: "unknown group name"},
+		{name: "bad character in group name", pattern: "(a)", replacement: `\g< 1>`, fragment: "bad character in group name ' 1'"},
 		{name: "missing angle bracket", pattern: "(a)", replacement: `\g1`, fragment: "missing <"},
 		{name: "unterminated group name", pattern: "(a)", replacement: `\g<1`, fragment: "missing >"},
 		{name: "octal out of range", pattern: "(a)", replacement: `\400`, fragment: "outside of range"},
