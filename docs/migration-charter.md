@@ -365,7 +365,7 @@ from git log alone.
 | 2 | CI workflow: golangci-lint, go vet, go test -race | done | 17d1c3b + 9cb194f | approved (6 minors fixed)² |
 | 3 | Config loader + running-config writer (parsed-blob diff) | done | c9fbab9 + 7ab4a89 | approved (3 doc minors fixed)³ |
 | 4 | Journal entry model, repr UTF-8 fallback, JSON serialization | done | 3fbfe92 + 45d003c + 1d678cb | approved (1 major + 6 minors fixed across two review rounds; golden fixture Python-generated, 8 cases, byte-identical; 2.2M-exec fuzz clean)⁴ |
-| 5 | Filters (field/unit-log-level/secret/search) | not-started | - | - |
+| 5 | Filters (field/unit-log-level/secret/search) | done | ef53aac + c999ebb | approved (3 majors + 9 minors fixed; one finding rebutted with evidence and upheld — Python accepts a missing search fields key via setdefault; two new sanctioned deviations: runtime entry-value tolerance, regex warn-and-disable) |
 | 6 | Geohash encoder + GeoIP + tag callables | not-started | - | - |
 | 7 | statsd client + Tagged sanitization | not-started | - | - |
 | 8 | State file I/O (ordered decode, sorted encode, interop tests) | not-started | - | - |
