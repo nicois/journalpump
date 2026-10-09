@@ -370,3 +370,59 @@ pinned monotonic clock), the Go-written fixture
   object keys).
 - **unknown top-level keys** are skipped, matching Python (the parsed
   dict keeps them but nothing consumes them).
+
+## Task 9 — sd_notify, watchdog, signals (D-lifecycle)
+
+Source of truth: journalpump/daemon.py notify call sites (READY=1 at
+:114/:134, RELOADING=1 at :106, STOPPING=1 at :90, WATCHDOG=1 at :95
+pinged every main-loop iteration, journalpump.py:1202) and
+systemd.daemon.notify semantics; Go port: `internal/daemon` (the
+supervisor wiring is Tasks 10/17).
+
+- **Notify client semantics are probed against python-systemd**, not
+  guessed (all five probes run against the installed
+  python-systemd): unset NOTIFY_SOCKET → False, NO error; repeated
+  calls all deliver (the env var is never unset or cached); a leading
+  '@' addresses an abstract-namespace socket (byte → NUL); a dead
+  listener RAISES OSError (ECONNREFUSED abstract, ENOENT filesystem
+  path); NOTIFY_SOCKET that is neither '/'- nor '@'-prefixed raises
+  OSError EPROTO. Go mirrors each: (false, nil) no-op, env read on
+  every call, net.UnixAddr '@' abstract handling, errors returned from
+  Notify (Python's unguarded daemon.notify calls would crash the
+  daemon — the Task 17 caller decides where to propagate).
+  `TestNotifyUnsetSocketIsNoOp`, `TestNotifySendsOverAbstractSocket`,
+  `TestNotifySendsOverPathSocket`, `TestNotifyInvalidSocketFails`,
+  `TestNotifyAbsentListenerFails`.
+- **Harness test, plan Task 9**: `TestStubBinarySendsNotifyOverAbstractSocket`
+  spawns a stub binary (the test binary re-executed in stub mode via
+  TestMain) with an abstract-socket NOTIFY_SOCKET and asserts the
+  exact READY=1 / WATCHDOG=1 / STOPPING=1 datagrams
+  systest/journalpump_process.py asserts against the real daemon.
+- **Notifier seam for the mock strategy**: `Notifier` interface +
+  `SocketNotifier` implementation; the fake `delayNotifier` (holds
+  WATCHDOG=1 for N) is the Go-native equivalent of the
+  systest/test_sigterm.py sitecustomize trick that delays
+  ping_watchdog so SIGTERM lands mid-loop — Task 10's harness and the
+  Task 17 run loop both program against the interface.
+- **State constants are byte-exact** (`StateReady` etc.): the harness
+  splits datagrams on "\n" and matches these lines.
+- **Signal composition per spec §4.3**: SIGTERM/SIGINT cancel the run
+  context (`signal.NotifyContext`); SIGHUP is a separate buffered(1)
+  `signal.Notify` channel consumed by the supervisor's select — a
+  reload EVENT, not cancellation. Pinned by
+  `TestSighupDoesNotCancelRunContext`, `TestSigtermCancelsRunContext`,
+  `TestSigintCancelsRunContext` (self-delivered signals; SIGHUP must
+  leave the run context alive).
+- **SIGHUP coalescing parity**: Python's sighup handler sets a boolean
+  flag (daemon.py:72-74) — repeated SIGHUPs before
+  reload_if_requested coalesce into one reload. Go's signal.Notify on
+  a capacity-1 channel with drop-when-full delivery coalesces the same
+  way; the supervisor select drains it every loop iteration.
+- **Library deviation, flagged for coordinator sanction**: spec §4.6
+  names coreos/go-systemd (sdnotify) for sd_notify; the plan's Task 9
+  "small client interface + fake" is implemented natively (~60 lines,
+  no new dependency) because the probe-locked semantics above are
+  easier to pin exactly on a purpose-built client (e.g. sdnotify
+  would DIAL an empty NOTIFY_SOCKET instead of no-op'ing, and its
+  '@' handling differs from python-systemd's byte-replacement). The
+  syscalls are identical (AF_UNIX SOCK_DGRAM connect + send).
