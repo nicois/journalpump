@@ -29,6 +29,16 @@ import (
 //     raw UTF-8 (v2 does not escape HTML either, like the old writer).
 //   - floats render Go-native (health.elapsed 3.5 → 3.5, 0 → 0; no
 //     Python float repr).
+//   - non-finite floats are an encoding ERROR in v2 (probed:
+//     "unsupported value: NaN"), where Python's json.dump default
+//     allow_nan=True emits NaN/Infinity literals. Unreachable from
+//     journalpump's own paths — the decoded state only carries RFC-valid
+//     JSON values, which cannot contain non-finite literals — but it
+//     narrows the "any Python-acceptable state file re-writes" guarantee
+//     at the writer: a state value that is not valid RFC JSON cannot be
+//     re-encoded. (A Python-written file containing NaN already fails
+//     Go's strict-JSON Read, so the read-side boundary is unchanged.)
+//     Deviation boundary recorded in docs/go-test-parity.md (Task 8).
 //
 // What is preserved from Python: the parsed document is equal
 // (json.load-compatible structure and values), the 4-space

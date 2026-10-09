@@ -151,8 +151,10 @@ def test_elasticsearch_wire_bytes(tmp_path: Path) -> None:
             # first-seen order of distinct (method, path) pairs: POST
             # counts are timing-dependent (see the payload-stream note),
             # so only the distinct sequence is pinned. Aliases polls are
-            # time-gated and excluded.
-            "request_sequence": list(dict.fromkeys(ordered_non_alias)),
+            # time-gated and excluded. Built as LISTS (not tuples) so the
+            # in-memory fixture equals its json round-trip on disk and
+            # the assertion holds in both normal and update mode.
+            "request_sequence": [list(pair) for pair in dict.fromkeys(ordered_non_alias)],
             "indices": {
                 index: {"mapping": mapping_by_index[index], "payloads": payloads_by_index[index]}
                 for index in sorted(mapping_by_index)

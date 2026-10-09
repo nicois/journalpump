@@ -51,8 +51,9 @@ def test_go_written_state_file_resume_selection():
         # assert an ordering; the resume walk reads the file's order.
         assert resume_cursor(reader_state) == expectations["resume_cursors"][reader_name]
 
-    # reader_two's senders (alphabetical file order): kafka_backup has a
-    # cursor, kafka_primary's is null — the walk hits the null and
+    # reader_two's senders (file order is Go-native and nondeterministic,
+    # so the walk's outcome must not depend on it): every sender order
+    # ends at kafka_primary's null cursor — the walk hits the null and
     # requires a full resync.
     assert expectations["resume_cursors"]["reader_two"] is None
 

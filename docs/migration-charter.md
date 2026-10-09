@@ -119,6 +119,36 @@ in review regardless of passing tests elsewhere.
 NEWS entry — plan Task 28):
 - Wrong-typed config values are rejected at load by typed decoding,
   where Python crashed mid-run when the value was used (thread A17).
+  User decision (2026-10-09, Task 3 review): the strict rejection also
+  covers values Python silently coerced or truthiness-tested — numeric
+  strings/floats for integer keys (e.g. threshold_for_metric_emit "10"
+  or 10.5, msg_buffer_max_length 50000.0), non-string values for string
+  keys (initial_position 1.5, write_running_config "yes", statsd host as
+  number), boolean/float statsd and global-tag values, and readers: null
+  — all rejected at load.
+- Running-config dump formatting: the Go dump is parsed-JSON-equal to
+  Python's json.dump(..., sort_keys=True) but not byte-identical (Go
+  renders floats like 60.0 as "60", 1e-05 as "0.00001", and 1e+20 as
+  "100000000000000000000" (Python's repr renders "60.0", "1e-05",
+  "1e+20"), and emits
+  non-ASCII as raw UTF-8 where Python's ensure_ascii=True writes \uXXXX).
+  User decision (2026-10-09, Task 3 review): recorded as a deviation
+  rather than reimplementing Python's float repr. Extended (user
+  decision, 2026-10-09, encoder switch — see the v2-writers entry
+  below): the running-config writer AND the state-file writer now use
+  Go 1.27's encoding/json/v2.
+- State-file and running-config writers use Go 1.27's
+  `encoding/json/v2` encoder: object key order is Go-native — map
+  iteration order, NOT sorted and (probe-verified) NONDETERMINISTIC
+  across writes — string escaping is raw UTF-8 (no ensure_ascii), and
+  floats render Go-native. Python's json.dump 4-space layout, the
+  no-trailing-newline shape and the 0600 atomic replace are kept, and
+  the PARSED document stays equal to Python's
+  json.dump(indent=4, sort_keys=True) output; the resume-cursor quirk
+  is unaffected because reading walks the file's key order in both
+  implementations. No test may assert a Go-written file's key
+  ordering. User decision (2026-10-09, encoder switch). NEWS-recorded
+  (Task 28).
 - Kafka: sarama send path replaces kafka-python's produce-per-message/
   future/flush dance with one `SyncProducer.SendMessages(batch)` call;
   per-future 1 s timeout maps to `WaitForAcks`/Net.ReadTimeout, NEWS note
@@ -130,6 +160,51 @@ NEWS entry — plan Task 28):
   (`senders/base.py:117`) and `shutdown()` (`journalpump.py:972-981`)
   only sets running flags + saves state, so buffered messages ARE lost on
   SIGTERM. User decision: keep the flush window (D9). NEWS-recorded.
+- Runtime tolerance of malformed entry values: values that crash Python
+  mid-run (truthy non-string MESSAGE in the secret-filter/apply paths,
+  float/exotic search field values, non-numeric PRIORITY, non-string
+  unit) are tolerated by Go — the value is left untouched or the field
+  does not match, and processing continues. User decision (2026-10-09,
+  Task 5 review): sanctioned crash-free deviation. NEWS-recorded
+  (Task 28). EXTENDED (user decision, 2026-10-09, Task 6 review) to the
+  ip_to_geohash failure paths (`int(precision)` ValueError, missing tag
+  KeyError, geoip2 AddressValueError/AddressNotFoundError, AttributeError
+  on a record without location, geohash's ValueError): Go degrades to an
+  empty geohash tag and FORWARDS the entry, where Python's
+  read_single_message (journalpump.py:1011-1018) catches, logs
+  "Unexpected exception while handling entry for %s", emits
+  stats.unexpected_exception, sleeps 0.5 s and DROPS the entry —
+  forwarded-with-empty-tag vs dropped-with-unexpected-exception is the
+  sanctioned delta.
+- Statsd per-call tag ordering: the GLOBAL `statsd.tags` reach the statsd
+  wire in exact Python order (the config layer captures the document order
+  from the raw JSON; `dict.update` override-keeps-position semantics are
+  ported exactly). Per-call tag keys (the `Tagged.make_tags` output) arrive
+  as Go maps whose insertion order is unrecoverable, so NEW per-call keys are
+  appended after the globals sorted among themselves. Coordinator decision
+  (2026-10-09, Task 7 review): sanctioned — metric values identical; telegraf
+  treats the tag list as a set; ordering unobservable in stored data.
+  NEWS-recorded (Task 28).
+- Regex warn-and-disable policy: secret-filter patterns that are
+  Python-valid but use constructs RE2 cannot compile (backreferences,
+  lookarounds, atomic groups, possessive quantifiers, `{,n}`, `\Z`,
+  `(?#)`, `(?u)`/`(?x)`, conditionals) are DISABLED with a startup
+  warning instead of crashing or rejecting (Python would accept them at
+  load). Python-INVALID patterns still hard-error at load with Python's
+  message. User decision (2026-10-09, Task 5 review): sanctioned.
+  NEWS-recorded (Task 28).
+- Native sd_notify client: the sd_notify/watchdog client is a
+  hand-written std-lib implementation (~60 lines, `internal/daemon`)
+  instead of the spec §4.6 coreos/go-systemd (sdnotify) library row.
+  Coordinator decision (2026-10-09, Task 9 review): sanctioned —
+  std-lib preference (D10, no new dependency) and Python-exact failure
+  shapes (the empty NOTIFY_SOCKET must fail with Python's OSError
+  EPROTO shape and a garbage address must fail at a prefix check,
+  where go-systemd would attempt a relative-path connect; go-systemd
+  v22.7.0 `daemon.SdNotify` returns (false, nil) for an empty socket
+  value and uses the same abstract-socket mechanism — the deviation is
+  the failure-shape parity and the Notifier seam, not the wire
+  mechanics). NEWS-recorded (Task 28).
 - Logplex framing: Go emits the clean RFC frame format; Python's
   accidental f-string bytes-repr wire framing bug is not reproduced
   (user decision, 2026-10-09; see the governing principle above).
@@ -363,17 +438,17 @@ from git log alone.
 
 | Task | Description (short) | Status | Commit | Review verdict |
 |---|---|---|---|---|
-| 1 | Branch scaffold, Go module skeleton, Makefile targets | not-started | - | - |
-| 2 | CI workflow: golangci-lint, go vet, go test -race | not-started | - | - |
-| 3 | Config loader + running-config writer (parsed-blob diff) | not-started | - | - |
-| 4 | Journal entry model, repr UTF-8 fallback, JSON serialization | not-started | - | - |
-| 5 | Filters (field/unit-log-level/secret/search) | not-started | - | - |
-| 6 | Geohash encoder + GeoIP + tag callables | not-started | - | - |
-| 7 | statsd client + Tagged sanitization | not-started | - | - |
-| 8 | State file I/O (ordered decode, sorted encode, interop tests) | not-started | - | - |
-| 9 | sd_notify, watchdog, signals (NotifyContext + SIGHUP channel) | not-started | - | - |
-| 10 | Implementation-agnostic systest harness + running-config/reload suites | not-started | - | - |
-| 11 | Python ground-truth e2e: file/logplex/ES/websocket/state/replay fixtures | not-started | - | - |
+| 1 | Branch scaffold, Go module skeleton, Makefile targets | done | 1421f47 + 353ea17 | approved (6 minors fixed)¹ |
+| 2 | CI workflow: golangci-lint, go vet, go test -race | done | 17d1c3b + 9cb194f | approved (6 minors fixed)² |
+| 3 | Config loader + running-config writer (parsed-blob diff) | done | c9fbab9 + 7ab4a89 | approved (3 doc minors fixed)³ |
+| 4 | Journal entry model, repr UTF-8 fallback, JSON serialization | done | 3fbfe92 + 45d003c + 1d678cb | approved (1 major + 6 minors fixed across two review rounds; golden fixture Python-generated, 8 cases, byte-identical; 2.2M-exec fuzz clean)⁴ |
+| 5 | Filters (field/unit-log-level/secret/search) | done | ef53aac + c999ebb | approved (3 majors + 9 minors fixed; one finding rebutted with evidence and upheld — Python accepts a missing search fields key via setdefault; two new sanctioned deviations: runtime entry-value tolerance, regex warn-and-disable) |
+| 6 | Geohash encoder + GeoIP + tag callables | done | 5122ff2 + 283e87e | approved (3 majors + 5 minors fixed; NaN guard, document-order tag visibility via JSON token walk, deviation extension recorded per coordinator ruling; 225-case golden battery) |
+| 7 | statsd client + Tagged sanitization | done | 5b343e2 + 10ffc40 | approved (1 major + 5 minors fixed; global statsd tag order exact via capture, per-call appended sorted = sanctioned deviation; empty-host/udp4 parity locked) |
+| 8 | State file I/O (ordered decode, Go-native encode, interop tests) | done | b445b53 + 9ec632a + 1773ebb | approved (1 major + 4 minors fixed; sent.cursor error scope matches Python's walk position incl. null-cursor abort; file-order decode; lenient write-only fields per coordinator ruling; permanent Python interop test in test/test_state_file_interop.py; two non-blocking residuals noted: pythonReprString \xNN escapes unreachable, other write-only fields strictly typed but unreachable from Python-written files). RE-RECORDED against the amended contract (1773ebb, user decision 2026-10-09, encoder switch — charter §2): the original byte-identical sorted-key writer was replaced by Go 1.27's encoding/json/v2 writer — parsed-equality contract, Go-native key order (nondeterministic across writes per probe), order-independent tests; verdict re-affirmed by the 1773ebb review round (2 doc restoration majors + 2 minors fixed) |
+| 9 | sd_notify, watchdog, signals (NotifyContext + SIGHUP channel) | done | 079c897 + 861d57d | approved per the reviewer's line: "sd_notify client Python-parity probed (unset no-op / empty+garbage EPROTO / ECONNREFUSED / ENOENT / '@' abstract), byte-exact state constants, NotifyContext + buffered(1) SIGHUP channel with drop-when-full coalescing pinned; native-client library deviation coordinator-sanctioned (charter §2) with corrected rationale; unittest-go/lint-go green" |
+| 10 | Implementation-agnostic systest harness + running-config/reload suites | done | d773674 + 0d7c1ba | approved (Go harness deferral recorded: systest-go/journalpump_process.go deferred to Task 18; Python-side harness rework (JOURNALPUMP_BIN selection) delivered in Task 10 and is the mechanism both implementations use; running-config/reload suites pass against the Python binary unchanged; harness unit tests for notify socket + exit-code capture) |
+| 11 | Python ground-truth e2e: file/logplex/ES/websocket/state/replay fixtures | done | 4e9985b + 0d4bac5 | changes-required (2 majors + 4 minors) FIXED in 0d4bac5: logplex bytes-repr framing reclassified as a sanctioned deviation (charter §2/D6) — Python ground truth only, content parity via the repr-stripped frame list (parity doc, support docstring, plan Task 21/11/28 aligned); ES content-length assertion moved into the per-run loop; ordered non-alias request sequence persisted in the fixture; per-entry JSON-cache quirk now CAPTURED with two concurrent filterless senders; replay count literal derived. Confirmation pass added: request_sequence fixture value built as lists (GROUNDTRUTH_UPDATE=1 worked end-to-end) |
 | 12 | Kafka ground truth via real broker / recording proxy | not-started | - | - |
 | 13 | Sender framework (error contract, wiring map, synctest) | not-started | - | - |
 | 14 | Per-sender buffer + reader backpressure (admission gate) | not-started | - | - |

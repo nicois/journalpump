@@ -318,7 +318,14 @@ pinned monotonic clock), the Go-written fixture
   is equal, the 4-space json.dump layout (items on their own lines,
   empty containers as `{}`/`[]`), no trailing newline, file mode 0600,
   and the lenient write-only raw fields are inlined (whitespace
-  re-indented under indentation, values preserved). `TestWriteParsedRoundTrip`
+  re-indented under indentation, values preserved). Deviation BOUNDARY
+  (probed): non-finite floats (NaN/±Inf) are an encoding error in v2
+  ("unsupported value: NaN") where Python's json.dump default
+  (allow_nan=True) emits NaN/Infinity literals — unreachable from
+  journalpump's own paths (decoded state carries only RFC-valid JSON
+  values; a Python-written file containing NaN already fails Go's
+  strict-JSON Read), but a state value that is not valid RFC JSON
+  cannot be re-encoded by the writer. `TestWriteParsedRoundTrip`
   replaces the old byte-golden lock: the fresh write parses exactly
   like the committed `state_go_written.json` artifact and re-reads to
   the same logical state compared with senders keyed by NAME — no
