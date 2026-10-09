@@ -1150,3 +1150,46 @@ Test-only shim (not operator-visible): `internal/daemon/pump.go`'s
 analogue of the Python harness setting `pump.poll_interval_ms = 100`.
 The production default stays 1000 ms and the shim file is compiled only
 under `-tags systest`.
+
+## Task 19 — syslog framing package (spec §5)
+
+`internal/syslogframing` ports `journalpump/rsyslog.py`: the RFC5424 /
+RFC3164 / CUSTOM formatters, `_generate_format` (the rsyslog-%token% →
+brace-placeholder tokenizer), the PRI computation, the RFC3164 date
+reformat, the RFC6587 octet-counted / non-transparent framing with
+`max_message_size` truncation and `escape_newlines`, and the TCP+TLS
+client with SNI and the one-shot EPIPE/ECONNRESET/ETIMEDOUT/SSLEOF send
+retry. Acceptance is byte-identical wire output to `SyslogTcpClient`.
+Task 20 (the rsyslog sender) consumes this package; it adds no sender
+wiring of its own.
+
+Parity coverage:
+
+- The 17 framing tests of `test/test_rsyslog.py` are ported byte-exact,
+  table-driven, against a recording stub `Conn` (thread B custom-fake
+  rule — no maintained syslog wire fake exists): 4 non-transparent
+  (verbatim small body, no extra newline, oversize truncation, body ==
+  max_msg), 6 octet-counted (advertised length == body, no stray
+  newline, oversize prefix length, back-to-back no-desync, tiny max_msg,
+  and the parametrized 1/4/8/16/32 self-consistency table), 3
+  escape_newlines.
+- `testdata/logline_groundtruth.json` is a Python-ORACLE capture
+  (generated from the real `SyslogTcpClient`, not hand-written): 37
+  wire-byte cases spanning RFC5424/RFC3164/CUSTOM, PRI in and out of
+  range (→13), the RFC3164 date reformat across timestamp shapes,
+  NILVALUE defaults for hostname/program/pid=0/msgid/msg, structured-data
+  nil/""/present, and escape_newlines off/on. `TestLogMatchesPythonGroundtruth`
+  replays it exactly.
+- `FuzzFramingSelfConsistent` fuzzes the framer: an octet frame's
+  advertised length always equals the bytes framed (never desyncs), and
+  a non-transparent frame is body-verbatim when it fits or
+  body[:max-1]+"\n" when truncated.
+
+Client deviations to watch (none observed in the framing tests; the
+real-socket/TLS paths are exercised by Task 20's rsyslogd systest):
+`shouldRetry` matches Python's `ssl.SSLEOFError` via `io.ErrUnexpectedEOF`
+(a third-party crypto/tls behavior difference would be flagged for
+adjudication rather than accommodated); `connect` uses Go's `net.Dial`
+(Happy-Eyeballs family selection) where Python iterates
+`getaddrinfo` — the dial order is not part of the wire-parity contract.
+Zero `max_msg` normalizes to 2048 (`max_msg or 2048`, rsyslog.py:118).
