@@ -316,19 +316,49 @@ pinned monotonic clock), the Go-written fixture
   with a hand-crafted file whose last-listed sender is not the
   alphabetically last (captured Python-written files are always
   alphabetical and cannot exhibit it).
+- **Malformed senders crash exactly where Python crashes**: Python's
+  unconditional `sender["sent"]["cursor"]` (journalpump.py:895-896)
+  raises KeyError only when the walk REACHES the sender. The decode is
+  lenient; the missing-sent.cursor error surfaces from
+  `ResumeCursor` (which returns `(cursor, error)`) at the walk
+  position: a malformed sender under a reader NOT in the new config is
+  never walked and harmless, and a malformed sender AFTER a
+  null-cursor sender yields a full resync, not an error (the
+  break-on-null abort at journalpump.py:904). Locked by
+  `TestResumeCursorMalformedSenderCrashesAtWalkPosition`,
+  `TestResumeCursorMalformedAfterNullIsFullResync` and
+  `TestMalformedSenderUnderUnconfiguredReaderIgnored`.
+- **Write-only fields decode leniently, no deviation**: searches hit
+  counters, total_lines, total_bytes, start_time and buffer.cursor are
+  never read back in Python, so they decode as raw JSON bytes and the
+  writer re-emits them verbatim — Go accepts any value Python could
+  have written (float hit counters, huge ints, non-string start_time;
+  `TestLenientWriteOnlyFieldsRoundTrip`). The resume-consumed fields
+  (reader cursor, sent.cursor) stay strictly typed.
 - **Python dict duplicate-key semantics are exact**: duplicate reader
   names — last wins (map decode); a duplicate sender NAME keeps its
-  FIRST position with the LAST value (dict re-assignment), which the
-  resume loop iterates.
-- **Corrupt file handling is exact**: `load_state` catches only
-  FileNotFoundError (→ empty state); invalid JSON, invalid UTF-8
-  (Python opens with encoding="utf-8"), trailing garbage ("Extra
-  data"), non-object documents all PROPAGATE and crash the daemon at
-  startup — Go returns an error for the caller to fail on. A sender
-  object without the `sent.cursor` path is also an error: Python's
-  unconditional `sender["sent"]["cursor"]` (journalpump.py:896) raises
-  KeyError — silently decoding it as a nil cursor would flip the crash
-  into a full resync.
+  FIRST position with the LAST value, and a duplicate "senders" key in
+  one reader REPLACES the whole previous object (dict re-assignment),
+  which the resume loop iterates
+  (`TestDuplicateSendersKeyReplacesWholeObject`).
+- **Corrupt file handling is exact, but error propagation is NOT
+  uniform in Python**: `load_state` catches only FileNotFoundError
+  (→ empty state); invalid JSON, invalid UTF-8 (Python opens with
+  encoding="utf-8"), trailing garbage ("Extra data") and non-object
+  documents all PROPAGATE. At STARTUP that propagation crashes the
+  daemon (daemon.py:48 calls reload_config before anything catches
+  it); on a SIGHUP reload the exception is caught and logged
+  ("Reloading configuration failed", daemon.py:80-83) and the OLD
+  configuration keeps running — the Task 17 caller must catch Read
+  errors on reload instead of crashing.
+- **Resume log lines are byte-parity**: Python %r quoting (single
+  quotes: 'kafka_backup') via `pythonReprString`, and the per-reader
+  "Reader %r resuming from cursor position: %r" line (journalpump.py:909)
+  is emitted by `ResumeCursor` after the walk on BOTH paths (the
+  null-cursor abort only breaks the sender loop in Python) — pinned to
+  Task 17: the call site must walk every reader in the new config
+  (absent reader → "... position: None") and must not emit the line
+  itself.
 - **File mode is exact**: Python calls atomic_replace_file without a
   mode, so mkstemp's 0600 applies; Go writes via
   `util.AtomicReplaceFile(path, 0o600, …)` and asserts the mode.

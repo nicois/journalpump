@@ -7,7 +7,6 @@ package state
 
 import (
 	"encoding/json"
-	"fmt"
 )
 
 // decodeRawValue consumes one complete JSON value and returns its raw
@@ -24,17 +23,4 @@ func decodeRawValue(dec *json.Decoder) (json.RawMessage, error) {
 func skipValue(dec *json.Decoder) error {
 	_, err := decodeRawValue(dec)
 	return err
-}
-
-// decodeString consumes one JSON string value.
-func decodeString(dec *json.Decoder) (string, error) {
-	tok, err := dec.Token()
-	if err != nil {
-		return "", err
-	}
-	s, ok := tok.(string)
-	if !ok {
-		return "", fmt.Errorf("must be a string")
-	}
-	return s, nil
 }

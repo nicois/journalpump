@@ -6,12 +6,24 @@
 package state
 
 import (
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Aiven-Open/journalpump/internal/journal"
 )
+
+// rawString renders a Go string as raw JSON bytes (for constructing
+// states in Go; the decoder stores decoded values verbatim).
+func rawString(s string) json.RawMessage {
+	return json.RawMessage(journal.PythonJSONString(s))
+}
+
+// rawInt renders an int64 as raw JSON bytes.
+func rawInt(n int64) json.RawMessage {
+	return json.RawMessage(strconv.FormatInt(n, 10))
+}
 
 // render produces the exact bytes of Python's
 // json.dump(state, fp, indent=4, sort_keys=True): every OBJECT's keys
@@ -25,7 +37,7 @@ func render(state *State) []byte {
 	out.key("readers")
 	renderReaders(out, state.Readers)
 	out.key("start_time")
-	out.string(state.StartTime)
+	out.raw(state.StartTime)
 	out.endContainer('}')
 	return out.bytes()
 }
@@ -59,7 +71,9 @@ func renderReader(out *lineBuffer, reader *ReaderState) {
 	out.beginContainer('{')
 	for _, name := range searchNames {
 		out.key(name)
-		out.literal(strconv.FormatInt(reader.Searches[name], 10))
+		// Write-only field: emitted verbatim from the lenient decode (or
+		// rawInt for states constructed in Go).
+		out.raw(reader.Searches[name])
 	}
 	out.endContainer('}')
 	out.key("senders")
@@ -79,9 +93,9 @@ func renderReader(out *lineBuffer, reader *ReaderState) {
 	}
 	out.endContainer('}')
 	out.key("total_bytes")
-	out.literal(strconv.FormatInt(reader.TotalBytes, 10))
+	out.raw(reader.TotalBytes)
 	out.key("total_lines")
-	out.literal(strconv.FormatInt(reader.TotalLines, 10))
+	out.raw(reader.TotalLines)
 	out.endContainer('}')
 }
 
@@ -94,7 +108,9 @@ func renderSender(out *lineBuffer, sender SenderState) {
 	out.key("current_queue")
 	out.literal(strconv.FormatInt(sender.Buffer.CurrentQueue, 10))
 	out.key("cursor")
-	renderNullableString(out, sender.Buffer.Cursor)
+	// Write-only field: emitted verbatim from the lenient decode (or
+	// rawNullableString for states constructed in Go).
+	out.raw(sender.Buffer.Cursor)
 	out.key("entry_num")
 	out.literal(strconv.FormatInt(sender.Buffer.EntryNum, 10))
 	out.key("total_size")
@@ -212,6 +228,18 @@ func (b *lineBuffer) item() {
 
 func (b *lineBuffer) literal(s string) {
 	b.out = append(b.out, s...)
+}
+
+// raw emits pre-rendered JSON bytes: the lenient decode stores
+// write-only values verbatim, so re-emission is byte-faithful. An
+// empty value renders as null — only reachable for hand-constructed
+// states that left the field unset.
+func (b *lineBuffer) raw(raw json.RawMessage) {
+	if len(raw) == 0 {
+		b.literal("null")
+		return
+	}
+	b.literal(string(raw))
 }
 
 func (b *lineBuffer) string(s string) {

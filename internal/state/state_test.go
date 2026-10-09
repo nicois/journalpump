@@ -6,6 +6,7 @@
 package state
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -69,10 +70,11 @@ func TestReadPythonFixture(t *testing.T) {
 	if reader.Cursor == nil || *reader.Cursor != "cursor=11223344-0" {
 		t.Errorf("cursor = %v", reader.Cursor)
 	}
-	wantSearches := map[string]int64{"errors": 0, "payment_lines": 7}
+	wantSearches := map[string]string{"errors": "0", "payment_lines": "7"}
 	for name, hits := range wantSearches {
-		if reader.Searches[name] != hits {
-			t.Errorf("search %q hits = %d, want %d", name, reader.Searches[name], hits)
+		// Searches hits decode leniently as raw bytes (write-only).
+		if got := string(reader.Searches[name]); got != hits {
+			t.Errorf("search %q hits = %s, want %s", name, got, hits)
 		}
 	}
 	if len(reader.Senders) != 2 {
@@ -105,21 +107,33 @@ func TestReadPythonFixture(t *testing.T) {
 	if got := strings.Join(primary.Health.Errors, "|"); got != "Connection refused|Timed out" {
 		t.Errorf("primary errors = %q", got)
 	}
-	if reader.TotalLines != 1_000_000 || reader.TotalBytes != 999_999_999 {
-		t.Errorf("totals = %d/%d", reader.TotalLines, reader.TotalBytes)
+	// Write-only fields decode leniently as raw bytes.
+	if got := string(reader.TotalLines); got != "1000000" {
+		t.Errorf("total_lines = %s, want 1000000", got)
 	}
-	if state.StartTime != "2026-10-09T12:00:00.000000" {
-		t.Errorf("start_time = %q", state.StartTime)
+	if got := string(reader.TotalBytes); got != "999999999" {
+		t.Errorf("total_bytes = %s, want 999999999", got)
+	}
+	if got := string(state.StartTime); got != `"2026-10-09T12:00:00.000000"` {
+		t.Errorf("start_time = %s", got)
 	}
 	// Resume: the alphabetically-FIRST sender has a null cursor, so the
 	// walk aborts with a full resync even though kafka_primary has a
-	// cursor.
+	// cursor. Log parity: Python %r quoting (single quotes), and the
+	// walk ends with the per-reader resuming line (journalpump.py:909).
 	logger := &capturingLogger{}
-	if got := ResumeCursor(reader, "reader_one", logger); got != nil {
-		t.Errorf("resume cursor = %v, want nil (full resync)", got)
+	cursor, err := ResumeCursor(reader, "reader_one", logger)
+	if cursor != nil || err != nil {
+		t.Errorf("resume = %v, %v, want nil/nil (full resync)", cursor, err)
 	}
-	if len(logger.lines) != 1 || !strings.Contains(logger.lines[0], "needs full sync from beginning") {
+	if len(logger.lines) != 2 {
 		t.Fatalf("log lines = %q", logger.lines)
+	}
+	if want := "Sender 'kafka_backup' for reader 'reader_one' needs full sync from beginning"; logger.lines[0] != want {
+		t.Errorf("full-sync line = %q, want %q", logger.lines[0], want)
+	}
+	if want := "Reader 'reader_one' resuming from cursor position: None"; logger.lines[1] != want {
+		t.Errorf("resuming line = %q, want %q", logger.lines[1], want)
 	}
 }
 
@@ -168,13 +182,13 @@ func TestWriteGolden(t *testing.T) {
 	cursorBackup := "cursor=backup-2"
 	bufferCursor := "cursor=buffer-3"
 	state := &State{
-		StartTime: "2026-10-09T13:00:00.000000",
+		StartTime: rawString("2026-10-09T13:00:00.000000"),
 		Readers: map[string]*ReaderState{
 			"reader_two": {
 				Cursor: &cursorPrimary,
-				Searches: map[string]int64{
-					"zeta":  3,
-					"alpha": 10,
+				Searches: map[string]json.RawMessage{
+					"zeta":  rawInt(3),
+					"alpha": rawInt(10),
 				},
 				// Deliberately NON-sorted in-memory order: the writer
 				// sorts on disk (sort_keys=True) and the health errors
@@ -190,7 +204,7 @@ func TestWriteGolden(t *testing.T) {
 								Elapsed: 3.5,
 								Errors:  []string{"connection reset été", "first error stays"},
 							},
-							Buffer: BufferState{Cursor: &bufferCursor, TotalSize: 4096, EntryNum: 9, CurrentQueue: 2},
+							Buffer: BufferState{Cursor: rawString(bufferCursor), TotalSize: 4096, EntryNum: 9, CurrentQueue: 2},
 						},
 					},
 					{
@@ -203,8 +217,8 @@ func TestWriteGolden(t *testing.T) {
 						},
 					},
 				},
-				TotalLines: 42,
-				TotalBytes: 84,
+				TotalLines: rawInt(42),
+				TotalBytes: rawInt(84),
 			},
 		},
 	}
@@ -260,7 +274,10 @@ func TestResumeCursorLastListedWins(t *testing.T) {
 	state := readHandCrafted(t, quirkStateFile)
 	reader := state.Readers["r"]
 	// File order: zulu (cursor=Z) listed first, alpha (cursor=A) last.
-	got := ResumeCursor(reader, "r", nil)
+	got, err := ResumeCursor(reader, "r", nil)
+	if err != nil {
+		t.Fatalf("ResumeCursor: %v", err)
+	}
 	if got == nil || *got != "cursor=A" {
 		t.Errorf("resume cursor = %v, want cursor=A (last listed wins in key order)", got)
 	}
@@ -275,7 +292,11 @@ func TestResumeCursorAnyMissingIsFullResync(t *testing.T) {
 		`"sent": {"cursor": "cursor=Z"`, `"sent": {"cursor": null`, 1)
 	state := readHandCrafted(t, file)
 	reader := state.Readers["r"]
-	if got := ResumeCursor(reader, "r", nil); got != nil {
+	got, err := ResumeCursor(reader, "r", nil)
+	if err != nil {
+		t.Fatalf("ResumeCursor: %v", err)
+	}
+	if got != nil {
 		t.Errorf("resume cursor = %v, want nil (missing cursor aborts the walk)", got)
 	}
 }
@@ -285,8 +306,11 @@ func TestResumeCursorAnyMissingIsFullResync(t *testing.T) {
 func TestResumeCursorDefaultsToReaderCursor(t *testing.T) {
 	t.Parallel()
 	cursor := "cursor=reader-0"
-	reader := &ReaderState{Cursor: &cursor, Searches: map[string]int64{}}
-	got := ResumeCursor(reader, "r", nil)
+	reader := &ReaderState{Cursor: &cursor}
+	got, err := ResumeCursor(reader, "r", nil)
+	if err != nil {
+		t.Fatalf("ResumeCursor: %v", err)
+	}
 	if got == nil || *got != cursor {
 		t.Errorf("resume cursor = %v, want %q", got, cursor)
 	}
@@ -300,7 +324,7 @@ func TestReadMissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if len(state.Readers) != 0 || state.StartTime != "" {
+	if len(state.Readers) != 0 || len(state.StartTime) != 0 {
 		t.Errorf("state = %+v, want empty", state)
 	}
 }
@@ -334,11 +358,30 @@ func TestReadCorruptJSON(t *testing.T) {
 	}
 }
 
-// TestReadMalformedSenderCrashes mirrors Python's unconditional
-// sender["sent"]["cursor"] (journalpump.py:896): a sender object
-// without the sent.cursor path must be an ERROR (the daemon crashes),
-// never a silent nil cursor that would trigger a full resync.
-func TestReadMalformedSenderCrashes(t *testing.T) {
+// malformedSenderFile builds a state file whose reader "r" contains
+// the given senders object.
+func malformedSenderFile(senders string) string {
+	return fmt.Sprintf(`{
+    "readers": {
+        "r": {
+            "cursor": null,
+            "searches": {},
+            "senders": %s,
+            "total_bytes": 0,
+            "total_lines": 0
+        }
+    },
+    "start_time": "x"
+}`, senders)
+}
+
+// TestResumeCursorMalformedSenderCrashesAtWalkPosition mirrors Python's
+// unconditional sender["sent"]["cursor"] (journalpump.py:895-896): a
+// sender object without the sent.cursor path crashes the daemon ONLY
+// when the walk reaches it — decode stays lenient and the error
+// surfaces from ResumeCursor, never a silent nil cursor that would
+// trigger a full resync.
+func TestResumeCursorMalformedSenderCrashesAtWalkPosition(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name   string
@@ -346,32 +389,91 @@ func TestReadMalformedSenderCrashes(t *testing.T) {
 	}{
 		{name: "sent missing", sender: `{"type": "LogSender"}`},
 		{name: "cursor missing", sender: `{"sent": {"count": 1}}`},
+		{name: "sent not an object", sender: `{"sent": 5}`},
+		{name: "sender not an object", sender: `"broken"`},
 	}
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			file := fmt.Sprintf(`{
+			state := readHandCrafted(t, malformedSenderFile(fmt.Sprintf(`{"alpha": %s}`, tc.sender)))
+			// Decode is lenient: Read succeeds — the crash would happen
+			// at resume-selection time in Python.
+			cursor, err := ResumeCursor(state.Readers["r"], "r", nil)
+			if err == nil || !strings.Contains(err.Error(), "missing sent.cursor") {
+				t.Fatalf("err = %v, want missing sent.cursor error", err)
+			}
+			if cursor != nil {
+				t.Errorf("cursor = %v, want nil alongside the error", cursor)
+			}
+		})
+	}
+}
+
+// TestResumeCursorMalformedAfterNullIsFullResync restores Python's
+// scope for the break-on-null abort (journalpump.py:904): a malformed
+// sender listed AFTER a null-cursor sender is never reached by the
+// walk, so the result is a full resync — NOT an error.
+func TestResumeCursorMalformedAfterNullIsFullResync(t *testing.T) {
+	t.Parallel()
+	senders := `{
+                "alpha": {"type": "LogSender", "sent": {"cursor": null, "count": 0, "bytes": 0}},
+                "zulu": {"type": "LogSender"}
+            }`
+	state := readHandCrafted(t, malformedSenderFile(senders))
+	logger := &capturingLogger{}
+	cursor, err := ResumeCursor(state.Readers["r"], "r", logger)
+	if err != nil {
+		t.Fatalf("ResumeCursor: %v, want nil error (walk aborted before the malformed sender)", err)
+	}
+	if cursor != nil {
+		t.Errorf("cursor = %v, want nil (full resync)", cursor)
+	}
+	if len(logger.lines) != 2 || !strings.Contains(logger.lines[0], "needs full sync from beginning") {
+		t.Fatalf("log lines = %q", logger.lines)
+	}
+}
+
+// TestMalformedSenderUnderUnconfiguredReaderIgnored: Python only walks
+// readers in the NEW config (journalpump.py:889-890), so a malformed
+// sender under a reader not in the config is harmless — decode is
+// lenient and the Go caller likewise only calls ResumeCursor for
+// configured readers.
+func TestMalformedSenderUnderUnconfiguredReaderIgnored(t *testing.T) {
+	t.Parallel()
+	file := `{
     "readers": {
-        "r": {
+        "in_config": {
+            "cursor": "cursor=reader-0",
+            "searches": {},
+            "senders": {"alpha": {"type": "LogSender", "sent": {"cursor": "cursor=A", "count": 1, "bytes": 1}}},
+            "total_bytes": 0,
+            "total_lines": 0
+        },
+        "orphan": {
             "cursor": null,
             "searches": {},
-            "senders": {"alpha": %s},
+            "senders": {"broken": {"type": "LogSender"}},
             "total_bytes": 0,
             "total_lines": 0
         }
     },
     "start_time": "x"
-}`, tc.sender)
-			path := filepath.Join(t.TempDir(), "state.json")
-			if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			_, err := Read(path)
-			if err == nil || !strings.Contains(err.Error(), "missing sent.cursor") {
-				t.Fatalf("err = %v, want missing sent.cursor error", err)
-			}
-		})
+}`
+	state := readHandCrafted(t, file)
+	// Decode is lenient (Read succeeded); the caller walks only readers
+	// in the new config, so "orphan" is never touched.
+	cursor, err := ResumeCursor(state.Readers["in_config"], "in_config", nil)
+	if err != nil {
+		t.Fatalf("ResumeCursor: %v", err)
+	}
+	if cursor == nil || *cursor != "cursor=A" {
+		t.Errorf("cursor = %v, want cursor=A", cursor)
+	}
+	// Walking the unconfigured reader WOULD error — which is exactly
+	// why the caller must not walk it, matching Python's scope.
+	if _, err := ResumeCursor(state.Readers["orphan"], "orphan", nil); err == nil {
+		t.Error("walking the unconfigured reader should error (the caller must not)")
 	}
 }
 
@@ -388,4 +490,115 @@ func readHandCrafted(t *testing.T, content string) *State {
 		t.Fatalf("Read: %v", err)
 	}
 	return state
+}
+
+// TestDuplicateSendersKeyReplacesWholeObject: a duplicate "senders"
+// key within one reader replaces the WHOLE previous object (Python
+// dict re-assignment keeps only the last value), including the file
+// key order of the surviving object.
+func TestDuplicateSendersKeyReplacesWholeObject(t *testing.T) {
+	t.Parallel()
+	file := `{
+    "readers": {
+        "r": {
+            "cursor": null,
+            "searches": {},
+            "senders": {"alpha": {"type": "LogSender", "sent": {"cursor": "cursor=A1", "count": 1, "bytes": 1}}},
+            "senders": {
+                "zulu": {"type": "LogSender", "sent": {"cursor": "cursor=Z", "count": 2, "bytes": 2}},
+                "alpha": {"type": "LogSender", "sent": {"cursor": "cursor=A2", "count": 3, "bytes": 3}}
+            },
+            "total_bytes": 0,
+            "total_lines": 0
+        }
+    },
+    "start_time": "x"
+}`
+	state := readHandCrafted(t, file)
+	reader := state.Readers["r"]
+	if len(reader.Senders) != 2 {
+		t.Fatalf("senders = %+v, want only the second occurrence", reader.Senders)
+	}
+	// The surviving object's file order: zulu first, alpha last.
+	if reader.Senders[0].Name != "zulu" || reader.Senders[1].Name != "alpha" {
+		t.Errorf("sender order = [%s, %s], want [zulu alpha]", reader.Senders[0].Name, reader.Senders[1].Name)
+	}
+	if got := *reader.Senders[1].State.Sent.Cursor; got != "cursor=A2" {
+		t.Errorf("alpha cursor = %q, want the second occurrence's value cursor=A2", got)
+	}
+	cursor, err := ResumeCursor(reader, "r", nil)
+	if err != nil {
+		t.Fatalf("ResumeCursor: %v", err)
+	}
+	if cursor == nil || *cursor != "cursor=A2" {
+		t.Errorf("resume cursor = %v, want cursor=A2 (last listed wins)", cursor)
+	}
+}
+
+// TestLenientWriteOnlyFieldsRoundTrip: the write-only fields decode
+// leniently (Python never reads them back) and the writer re-emits the
+// decoded raw bytes verbatim, so unusual values survive a Go
+// read/write cycle unchanged — Go must not refuse state files Python
+// accepts.
+func TestLenientWriteOnlyFieldsRoundTrip(t *testing.T) {
+	t.Parallel()
+	file := `{
+    "readers": {
+        "r": {
+            "cursor": null,
+            "searches": {"hits": 7.5, "huge": 1e30},
+            "senders": {"alpha": {"type": "LogSender", "buffer": {"cursor": 3.5, "entry_num": 0, "current_queue": 0, "total_size": 0}, "sent": {"cursor": "cursor=A", "count": 1, "bytes": 1}}},
+            "total_bytes": 123456789012345678901234567890,
+            "total_lines": 1e30
+        }
+    },
+    "start_time": 42
+}`
+	state := readHandCrafted(t, file)
+	reader := state.Readers["r"]
+	if got := string(reader.Searches["hits"]); got != "7.5" {
+		t.Errorf("search hits = %s, want 7.5 (float counter accepted)", got)
+	}
+	if got := string(reader.Searches["huge"]); got != "1e30" {
+		t.Errorf("search hits = %s, want 1e30", got)
+	}
+	if got := string(reader.TotalLines); got != "1e30" {
+		t.Errorf("total_lines = %s, want 1e30", got)
+	}
+	if got := string(reader.TotalBytes); got != "123456789012345678901234567890" {
+		t.Errorf("total_bytes = %s, want the huge int verbatim", got)
+	}
+	if got := string(state.StartTime); got != "42" {
+		t.Errorf("start_time = %s, want 42 (non-string accepted)", got)
+	}
+	if got := string(reader.Senders[0].State.Buffer.Cursor); got != "3.5" {
+		t.Errorf("buffer cursor = %s, want 3.5", got)
+	}
+
+	// The writer emits the raw bytes verbatim: a second read of the
+	// rewrite decodes to identical raw values (idempotent round trip).
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := Write(path, state); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	again, err := Read(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	reread := again.Readers["r"]
+	if got := string(reread.Searches["hits"]); got != "7.5" {
+		t.Errorf("round-trip search hits = %s, want 7.5", got)
+	}
+	if got := string(reread.TotalLines); got != "1e30" {
+		t.Errorf("round-trip total_lines = %s, want 1e30", got)
+	}
+	if got := string(reread.TotalBytes); got != "123456789012345678901234567890" {
+		t.Errorf("round-trip total_bytes = %s, want the huge int verbatim", got)
+	}
+	if got := string(again.StartTime); got != "42" {
+		t.Errorf("round-trip start_time = %s, want 42", got)
+	}
+	if got := string(reread.Senders[0].State.Buffer.Cursor); got != "3.5" {
+		t.Errorf("round-trip buffer cursor = %s, want 3.5", got)
+	}
 }

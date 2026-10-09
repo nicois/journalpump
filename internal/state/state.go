@@ -23,17 +23,21 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/Aiven-Open/journalpump/internal/util"
 )
 
 // BufferState mirrors senders/base.py Sender.get_state "buffer" object.
+// Cursor is decoded leniently as raw JSON bytes: the buffer cursor is
+// written but never read back in Python, so the reader must accept any
+// value Python could have written rather than reject the file.
 type BufferState struct {
-	Cursor       *string `json:"cursor"`
-	TotalSize    int64   `json:"total_size"`
-	EntryNum     int64   `json:"entry_num"`
-	CurrentQueue int64   `json:"current_queue"`
+	Cursor       json.RawMessage `json:"cursor"`
+	TotalSize    int64           `json:"total_size"`
+	EntryNum     int64           `json:"entry_num"`
+	CurrentQueue int64           `json:"current_queue"`
 }
 
 // SentState mirrors the "sent" object.
@@ -54,12 +58,19 @@ type HealthState struct {
 	Errors  []string `json:"errors"`
 }
 
-// SenderState mirrors one sender's get_state() value.
+// SenderState mirrors one sender's get_state() value. sentCursorMissing
+// records whether the raw sender value lacked the sent.cursor key path
+// Python indexes unconditionally at resume-selection time
+// (journalpump.py:896); the check happens at the WALK position in
+// ResumeCursor, not at decode (see ResumeCursor). It is false for
+// states constructed in Go, which always carry sent.cursor.
 type SenderState struct {
 	Type   string      `json:"type"`
 	Buffer BufferState `json:"buffer"`
 	Sent   SentState   `json:"sent"`
 	Health HealthState `json:"health"`
+
+	sentCursorMissing bool
 }
 
 // NamedSenderState pairs a sender name with its state; Senders keeps
@@ -71,20 +82,27 @@ type NamedSenderState struct {
 }
 
 // ReaderState mirrors JournalReader.get_state (journalpump.py:326-335).
-// Searches holds the per-search hit counters (written, never restored
-// — nothing reads them back in Python either).
+// The write-only fields (searches hit counters, total_lines,
+// total_bytes) are decoded leniently as raw JSON bytes: Python never
+// reads them back, and strict typing would make Go refuse state files
+// Python accepts (e.g. a float hit counter written by a Python with a
+// slightly different counter type). The writer emits the raw bytes
+// verbatim, so lenient decode is also byte-faithful. Cursor IS
+// consumed by the resume selection, so it stays strictly a string.
 type ReaderState struct {
 	Cursor     *string
-	Searches   map[string]int64
+	Searches   map[string]json.RawMessage
 	Senders    []NamedSenderState
-	TotalLines int64
-	TotalBytes int64
+	TotalLines json.RawMessage
+	TotalBytes json.RawMessage
 }
 
 // State mirrors the whole file: {"readers": {...}, "start_time": str}.
+// StartTime is decoded leniently (raw JSON bytes) like the other
+// write-only fields — Python never reads it back.
 type State struct {
 	Readers   map[string]*ReaderState
-	StartTime string
+	StartTime json.RawMessage
 }
 
 // Logger is the logging subset the resume selection uses for the
@@ -116,9 +134,14 @@ func Write(path string, state *State) error {
 }
 
 // Read parses a state file the way Python's load_state does: a missing
-// file is an empty state (FileNotFoundError → {}), everything else —
-// including invalid JSON — is an error the caller must fail on (Python
-// lets the exception propagate and crash the daemon at startup).
+// file is an empty state (FileNotFoundError → {}), every other error —
+// including invalid JSON — propagates to the caller. In Python that
+// propagation is NOT uniform: at startup the exception escapes and
+// crashes the daemon (daemon.py:48 calls reload_config before anything
+// catches it), but on a SIGHUP reload it is caught and logged
+// ("Reloading configuration failed", daemon.py:80-83) and the old
+// configuration keeps running. The Task 17 caller must therefore catch
+// Read errors on reload instead of crashing.
 //
 // The per-reader senders object is decoded with token streaming to
 // preserve the FILE key order (encoding/json into a map would discard
@@ -126,7 +149,8 @@ func Write(path string, state *State) error {
 // as plain maps/structs since only the senders order is
 // order-sensitive. Duplicate reader names follow the map decode
 // (last wins); a duplicate sender NAME keeps its first position with
-// the last value, matching Python's dict re-assignment semantics.
+// the last value, and a duplicate "senders" key replaces the whole
+// previous object, both matching Python's dict re-assignment semantics.
 func Read(path string) (*State, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -166,7 +190,9 @@ func parse(data []byte) (*State, error) {
 				return nil, err
 			}
 		case "start_time":
-			value, err := decodeString(dec)
+			// Write-only field: decoded leniently as raw bytes (Python
+			// never reads it back).
+			value, err := decodeRawValue(dec)
 			if err != nil {
 				return nil, fmt.Errorf("state file: start_time: %w", err)
 			}
@@ -229,13 +255,16 @@ func parseReader(dec *json.Decoder) (*ReaderState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("state file: reader: %w", err)
 	}
-	reader := &ReaderState{Searches: map[string]int64{}}
-	// Pass 1: the order-insensitive fields via a struct decode.
+	reader := &ReaderState{Searches: map[string]json.RawMessage{}}
+	// Pass 1: the order-insensitive fields via a struct decode. The
+	// write-only fields decode leniently as raw JSON bytes (see
+	// ReaderState); cursor stays strict because the resume selection
+	// consumes it.
 	var fields struct {
-		Cursor     *string          `json:"cursor"`
-		Searches   map[string]int64 `json:"searches"`
-		TotalLines *int64           `json:"total_lines"`
-		TotalBytes *int64           `json:"total_bytes"`
+		Cursor     *string                    `json:"cursor"`
+		Searches   map[string]json.RawMessage `json:"searches"`
+		TotalLines json.RawMessage            `json:"total_lines"`
+		TotalBytes json.RawMessage            `json:"total_bytes"`
 	}
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return nil, fmt.Errorf("state file: reader: %w", err)
@@ -243,14 +272,10 @@ func parseReader(dec *json.Decoder) (*ReaderState, error) {
 	reader.Cursor = fields.Cursor
 	reader.Searches = fields.Searches
 	if reader.Searches == nil {
-		reader.Searches = map[string]int64{}
+		reader.Searches = map[string]json.RawMessage{}
 	}
-	if fields.TotalLines != nil {
-		reader.TotalLines = *fields.TotalLines
-	}
-	if fields.TotalBytes != nil {
-		reader.TotalBytes = *fields.TotalBytes
-	}
+	reader.TotalLines = fields.TotalLines
+	reader.TotalBytes = fields.TotalBytes
 	// Pass 2: the senders key order, by token.
 	sdec := json.NewDecoder(bytes.NewReader(raw))
 	sdec.UseNumber()
@@ -283,6 +308,9 @@ func walkReaderObject(dec *json.Decoder, reader *ReaderState) error {
 			}
 			continue
 		}
+		// A duplicate "senders" key replaces the whole previous object
+		// (Python dict re-assignment keeps only the last value).
+		reader.Senders = nil
 		if err := walkSenders(dec, reader); err != nil {
 			return err
 		}
@@ -320,16 +348,15 @@ func walkSenders(dec *json.Decoder, reader *ReaderState) error {
 			return fmt.Errorf("state file: reader sender %q: %w", name, err)
 		}
 		var sender SenderState
-		if err := json.Unmarshal(raw, &sender); err != nil {
-			return fmt.Errorf("state file: reader sender %q: %w", name, err)
-		}
-		// Python: sender["sent"]["cursor"] raises KeyError on a malformed
-		// sender object and the daemon crashes — reproduce as an error
-		// instead of silently treating it as a nil cursor (which would
-		// trigger a full resync).
-		if rawHasNoSentCursor(raw) {
-			return fmt.Errorf("state file: reader sender %q: missing sent.cursor", name)
-		}
+		// Lenient decode: Python never touches a sender object here
+		// beyond sent.cursor at resume-selection time, so mismatched or
+		// malformed write-only fields must not make Go reject a file
+		// Python accepts. Whatever fails decodes as zero values; the
+		// only consumed key path, sent.cursor, has its PRESENCE probed
+		// separately (the probe handles non-object "sent" values the
+		// way Python's TypeError would — missing at the walk position).
+		_ = json.Unmarshal(raw, &sender)
+		sender.sentCursorMissing = rawLacksSentCursor(raw)
 		if position, ok := positions[name]; ok {
 			reader.Senders[position].State = sender
 			continue
@@ -343,13 +370,16 @@ func walkSenders(dec *json.Decoder, reader *ReaderState) error {
 	return nil
 }
 
-// rawHasNoSentCursor reports whether a sender value lacks the
-// "sent"."cursor" key path Python indexes unconditionally
-// (journalpump.py:896). The key PRESENCE matters, not its value: a
-// present null cursor is a legal full-resync marker, so the probe uses
-// a non-pointer RawMessage (a `null` value decodes to the literal
-// bytes "null", an absent key to nil).
-func rawHasNoSentCursor(raw []byte) bool {
+// rawLacksSentCursor reports whether a sender value lacks the
+// "sent"."cursor" key path Python indexes unconditionally at resume
+// selection (journalpump.py:896). The key PRESENCE matters, not its
+// value: a present null cursor is a legal full-resync marker, so the
+// probe uses a non-pointer RawMessage (a `null` value decodes to the
+// literal bytes "null", an absent key to nil). A raw value that does
+// not unmarshal at all (e.g. "sent" is not an object) also counts as
+// lacking — Python would raise KeyError/TypeError at the same walk
+// position.
+func rawLacksSentCursor(raw []byte) bool {
 	var probe struct {
 		Sent *struct {
 			Cursor json.RawMessage `json:"cursor"`
@@ -361,23 +391,93 @@ func rawHasNoSentCursor(raw []byte) bool {
 	return probe.Sent == nil || probe.Sent.Cursor == nil
 }
 
+// pythonReprString ports Python's %r for the strings the resume log
+// lines interpolate (names, cursor values): CPython repr prefers
+// single quotes and only switches to double quotes when the string
+// contains a single quote but no double quote; backslash, the quote
+// character and the common control characters are escaped. Plain
+// config names and cursors render as 'kafka_backup', matching Python.
+func pythonReprString(s string) string {
+	quote := byte('\'')
+	if strings.Contains(s, "'") && !strings.Contains(s, "\"") {
+		quote = '"'
+	}
+	var out strings.Builder
+	out.Grow(len(s) + 2)
+	out.WriteByte(quote)
+	for _, r := range s {
+		switch r {
+		case '\\', rune(quote):
+			out.WriteByte('\\')
+			out.WriteRune(r)
+		case '\n':
+			out.WriteString(`\n`)
+		case '\r':
+			out.WriteString(`\r`)
+		case '\t':
+			out.WriteString(`\t`)
+		default:
+			out.WriteRune(r)
+		}
+	}
+	out.WriteByte(quote)
+	return out.String()
+}
+
 // ResumeCursor ports the resume-cursor selection of
 // journalpump.py:889-905: it starts at the reader's own cursor and
 // then walks the senders IN FILE KEY ORDER — the LAST listed sender
 // wins, and any sender whose sent.cursor is null aborts the walk with
 // a full resync (nil) after logging "Sender %r for reader %r needs
-// full sync from beginning". A nil result mirrors Python's None.
-func ResumeCursor(reader *ReaderState, readerName string, log Logger) *string {
+// full sync from beginning" (journalpump.py:898-902). A nil result
+// mirrors Python's None. The per-reader resuming line (909) is emitted
+// after the walk on BOTH paths — the null-cursor abort only breaks the
+// sender loop in Python, it does not skip the line.
+//
+// The malformed-sender check happens at the WALK position, exactly
+// where Python's unconditional sender["sent"]["cursor"] (896) raises:
+// a sender listed BEFORE a null-cursor sender (or under a reader not
+// in the new config, which the caller never walks) is never touched
+// and therefore harmless — decode is lenient and the error surfaces
+// only if the walk actually reaches the malformed sender.
+//
+// The walk ends with Python's per-reader info line
+// "Reader %r resuming from cursor position: %r" (journalpump.py:909).
+// TODO(migration Task 17): the reader-construction call site must call
+// ResumeCursor for every reader in the new config — including readers
+// absent from the state file (empty ReaderState → logs
+// "... position: None") — and must NOT emit that line itself, so the
+// logging stays exactly where Python emits it.
+func ResumeCursor(reader *ReaderState, readerName string, log Logger) (*string, error) {
 	resume := reader.Cursor
 	for _, sender := range reader.Senders {
+		if sender.State.sentCursorMissing {
+			// Python: sender["sent"]["cursor"] raises KeyError right here
+			// (journalpump.py:896) and the daemon crashes — reproduce as
+			// an error instead of silently treating it as a nil cursor
+			// (which would trigger a full resync).
+			return nil, fmt.Errorf("state file: reader %s sender %s: missing sent.cursor",
+				pythonReprString(readerName), pythonReprString(sender.Name))
+		}
 		cursor := sender.State.Sent.Cursor
 		if cursor == nil {
 			if log != nil {
-				log.Printf("Sender %q for reader %q needs full sync from beginning", sender.Name, readerName)
+				log.Printf("Sender %s for reader %s needs full sync from beginning",
+					pythonReprString(sender.Name), pythonReprString(readerName))
 			}
-			return nil
+			resume = nil
+			break
 		}
 		resume = cursor
 	}
-	return resume
+	if log != nil {
+		// journalpump.py:909 — emitted for every walked reader, after the
+		// walk (see the Task 17 TODO above).
+		cursorRepr := "None"
+		if resume != nil {
+			cursorRepr = pythonReprString(*resume)
+		}
+		log.Printf("Reader %s resuming from cursor position: %s", pythonReprString(readerName), cursorRepr)
+	}
+	return resume, nil
 }
