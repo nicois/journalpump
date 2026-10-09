@@ -1740,6 +1740,8 @@ Send path (thread A7):
   `sarama.ErrOutOfBrokers`, timeouts, EOF, ECONNREFUSED/ECONNRESET/EPIPE
   → silent retriable; everything else → the unexpected-exception path
   (`TestRetriableClassification`).
+- `New` silences sarama's package-level logger (`io.Discard`), the
+  analogue of kafka_sender.py:44 setting the `kafka` logger to CRITICAL.
 - Connect runs inside `SendMessages` (Python's `_init_kafka`), reports
   the connected transition through the `sender.ConnectionReporter` seam
   so the loop resets the shared backoff exponent, and a failure returns
