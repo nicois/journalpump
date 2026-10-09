@@ -1598,10 +1598,27 @@ Proxy environment (review round 2):
   second `getproxies_environment` pass inspects the ORIGINAL name, so
   uppercase never overrides lowercase); the `no_proxy` lookup is
   lowercase-first with an uppercase fallback; `ALL_PROXY` is the fallback
-  when no scheme-specific proxy is set; and loopback targets are NOT
-  special-cased — they are proxied unless `no_proxy` matches (the
-  platform-specific `proxy_bypass` is a no-op on Linux, where requests
-  clears `no_proxy` around it when none was supplied).
+  when no scheme-specific proxy is set; a scheme-less proxy address
+  (`HTTP_PROXY=proxy.example:8080`) is normalized with an `http://`
+  prepended host validation, and a proxy with no host is rejected; and
+  loopback targets are NOT special-cased — they are proxied unless
+  `no_proxy` matches.
+- Review round 3 completed the `no_proxy` matching (the Linux
+  `proxy_bypass` fallback is NOT a no-op: requests'
+  `set_environ("no_proxy", None)` leaves the environment untouched, so
+  `urllib.request.proxy_bypass_environment` runs against the ambient
+  `no_proxy`). The selector now OR-s requests' own loop (plain suffix on
+  host and host:port for hostnames; CIDR/plain-IP for IP hosts) with
+  urllib's fallback (`NO_PROXY=*` wildcard, case-insensitive matching,
+  leading-dot tolerance and `.name` label-boundary suffixes). Note:
+  requests' own loop is a PLAIN suffix with no label boundary, so
+  `no_proxy=example.com` also bypasses `notexample.com` (probe-verified
+  against requests 2.33.1); Python parity keeps that behavior rather than
+  silently adopting a stricter rule (which would need a sanctioned
+  deviation). `TestNoProxySelection` covers wildcard, mixed case,
+  leading dot, label boundary, port handling and CIDR/plain IP;
+  `TestParseProxyURL` and `TestProxyConfiguredWithoutScheme` cover the
+  scheme-less address.
 - `TestProxySelectionMatchesRequests` unit-tests the precedence (lowercase
   wins, empty lowercase removes), the `ALL_PROXY` fallback and the
   scheme-beats-`ALL_PROXY` case; `TestNoProxySelection` unit-tests the
@@ -1611,16 +1628,23 @@ Proxy environment (review round 2):
   and passed vacuously); `TestNoProxyBypass` uses a NON-loopback target and
   asserts the proxy is NOT used.
 
-Interpolation of container-valued extras (review round 2):
+Interpolation of container-valued extras (review rounds 2-3):
 
 - `pyRepr` now follows Python's `repr` exactly: single quotes unless the
   string contains `'` and no `"` (then double quotes), with backslash
   escaping of the chosen quote, backslash, the short escapes `\t` `\n`
-  `\r`, and `\xNN` for every other control character (including NUL and
-  DEL) — previously it single-quoted unconditionally and emitted control
-  characters literally. `TestPyStrMatchesPython` pins apostrophe/quote
-  selection and control-character escaping for container values supplied
-  through `extra_field_values`.
+  `\r`, and an escaped form for every NONPRINTABLE rune. Round 3 completed
+  the non-ASCII rule: Python escapes nonprintable characters per the
+  unicodedata nonprintable categories (Cc, Cf, Co, Cs, Zl, Zp, and Zs
+  except U+0020), which agrees with Go's `unicode.IsPrint` for the values
+  journalpump can see, and uses repr's escape WIDTH — `\xNN` up to
+  U+00FF, `\uNNNN` up to U+FFFF, `\UXXXXXXXX` above — so U+0085 → `\x85`,
+  U+00A0 → `\xa0`, U+2028 → `\u2028`, U+E000 → `\ue000`, while a printable
+  non-ASCII character (é, ☃, 😀, U+FFFD) stays literal. Previously it
+  single-quoted unconditionally and emitted nonprintable non-ASCII
+  literally. `TestPyStrMatchesPython` pins apostrophe/quote selection,
+  control characters, latin-1/BMP/astral nonprintables and printable
+  non-ASCII for container values supplied through `extra_field_values`.
 
 Fixture assertion at the HTTP boundary (review round 2):
 
