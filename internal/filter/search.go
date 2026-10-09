@@ -263,8 +263,9 @@ func (s *Search) Hits() int64 {
 // Stats is the subset of the statsd client perform_searches uses
 // (journalpump.py:612-617, 637-638).
 type Stats interface {
-	// Increase mirrors statsd.increase(metric, tags=...).
-	Increase(metric string, tags map[string]string)
+	// Increase mirrors statsd.increase(metric, inc_value=..., tags=...);
+	// perform_searches uses the default 1.
+	Increase(metric string, incValue int64, tags map[string]string)
 	// Gauge mirrors statsd.gauge(metric, value=..., tags=...).
 	Gauge(metric string, value float64, tags map[string]string)
 }
@@ -379,7 +380,7 @@ func (s *Searcher) PerformSearches(entry map[string]any) bool {
 			tags[spec.name] = spec.static
 		}
 		if s.stats != nil {
-			s.stats.Increase(search.name, s.tagged.MakeTags(tags))
+			s.stats.Increase(search.name, 1, s.tagged.MakeTags(tags))
 		}
 		search.hits++
 		matched = true

@@ -192,8 +192,8 @@ func TestPythonFloatRepr(t *testing.T) {
 		{math.Inf(1), "Infinity"},
 		{math.Inf(-1), "-Infinity"},
 	} {
-		if got := pythonFloatRepr(tc.value); got != tc.want {
-			t.Errorf("pythonFloatRepr(%v) = %q, want %q", tc.value, got, tc.want)
+		if got := PythonFloatRepr(tc.value); got != tc.want {
+			t.Errorf("PythonFloatRepr(%v) = %q, want %q", tc.value, got, tc.want)
 		}
 	}
 }

@@ -63,7 +63,7 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 	case json.Number:
 		out.WriteString(v.String())
 	case float64:
-		out.WriteString(pythonFloatRepr(v))
+		out.WriteString(PythonFloatRepr(v))
 	case time.Time:
 		// Python's default handler returns obj.isoformat(), which
 		// json.dumps then encodes as a regular JSON string.
@@ -160,12 +160,13 @@ func lowerHex16(v uint16) string {
 	})
 }
 
-// pythonFloatRepr renders a float64 exactly like Python repr(), which
-// json.dumps uses for float values: shortest round-trip digits with a
-// switch to scientific notation when the decimal exponent is < -4 or
-// >= 16 (Go's own formatting switches at different bounds, e.g. 1e-05
-// and 1e+20 render as "0.00001"/"100000000000000000000").
-func pythonFloatRepr(f float64) string {
+// PythonFloatRepr renders a float64 exactly like Python repr(), which
+// json.dumps uses for float values (and str(value) in statsd.py's wire
+// format — identical to repr for floats): shortest round-trip digits
+// with a switch to scientific notation when the decimal exponent is
+// < -4 or >= 16 (Go's own formatting switches at different bounds,
+// e.g. 1e-05 and 1e+20 render as "0.00001"/"100000000000000000000").
+func PythonFloatRepr(f float64) string {
 	switch {
 	case math.IsNaN(f):
 		return "NaN"

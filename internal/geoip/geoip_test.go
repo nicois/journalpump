@@ -107,7 +107,7 @@ type recordingStats struct {
 	}
 }
 
-func (r *recordingStats) Increase(metric string, tags map[string]string) {
+func (r *recordingStats) Increase(metric string, _ int64, tags map[string]string) {
 	r.increases = append(r.increases, struct {
 		metric string
 		tags   map[string]string

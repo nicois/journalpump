@@ -26,7 +26,7 @@ type metricCall struct {
 	tags   map[string]string
 }
 
-func (r *recordingStats) Increase(metric string, tags map[string]string) {
+func (r *recordingStats) Increase(metric string, _ int64, tags map[string]string) {
 	r.increases = append(r.increases, metricCall{metric: metric, tags: tags})
 }
 
