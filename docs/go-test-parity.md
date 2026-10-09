@@ -1683,3 +1683,114 @@ Fixture assertion at the HTTP boundary (review round 2):
   quirk-locks (`TestHostnamePIDAlwaysLocalhost`,
   `TestPRIAndFieldConstants`) remain separate tests for the parts we
   intentionally lock.
+
+## Task 22 — kafka sender (spec §5, D4/D5)
+
+`internal/sender/kafka` ports `journalpump/senders/kafka_sender.py` on
+IBM/sarama (D5) and is registered as output_type `kafka`. socks5-kafka
+(D4) is retained. It is the counterpart of the Python `KafkaSender`.
+
+Config mapping (config validation outcomes identical to Python;
+`test/unit/senders/test_kafka_sender.py` ported):
+
+- `kafka_topic` is required (`config["kafka_topic"]` KeyError →
+  `config key 'kafka_topic' missing`); `max_send_interval` defaults to
+  0.3; `kafka_msg_key` is UTF-8 encoded (`kafka_msg_key.encode("utf8")`)
+  and an empty string is falsy → no key.
+- `security_protocol` is explicit-or-derived: an explicit value must be
+  one of PLAINTEXT/SSL/SASL_PLAINTEXT/SASL_SSL (else `Invalid
+  security_protocol value: …`), otherwise `ssl` truthiness selects SSL,
+  else PLAINTEXT. `ca` is set for SSL/SASL_SSL; `certfile`/`keyfile`
+  only for SSL. SASL defaults `sasl_mechanism` to PLAIN and requires
+  both `sasl_plain_username` and `sasl_plain_password` (else the Python
+  ValueError text). `TestClientConfig*` and `TestValidSecurityProtocols`
+  pin these.
+- Producer config adds `linger_ms = 500` and the compression choice.
+  The deployment pins snappy (python-snappy present, zstandard absent —
+  Task 12 fixture notes): `sarama.CompressionSnappy`. Python prefers
+  zstd when `zstandard` is importable, but the deployment lacks it;
+  sarama would support zstd too, so the codec is pinned to the deployed
+  behavior and the zstd-preference fact is recorded rather than
+  reproduced (charter §2/thread A8).
+- `socks5_proxy` maps onto sarama's `Net.Proxy` with an
+  `golang.org/x/net/proxy` SOCKS5 dialer (`socks5Dialer`); an invalid
+  scheme is rejected at config build. `TestProducerConfigWithSocks5Proxy`
+  / `WithoutSocks5Proxy` / `InvalidSocks5Proxy` pin it.
+
+Send path (thread A7):
+
+- One `sarama.SyncProducer.SendMessages(batch)` per shared-loop flush
+  replaces kafka-python's produce-per-message + `flush()` +
+  `future.get(timeout=1)` dance; the synchronous call already blocks for
+  every broker ack, so the Python per-future timeout collapses into it.
+  The delivered payload bytes / key / partition are identical. A nil
+  return lets the shared loop advance the cursor to the batch's last
+  cursor (ack-then-advance — the same contract as Python's
+  mark_sent-after-flush).
+- The partitioner is `sarama.NewReferenceHashPartitioner` (Java-
+  compatible murmur2), matching kafka-python's default
+  `murmur2(key) % num_partitions`; sarama's default FNV partitioner
+  would place a fixed key differently.
+- `Producer.RequiredAcks = WaitForLocal` (kafka-python's default
+  `acks=1`).
+- `Retriable` classifies a send error like Python's `KAFKA_CONN_ERRORS`:
+  retriable KErrors (unknown-topic/leader-not-available/not-leader/
+  request-timed-out/broker-not-available/network-exception/
+  not-enough-replicas×2/rebalance-in-progress/storage-error),
+  `sarama.ErrOutOfBrokers`, timeouts, EOF, ECONNREFUSED/ECONNRESET/EPIPE
+  → silent retriable; everything else → the unexpected-exception path
+  (`TestRetriableClassification`).
+- Connect runs inside `SendMessages` (Python's `_init_kafka`), reports
+  the connected transition through the `sender.ConnectionReporter` seam
+  so the loop resets the shared backoff exponent, and a failure returns
+  the error so the loop marks disconnected, backs off and retries the
+  batch. `dropProducer` on any send failure makes the next attempt
+  re-initialize (Python's `close()` + `kafka_producer = None`).
+- Topic auto-create (`maybeCreateTopic`) runs after a successful connect
+  and only when BOTH `kafka_topic_config.num_partitions` and
+  `.replication_factor` are present-and-non-null
+  (`TestMaybeCreateTopicWithBothValues` / `PartialConfigSkips`); a
+  `TopicAlreadyExists` reply is tolerated and logged
+  (`TestMaybeCreateTopicAlreadyExistsTolerated`). The config loader
+  decodes with `UseNumber`, so the JSON-number path is covered
+  (`TestMaybeCreateTopicWithJSONNumberConfig`).
+- NOT a `DurableReporter`: kafka's cursor advances on the broker ack, so
+  there is no write-behind buffer whose flush boundary would lag the
+  cursor — the file sender alone is the durable (disk-buffered) sink
+  (`TestSourceNotDurableReporter`).
+
+Unit tests use the maintained sarama mocks
+(`github.com/IBM/sarama/mocks`) behind a `producer`/`admin` seam
+(thread B): `TestSendMessagesSuccess` checks the topic/key/value of each
+`*sarama.ProducerMessage`, `TestSendMessagesWithoutKey` the nil-key
+case, `TestSendMessagesFailureDropsProducer` the teardown, and
+`TestEnsureProducerReportsConnected` the `ConnectionReporter` wiring.
+
+systest: `systest-go/kafka_e2e_test.go`
+(`TestKafkaSenderEndToEnd`) drives the real binary against a real Kafka
+4.0 KRaft broker and asserts the Task 12 fixture ground truth (payload
+bytes, key, partition, sent count/cursor) for the auto-create and the
+admin-create/keyed scenarios, consuming with a sarama consumer. It is
+OPT-IN — it skips unless `JOURNALPUMP_KAFKA_BROKER` points at a broker
+(the Go analogue of the Python harness's override), so the default
+broker-free systest gate stays green; CI runs it against the same
+`docker.io/apache/kafka:4.0.0` KRaft service the Python capture used.
+
+Recorded divergences / open items for adjudication:
+
+- `kafka_api_version` unset: kafka-python auto-detects via an
+  ApiVersions request; sarama has no ApiVersions negotiation and keeps
+  its default version. A pinned `kafka_api_version` maps via
+  `sarama.ParseKafkaVersion`.
+- `reconnect_backoff_max_ms` (10 s) has no direct sarama analogue;
+  `reconnect_backoff_ms` maps to `Metadata.Retry.Backoff` (1 s).
+- acks: kafka-python's default is `acks=1`; the coordinator note said
+  "all/-1", but the Python source has no acks setting, so Go pins
+  `WaitForLocal` (acks=1) to match deployed Python. Flagged for the
+  coordinator.
+- snappy interop verdict (spec risk 10, charter §2/D5): kafka-python
+  used xerial-framed snappy, not automatically byte-identical to
+  sarama's framing. The opt-in real-broker test consumes sarama-produced
+  records with a sarama consumer; the kafka-python-consumer interop
+  proof on a real broker (or a NEWS-recorded deviation) still needs the
+  broker run and is flagged to the coordinator.
