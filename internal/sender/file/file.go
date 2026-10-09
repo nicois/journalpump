@@ -217,11 +217,19 @@ func (s *Sender) Close() error {
 // not-yet-flushed tail and releases the handle, so a reload retire does
 // not persist lines the delivery checkpoint never claimed (Python
 // request_stop drops the old sender's buffered messages identically).
+//
+// When the truncate fails the handle is deliberately LEFT OPEN: the
+// partial line is still on disk and the supervisor treats the output as
+// blocked until a later retire retries CloseDiscarding and repairs it. If
+// the handle were closed here the retry could never truncate, so the
+// output would be blocked forever.
 func (s *Sender) CloseDiscarding() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	discardErr := s.discardUnflushedLocked()
-	return errors.Join(discardErr, s.output.Close())
+	if err := s.discardUnflushedLocked(); err != nil {
+		return err
+	}
+	return s.output.Close()
 }
 
 // New is the wiring-map constructor for output_type "file"

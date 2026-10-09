@@ -214,6 +214,12 @@ func (p *Pump) configureReaders(cfg *config.Config) error {
 		}
 	}
 	if len(retireErrs) > 0 {
+		// retireReader retained the failed senders in the registry, so the
+		// unrepaired output stays blocked: a later reload retries the
+		// cleanup there and refuses again until it succeeds. The previous
+		// readers stay live and the active blob is unrecorded, so the next
+		// reload re-enters this path rather than treating the output as
+		// retired.
 		return fmt.Errorf("retiring readers: %w", errors.Join(retireErrs...))
 	}
 	p.readers = runtimes
@@ -258,7 +264,13 @@ func (p *Pump) startReader(rt *ReaderRuntime) {
 //
 // The cleanup error is returned rather than dropped: a failed
 // CloseDiscarding (a partial line that could not be truncated) must stop
-// the caller from starting a replacement writer on the same output.
+// the caller from starting a replacement writer on the same output. The
+// entries whose cleanup FAILED stay registered under rt.name — that
+// lingering registry entry is the persistent cleanup-failure state for
+// their output: every later reload retries them here, and until one
+// attempt succeeds configureReaders aborts instead of starting a
+// replacement writer (which would append replay onto the partial line the
+// failed truncate left behind). Entries that cleaned up are dropped.
 func (p *Pump) retireReader(rt *ReaderRuntime) error {
 	// A reader built but never started (a unit test, or a reload before
 	// Run wired the group) has no goroutine to join.
@@ -269,29 +281,37 @@ func (p *Pump) retireReader(rt *ReaderRuntime) error {
 
 	p.senderMu.Lock()
 	entries := p.senders[rt.name]
-	delete(p.senders, rt.name)
 	p.senderMu.Unlock()
 	var errs []error
+	var failed []*senderEntry
 	for _, entry := range entries {
 		entry.cancel()
 		if entry.done != nil {
 			<-entry.done
 		}
+		var err error
 		switch transport := entry.inst.Transport.(type) {
 		case sender.Discarder:
 			// Drop the buffered-but-unpersisted tail (the checkpoint
 			// never claimed it): a reload retire must not deliver lines
 			// the persisted cursor does not cover, or replay would
 			// duplicate them.
-			if err := transport.CloseDiscarding(); err != nil {
-				errs = append(errs, fmt.Errorf("sender %s/%s: %w", rt.name, entry.name, err))
-			}
+			err = transport.CloseDiscarding()
 		case io.Closer:
-			if err := transport.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("sender %s/%s: %w", rt.name, entry.name, err))
-			}
+			err = transport.Close()
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("sender %s/%s: %w", rt.name, entry.name, err))
+			failed = append(failed, entry)
 		}
 	}
+	p.senderMu.Lock()
+	if len(failed) == 0 {
+		delete(p.senders, rt.name)
+	} else {
+		p.senders[rt.name] = failed
+	}
+	p.senderMu.Unlock()
 	return errors.Join(errs...)
 }
 

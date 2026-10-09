@@ -145,14 +145,34 @@ func (s *Stats) SecretFilterStatsDue() bool {
 
 // CorruptedEntry ports the "Bad message" arm of read_next
 // (journalpump.py:392-397): journal.corrupted_log_entry increases
-// immediately (not throttled) and the corruption is warned.
+// immediately (not throttled) and the corruption is warned. Python's
+// log.warning maps to the WARNING level, so the line routes through
+// Warningf when the logger is level-aware; a plain Printf would emit at
+// INFO and vanish under a WARNING threshold.
 func (s *Stats) CorruptedEntry() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.client != nil {
 		s.client.Increase("journal.corrupted_log_entry", 1, s.tags)
 	}
-	s.log.Printf("Corrupted log entry in %s", s.name)
+	s.warnf("Corrupted log entry in %s", s.name)
+}
+
+// warnf emits a WARNING line when the logger supports level-aware output,
+// falling back to Printf otherwise (mirrors the sender handler's optional
+// warningLogger seam).
+func (s *Stats) warnf(format string, args ...any) {
+	if w, ok := s.log.(warningLogger); ok {
+		w.Warningf(format, args...)
+		return
+	}
+	s.log.Printf(format, args...)
+}
+
+// warningLogger is the OPTIONAL Logger capability for WARNING-level lines
+// (the level-aware journald sink provides Warningf).
+type warningLogger interface {
+	Warningf(format string, args ...any)
 }
 
 // NoteCursor updates the last-message-seen time (journalpump.py:403-405:

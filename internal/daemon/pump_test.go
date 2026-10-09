@@ -113,6 +113,20 @@ func registerFakeSenders() {
 		sender.Register("failinit", func(sender.ConstructorArgs) (sender.Instance, error) {
 			return sender.Instance{}, errors.New("constructor exploded")
 		})
+		// probe emits a metric through the stats client it was constructed
+		// with, so a test can observe which client (captured vs live)
+		// reached a lazily-initialized sender.
+		sender.Register("probe", func(args sender.ConstructorArgs) (sender.Instance, error) {
+			if args.Stats != nil {
+				args.Stats.Increase("sender.init_probe", 1, nil)
+			}
+			return sender.Instance{
+				Transport:       &fakeTransport{},
+				MaxSendInterval: 50 * time.Millisecond,
+				Type:            "ProbeSender",
+				ConnectOnInit:   true,
+			}, nil
+		})
 		// flaky fails its first construction attempt and succeeds on the
 		// retry, so a test can exercise late successful initialization.
 		sender.Register("flaky", func(sender.ConstructorArgs) (sender.Instance, error) {
@@ -2115,6 +2129,32 @@ func (c *udpCapture) read(t *testing.T) string {
 	return string(buf[:n])
 }
 
+// collect drains every datagram that arrives within a short window, so a
+// test can assert a capture received several distinct metrics.
+func (c *udpCapture) collect(t *testing.T) []string {
+	t.Helper()
+	_ = c.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	var out []string
+	buf := make([]byte, 4096)
+	for {
+		n, _, err := c.conn.ReadFromUDP(buf)
+		if err != nil {
+			return out
+		}
+		out = append(out, string(buf[:n]))
+	}
+}
+
+// containsDatagram reports whether any captured datagram contains sub.
+func containsDatagram(datagrams []string, sub string) bool {
+	for _, d := range datagrams {
+		if strings.Contains(d, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestBroadHandlerDelayAndTags locks read_single_message's except-arm
 // through the ENTRY POINT: a read failure routes into the broad handler,
 // which logs, emits unexpected_exception with where=mainloop and
@@ -2157,10 +2197,12 @@ func TestBroadHandlerDelayAndTags(t *testing.T) {
 }
 
 // TestStatsdReloadSplitDirection locks the stats-client split across a
-// statsd-only reload with an UNCHANGED readers blob: the reader's
-// CAPTURED client keeps taking the reader-owned metrics (secret-filter
-// matches), while the supervisor's periodic gauge refresh goes to the
-// LIVE pump client (Python refresh_gauges, journalpump.py:1102-1108).
+// statsd-only reload with an UNCHANGED readers blob: AFTER the reload the
+// reader's CAPTURED client still takes the reader-owned metrics —
+// secret-filter matches AND a lazily-initialized sender's construction
+// metrics — while the supervisor's periodic gauge refresh goes to the LIVE
+// pump client (Python refresh_gauges, journalpump.py:1102-1108). Emitting
+// only before the reload would not prove the captured client survives it.
 func TestStatsdReloadSplitDirection(t *testing.T) {
 	registerFakeSenders()
 	captureOld := newUDPCapture(t)
@@ -2168,7 +2210,7 @@ func TestStatsdReloadSplitDirection(t *testing.T) {
 	captureNew := newUDPCapture(t)
 	newHost, newPort := captureNew.addr()
 
-	readers := `{"r":{"senders":{"s":{"output_type":"fake"}}}}`
+	readers := `{"r":{"senders":{"s":{"output_type":"probe"}}}}`
 	initial := decodeConfig(t, fmt.Sprintf(`{"statsd":{"host":%q,"port":%d},"readers":%s}`, oldHost, oldPort, readers))
 	updated := decodeConfig(t, fmt.Sprintf(`{"statsd":{"host":%q,"port":%d},"readers":%s}`, newHost, newPort, readers))
 
@@ -2180,12 +2222,6 @@ func TestStatsdReloadSplitDirection(t *testing.T) {
 		t.Cleanup(func() { retireAll(p) })
 		rt := p.readers[0]
 
-		// Past the 10 s reader stats window, then report secret-filter
-		// matches: they must land on the reader-CAPTURED (old) client.
-		time.Sleep(11 * time.Second)
-		rt.secretFilterMatches = 3
-		rt.reportSecretFilterMetrics()
-
 		// Statsd-only reload: same readers blob (the reader is kept), new
 		// statsd endpoint.
 		if err := p.handleNewConfig(updated); err != nil {
@@ -2195,6 +2231,16 @@ func TestStatsdReloadSplitDirection(t *testing.T) {
 			t.Fatalf("reader replaced on a statsd-only reload (readers=%d)", len(p.readers))
 		}
 
+		// AFTER the reload, initializing a sender must use the reader's
+		// CAPTURED client (the probe constructor emits through it).
+		rt.initSenders()
+
+		// Past the 10 s reader stats window, then report secret-filter
+		// matches: they too must land on the reader-CAPTURED (old) client.
+		time.Sleep(11 * time.Second)
+		rt.secretFilterMatches = 3
+		rt.reportSecretFilterMetrics()
+
 		// The supervisor's gauge refresh uses the LIVE client.
 		rt.stats.Gauges.Set("reader.nonzero", 5, map[string]string{})
 		if err := p.tick(); err != nil {
@@ -2202,14 +2248,20 @@ func TestStatsdReloadSplitDirection(t *testing.T) {
 		}
 	})
 
-	// Reader-owned metric on the OLD endpoint.
-	old := captureOld.read(t)
-	if !strings.Contains(old, "journal.secret_filter_match") {
-		t.Errorf("old-client datagram = %q, want the secret-filter metric", old)
+	// Reader-owned metrics (sender construction + secret filter) on the
+	// OLD endpoint.
+	old := captureOld.collect(t)
+	if !containsDatagram(old, "sender.init_probe") {
+		t.Errorf("old-client datagrams = %q, want the sender-construction probe", old)
+	}
+	if !containsDatagram(old, "journal.secret_filter_match") {
+		t.Errorf("old-client datagrams = %q, want the secret-filter metric", old)
+	}
+	if containsDatagram(old, "reader.nonzero") {
+		t.Errorf("old client received the live-client gauge refresh: %q", old)
 	}
 	// Supervisor-owned gauge on the NEW endpoint.
-	newLine := captureNew.read(t)
-	if !strings.Contains(newLine, "reader.nonzero") {
-		t.Errorf("new-client datagram = %q, want the refreshed persistent gauge", newLine)
+	if newLines := captureNew.collect(t); !containsDatagram(newLines, "reader.nonzero") {
+		t.Errorf("new-client datagrams = %q, want the refreshed persistent gauge", newLines)
 	}
 }

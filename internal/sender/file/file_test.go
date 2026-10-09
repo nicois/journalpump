@@ -623,3 +623,60 @@ func TestDiscardReopenReplayValidJSONL(t *testing.T) {
 		}
 	}
 }
+
+// failTruncateOnceFile fails the first Truncate, records whether the
+// handle was closed.
+type failTruncateOnceFile struct {
+	f      *os.File
+	fired  bool
+	closed bool
+}
+
+func (w *failTruncateOnceFile) Write(p []byte) (int, error) { return w.f.Write(p) }
+
+func (w *failTruncateOnceFile) Truncate(size int64) error {
+	if !w.fired {
+		w.fired = true
+		return errWriteBoom
+	}
+	return w.f.Truncate(size)
+}
+
+func (w *failTruncateOnceFile) Close() error {
+	w.closed = true
+	return w.f.Close()
+}
+
+func (w *failTruncateOnceFile) Stat() (os.FileInfo, error) { return w.f.Stat() }
+
+// TestCloseDiscardingKeepsHandleOpenForRepair locks the repair seam: when
+// the discard truncate fails, the handle is left OPEN (a retry must be able
+// to truncate the partial line), the output stays on disk, and a later
+// CloseDiscarding that succeeds finally releases the handle.
+func TestCloseDiscardingKeepsHandleOpenForRepair(t *testing.T) {
+	const prior = "{\"old\":1}\n"
+	path, base := openPrepopulated(t, prior)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	of := &failTruncateOnceFile{f: f}
+	tr := newSender(of, base)
+
+	if err := tr.CloseDiscarding(); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("first CloseDiscarding err = %v, want the truncate failure", err)
+	}
+	if of.closed {
+		t.Fatal("handle closed on a failed discard: a retry could not repair")
+	}
+	if err := tr.CloseDiscarding(); err != nil {
+		t.Fatalf("retry CloseDiscarding: %v", err)
+	}
+	if !of.closed {
+		t.Error("retry did not release the handle")
+	}
+	if got := readFile(t, path); got != prior {
+		t.Errorf("output = %q, want %q (pre-existing lines preserved)", got, prior)
+	}
+}

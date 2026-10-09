@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -150,12 +151,103 @@ type failDiscardTransport struct {
 
 func (t *failDiscardTransport) CloseDiscarding() error { return errors.New("truncate boom") }
 
+// flakyDiscardTransport fails the first CloseDiscarding and succeeds on
+// the retry, driving the cleanup-repair path.
+type flakyDiscardTransport struct {
+	*fakeTransport
+	mu    sync.Mutex
+	calls int
+}
+
+func (t *flakyDiscardTransport) CloseDiscarding() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.calls++
+	if t.calls == 1 {
+		return errors.New("truncate boom")
+	}
+	return nil
+}
+
 // TestConfigureReadersRefusesReplacementOnDiscardFailure locks the
-// cleanup-error propagation: when retiring a reader's sender fails to
-// discard (restore its complete-line boundary), the reload aborts BEFORE
-// starting the replacement reader, so no replacement writer can append
-// replay onto a corrupt prefix.
+// cleanup-error propagation AND its persistence across reloads: when
+// retiring a reader's sender fails to discard (restore its complete-line
+// boundary), the reload aborts BEFORE starting the replacement reader, so
+// no replacement writer can append replay onto a corrupt prefix. The
+// failed sender stays registered, so a SECOND reload with a changed config
+// ctime retries the cleanup and — still failing — refuses again instead of
+// treating the output as already retired.
 func TestConfigureReadersRefusesReplacementOnDiscardFailure(t *testing.T) {
+	registerFakeSenders()
+	overrideReopener(t)
+	initial := decodeConfig(t, `{"readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+	updated := decodeConfig(t, `{"readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
+
+	var statCalls int
+	t0 := time.Now()
+	p, err := NewPump(initial, PumpDeps{
+		Log:        &captureLog{},
+		Notifier:   &fakeNotifier{},
+		ConfigPath: filepath.Join(t.TempDir(), "config.json"),
+		StatConfig: func(string) (time.Time, error) {
+			statCalls++
+			return t0.Add(time.Duration(statCalls) * time.Hour), nil
+		},
+		LoadConfig: func(string) (*config.Config, error) { return updated, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canceled := 0
+	entry := &senderEntry{
+		name:   "s",
+		cancel: func() { canceled++ },
+		inst:   sender.Instance{Transport: &failDiscardTransport{}},
+	}
+	p.senderMu.Lock()
+	p.senders["r1"] = []*senderEntry{entry}
+	p.senderMu.Unlock()
+
+	// First reload: cleanup fails, abort before the replacement starts.
+	if err := p.reloadConfig(); err == nil || !strings.Contains(err.Error(), "truncate boom") {
+		t.Fatalf("first reload err = %v, want the discard failure", err)
+	}
+	if canceled == 0 {
+		t.Error("old sender was not cancelled")
+	}
+	if len(p.readers) != 1 || p.readers[0].name != "r1" {
+		t.Errorf("replacement reader started despite the discard failure (readers=%d)", len(p.readers))
+	}
+	if config.ReadersChanged(p.readersActiveBlob, initial.ReadersBlob()) {
+		t.Error("active readers blob changed despite the aborted reload")
+	}
+	// The failed entry is RETAINED — the persistent cleanup-failure state.
+	p.senderMu.Lock()
+	retained := len(p.senders["r1"])
+	p.senderMu.Unlock()
+	if retained != 1 {
+		t.Fatalf("failed sender retained = %d, want 1 (persistent cleanup-failure state)", retained)
+	}
+
+	// Second reload with a CHANGED ctime must still refuse: the retained
+	// entry is retried, fails again, and the reload aborts.
+	if err := p.reloadConfig(); err == nil || !strings.Contains(err.Error(), "truncate boom") {
+		t.Fatalf("second reload err = %v, want the discard failure", err)
+	}
+	if len(p.readers) != 1 || p.readers[0].name != "r1" {
+		t.Errorf("second reload started a replacement reader (readers=%d)", len(p.readers))
+	}
+	if config.ReadersChanged(p.readersActiveBlob, initial.ReadersBlob()) {
+		t.Error("active readers blob changed after the second aborted reload")
+	}
+}
+
+// TestConfigureReadersProceedsAfterCleanupRepair locks the other half of
+// the persistent cleanup-failure state: once a retried retire finally
+// restores the output's complete-line boundary, the reload proceeds and
+// swaps in the replacement reader.
+func TestConfigureReadersProceedsAfterCleanupRepair(t *testing.T) {
 	registerFakeSenders()
 	overrideReopener(t)
 	initial := decodeConfig(t, `{"readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
@@ -164,29 +256,27 @@ func TestConfigureReadersRefusesReplacementOnDiscardFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cancel := startReaderGroup(p)
+	defer cancel()
+	t.Cleanup(func() { retireAll(p) })
 
-	canceled := false
 	entry := &senderEntry{
 		name:   "s",
-		cancel: func() { canceled = true },
-		inst:   sender.Instance{Transport: &failDiscardTransport{}},
+		cancel: func() {},
+		inst:   sender.Instance{Transport: &flakyDiscardTransport{}},
 	}
 	p.senderMu.Lock()
 	p.senders["r1"] = []*senderEntry{entry}
 	p.senderMu.Unlock()
 
-	err = p.handleNewConfig(updated)
-	if err == nil || !strings.Contains(err.Error(), "truncate boom") {
-		t.Fatalf("handleNewConfig err = %v, want the discard failure", err)
+	if err := p.handleNewConfig(updated); err == nil || !strings.Contains(err.Error(), "truncate boom") {
+		t.Fatalf("first reload err = %v, want the discard failure", err)
 	}
-	if !canceled {
-		t.Error("old sender was not cancelled")
+	if err := p.handleNewConfig(updated); err != nil {
+		t.Fatalf("second reload err = %v, want success once the cleanup is repaired", err)
 	}
-	if len(p.readers) != 1 || p.readers[0].name != "r1" {
-		t.Errorf("replacement reader started despite the discard failure (readers=%d)", len(p.readers))
-	}
-	if config.ReadersChanged(p.readersActiveBlob, initial.ReadersBlob()) {
-		t.Error("active readers blob changed despite the aborted reload")
+	if len(p.readers) != 1 || p.readers[0].name != "r2" {
+		t.Fatalf("readers = %d (first %q), want the r2 replacement after repair", len(p.readers), p.readers[0].name)
 	}
 }
 
