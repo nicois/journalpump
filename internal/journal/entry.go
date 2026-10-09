@@ -23,8 +23,10 @@ package journal
 //	bool         config extras
 //	time.Time    the injected timestamp (Python datetime)
 //	[]any        repeated journal fields (python-systemd list values)
-//	[]Field      ordered object (config extras nested objects)
-//	map[string]any unordered object (config extras nested objects)
+//	[]Field      ordered object (extra_field_values nested objects) — the
+//	             wire format is Python construction order, so unordered
+//	             maps are deliberately not accepted; config decoding must
+//	             capture document order (Task 16 wiring)
 type Field struct {
 	Key   string
 	Value any

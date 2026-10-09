@@ -35,6 +35,26 @@ func TestProcessEntry(t *testing.T) {
 			want:   []Field{{Key: "MESSAGE", Value: `b'a\'b\\c\nd\te\x00"'`}},
 		},
 		{
+			name:   "repr switches to double quotes for apostrophe-only values",
+			fields: []Field{{Key: "MESSAGE", Value: []byte("don't\xff")}},
+			want:   []Field{{Key: "MESSAGE", Value: `b"don't\xff"`}},
+		},
+		{
+			name:   "repr lone apostrophe uses double quote delimiter",
+			fields: []Field{{Key: "MESSAGE", Value: []byte("'")}},
+			want:   []Field{{Key: "MESSAGE", Value: `b"'"`}},
+		},
+		{
+			name:   "repr lone double quote keeps single quote delimiter",
+			fields: []Field{{Key: "MESSAGE", Value: []byte(`"`)}},
+			want:   []Field{{Key: "MESSAGE", Value: `b'"'`}},
+		},
+		{
+			name:   "repr both quotes keeps single quote delimiter",
+			fields: []Field{{Key: "MESSAGE", Value: []byte(`'"`)}},
+			want:   []Field{{Key: "MESSAGE", Value: `b'\'"'`}},
+		},
+		{
 			name:   "repr has no short escapes for a b f v",
 			fields: []Field{{Key: "MESSAGE", Value: []byte("\a\b\f\v")}},
 			want:   []Field{{Key: "MESSAGE", Value: `b'\x07\x08\x0c\x0b'`}},

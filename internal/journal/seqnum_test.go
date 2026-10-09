@@ -2,6 +2,7 @@ package journal
 
 import (
 	"encoding/json"
+	"math/big"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,7 @@ func TestParseSeqnumFromCursor(t *testing.T) {
 	}{
 		{"s=abc;i=1f4;b=def;m=123;t=456;x=789", int64(500), true},
 		{"s=abc;i=0x1f4;b=def", int64(500), true},
+		{"s=abc;i=0x_1f4;b=def", int64(500), true},
 		{"s=abc;i= 1f4 ;b=def", int64(500), true},
 		{"s=abc;i=ffffffffffffffff;b=def", json.Number("18446744073709551615"), true},
 		{"s=abc;b=def;m=123;t=456;x=789", nil, false},       // no i= field
@@ -63,20 +65,70 @@ func FuzzParseSeqnumFromCursor(f *testing.F) {
 	})
 }
 
-// referenceSeqnum is a naive reference implementation used only as the
-// fuzz oracle.
+// referenceSeqnum is an independent model of the Python behavior used
+// only as the fuzz oracle: startswith("i=") matches (a bare "i="
+// component parses int("", 16) -> ValueError), and int(s, 16) acceptance
+// (whitespace, sign, 0x prefix, underscores between digits or after the
+// prefix) is modeled by hand below rather than delegated to
+// pythonIntString.
 func referenceSeqnum(cursor string) (any, bool) {
 	for _, part := range splitSemicolons(cursor) {
-		// Python startswith("i=") also matches the bare "i=" component;
-		// int("", 16) then raises ValueError.
 		if strings.HasPrefix(part, "i=") {
-			if value, ok := pythonIntString(part[2:], 16); ok {
-				return value, true
-			}
-			return nil, false
+			return referenceHexInt(part[2:])
 		}
 	}
 	return nil, false
+}
+
+func referenceHexInt(s string) (any, bool) {
+	s = strings.Trim(s, " \t\n\r\v\f")
+	if s == "" {
+		return nil, false
+	}
+	sign := 1
+	switch s[0] {
+	case '-':
+		sign = -1
+		s = s[1:]
+	case '+':
+		s = s[1:]
+	}
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		s = strings.TrimPrefix(s, "0x")
+		s = strings.TrimPrefix(s, "0X")
+		s = strings.TrimPrefix(s, "_")
+	}
+	previousDigit := false
+	var digits strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_':
+			if !previousDigit {
+				return nil, false
+			}
+			previousDigit = false
+		case strings.ContainsRune("0123456789abcdefABCDEF", rune(c)):
+			digits.WriteByte(c)
+			previousDigit = true
+		default:
+			return nil, false
+		}
+	}
+	if !previousDigit {
+		return nil, false
+	}
+	value, ok := new(big.Int).SetString(digits.String(), 16)
+	if !ok {
+		return nil, false
+	}
+	if sign < 0 {
+		value.Neg(value)
+	}
+	if value.IsInt64() {
+		return value.Int64(), true
+	}
+	return json.Number(value.Text(10)), true
 }
 
 func splitSemicolons(cursor string) []string {

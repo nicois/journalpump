@@ -14,7 +14,9 @@ import (
 // math.RoundToEven reproduces for the float64 seconds*1e6 product.
 func TimestampFromRealtime(seconds float64) (time.Time, error) {
 	micros := math.RoundToEven(seconds * 1e6)
-	if micros > math.MaxInt64 {
+	// Guard the float64->int64 conversion like Python's fromtimestamp
+	// range check: NaN and out-of-int64 magnitudes must not wrap.
+	if math.IsNaN(micros) || micros < float64(math.MinInt64) || micros > math.MaxInt64 {
 		return time.Time{}, fmt.Errorf("year is out of range for timestamp %v", seconds)
 	}
 	t := time.UnixMicro(int64(micros)).UTC()

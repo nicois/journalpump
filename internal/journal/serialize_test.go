@@ -34,6 +34,15 @@ var goldenFixtures = []goldenFixture{
 		extras:   []Field{{Key: "cluster", Value: "test-cluster"}},
 	},
 	{
+		name: "repr-quote",
+		entry: []Field{
+			{Key: "MESSAGE", Value: []byte("don't\xff")},
+			{Key: "_SOURCE_REALTIME_TIMESTAMP", Value: []byte("1000")},
+		},
+		cursor:   "s=abc;i=1f4;b=def",
+		realtime: 1728475023123456,
+	},
+	{
 		name: "invalid-utf8",
 		entry: []Field{
 			{Key: "MESSAGE", Value: []byte("\xff\xfe invalid \x00 bytes")},
@@ -250,6 +259,11 @@ func TestTimestampFromRealtime(t *testing.T) {
 	if _, err := TimestampFromRealtime(253402300800.0); err == nil {
 		t.Error("TimestampFromRealtime(year 10000) should error like Python ValueError")
 	}
+	for _, seconds := range []float64{math.NaN(), 1e19, -1e19} {
+		if _, err := TimestampFromRealtime(seconds); err == nil {
+			t.Errorf("TimestampFromRealtime(%v) should error like Python fromtimestamp range checks", seconds)
+		}
+	}
 }
 
 // TestSerializeValues covers the value shapes that only occur outside the
@@ -268,11 +282,6 @@ func TestSerializeValues(t *testing.T) {
 		{"big int verbatim", []Field{{Key: "n", Value: json.Number("10000000000000000000000000")}}, `{"n": 10000000000000000000000000}`},
 		{"nested list", []Field{{Key: "m", Value: []any{int64(1), "x", nil}}}, `{"m": [1, "x", null]}`},
 		{"nested ordered object", []Field{{Key: "o", Value: []Field{{Key: "y", Value: int64(2)}, {Key: "x", Value: int64(1)}}}}, `{"o": {"y": 2, "x": 1}}`},
-		{
-			name:   "nested unordered object sorted",
-			fields: []Field{{Key: "o", Value: map[string]any{"y": int64(2), "x": int64(1)}}},
-			want:   `{"o": {"x": 1, "y": 2}}`,
-		},
 	} {
 		got, err := Serialize(tc.fields)
 		if err != nil {
@@ -285,6 +294,12 @@ func TestSerializeValues(t *testing.T) {
 	}
 	if _, err := Serialize([]Field{{Key: "MESSAGE", Value: []byte("\xff")}}); err == nil {
 		t.Error("Serialize should refuse undecodable bytes like Python UnicodeDecodeError")
+	}
+	// Unordered objects must be refused, not reordered: the wire format is
+	// Python construction order, so callers supply []Field in document
+	// order (config decoding captures it in the Task 16 wiring).
+	if _, err := Serialize([]Field{{Key: "o", Value: map[string]any{"x": int64(1)}}}); err == nil {
+		t.Error("Serialize should refuse map[string]any values")
 	}
 }
 

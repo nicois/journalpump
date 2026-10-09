@@ -106,6 +106,16 @@ FIXTURES = [
         "extra_field_values": {"cluster": "test-cluster"},
     },
     {
+        "name": "repr-quote",
+        "entry": {
+            "MESSAGE": b"don't\xff",
+            "_SOURCE_REALTIME_TIMESTAMP": b"1000",
+        },
+        "cursor": "s=abc;i=1f4;b=def",
+        "realtime": 1728475023123456,
+        "extra_field_values": {},
+    },
+    {
         "name": "invalid-utf8",
         "entry": {
             "MESSAGE": b"\xff\xfe invalid \x00 bytes",

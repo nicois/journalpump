@@ -163,12 +163,13 @@ func convertUUID(value any) (any, bool) {
 }
 
 // canonicalUUID mirrors uuid.UUID(str) parsing: "urn:"/"uuid:" markers
-// removed anywhere, []{} trimmed from the ends, hyphens removed, then
+// removed anywhere, braces trimmed from the ends (brackets are NOT
+// accepted — uuid.UUID("[...]") raises ValueError), hyphens removed, then
 // exactly 32 hexadecimal digits.
 func canonicalUUID(s string) (string, bool) {
 	s = strings.ReplaceAll(s, "urn:", "")
 	s = strings.ReplaceAll(s, "uuid:", "")
-	s = strings.Trim(s, "[]{}")
+	s = strings.Trim(s, "{}")
 	s = strings.ReplaceAll(s, "-", "")
 	if len(s) != 32 {
 		return "", false
@@ -185,10 +186,11 @@ func canonicalUUID(s string) (string, bool) {
 // pythonIntString parses s the way Python int(s, base) does: surrounding
 // ASCII whitespace is ignored, an optional sign and (for base 16) an
 // optional 0x prefix are accepted, and underscores may appear between
-// digits (Python int() quirk, locked by tests). Values that do not fit
-// int64 keep their full decimal precision as json.Number, matching
-// Python's arbitrary-precision ints. Python's tolerance of non-ASCII
-// Unicode digits is not replicated (unreachable from journald values).
+// digits or right after the base prefix (Python int() quirks, locked by
+// tests). Values that do not fit int64 keep their full decimal precision
+// as json.Number, matching Python's arbitrary-precision ints. Python's
+// tolerance of non-ASCII Unicode digits is not replicated (unreachable
+// from journald values).
 func pythonIntString(s string, base int) (any, bool) {
 	s = strings.Trim(s, " \t\n\r\v\f")
 	if s == "" {
@@ -202,10 +204,12 @@ func pythonIntString(s string, base int) (any, bool) {
 	case '+':
 		s = s[1:]
 	}
+	afterPrefix := false
 	if base == 16 && (strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X")) {
 		s = s[2:]
+		afterPrefix = true
 	}
-	digits, ok := stripUnderscores(s, base)
+	digits, ok := stripUnderscores(s, base, afterPrefix)
 	if !ok || digits == "" {
 		return nil, false
 	}
@@ -222,15 +226,15 @@ func pythonIntString(s string, base int) (any, bool) {
 	return json.Number(bigInt.Text(10)), true
 }
 
-// stripUnderscores removes Python int() underscores: allowed only between
-// digits of the digit run (not leading, trailing, doubled, or adjacent to
-// the sign or base prefix).
-func stripUnderscores(s string, base int) (string, bool) {
+// stripUnderscores removes Python int() underscores: allowed between
+// digits and right after the base prefix (afterPrefix), but not leading,
+// trailing, doubled, or adjacent to the sign.
+func stripUnderscores(s string, base int, afterPrefix bool) (string, bool) {
 	if !strings.Contains(s, "_") {
 		return s, true
 	}
 	var b strings.Builder
-	underscoreAllowed := false
+	underscoreAllowed := afterPrefix
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -81,6 +80,10 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 		}
 		out.WriteByte(']')
 	case []Field:
+		// Ordered object (extra_field_values nested objects). Callers must
+		// supply document order — the wire format is Python construction
+		// order, so no unordered representation is accepted (an unordered
+		// map[string]any would silently change key order on the wire).
 		out.WriteByte('{')
 		for i, field := range v {
 			if i > 0 {
@@ -89,29 +92,6 @@ func appendPythonJSON(out *bytes.Buffer, key string, value any) error {
 			out.WriteString(pythonJSONString(field.Key))
 			out.WriteString(": ")
 			if err := appendPythonJSON(out, field.Key, field.Value); err != nil {
-				return err
-			}
-		}
-		out.WriteByte('}')
-	case map[string]any:
-		// Nested unordered objects are only reachable from
-		// extra_field_values config values. Python serializes them in JSON
-		// document order, which map[string]any cannot preserve; keys are
-		// emitted sorted instead (recorded deviation; flat scalar extras,
-		// the only shape real configs use, are unaffected).
-		keys := make([]string, 0, len(v))
-		for key := range v {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		out.WriteByte('{')
-		for i, key := range keys {
-			if i > 0 {
-				out.WriteString(", ")
-			}
-			out.WriteString(pythonJSONString(key))
-			out.WriteString(": ")
-			if err := appendPythonJSON(out, key, v[key]); err != nil {
 				return err
 			}
 		}
