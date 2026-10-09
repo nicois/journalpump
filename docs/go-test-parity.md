@@ -1334,25 +1334,52 @@ Error classification and reconnection:
   stats, backoff, re-init). `TestInstanceClassifierRoutesConnErrors`
   proves the classifier is installed and routes both ways.
 - Connection transitions and backoff are owned by the shared Task 13
-  loop, not the sender. On a retriable connect failure the sender logs
-  rsyslog.py:62-66's warning, waits the flat 5 s sleep (rsyslog.py:70),
-  and RETURNS the error; the loop then does the `mark_disconnected`
-  transition (populating the health error ring), the jittered exponential
-  backoff on ONE shared counter (so a send-failure backoff and a
-  subsequent reconnect-failure backoff continue the same exponent rather
-  than restarting), and the reset on the next successful batch. The
-  sender keeps no private backoff state. A non-retriable failure (e.g. a
-  missing `rsyslog_server`) returns immediately for the
-  unexpected-exception path; the 5 s wait is a cancelable seam so
-  shutdown never hangs.
+  loop, not the sender, but the sender's connect path runs INSIDE
+  `SendMessages`, so it reports its transitions through a new OPTIONAL
+  transport seam, `sender.ConnectionReporter`
+  (`SetConnectionObserver(connected, disconnected)`), detected in
+  `NewLoop` exactly like the existing `DurableReporter` capability:
+  - A SUCCESSFUL connect reports `connected` → the loop's `MarkConnected`
+    clears the health errors and RESETS the shared backoff exponent,
+    matching Python's `mark_connected` at the end of
+    `_init_rsyslog_client`. Without it, repeated payload failures
+    separated by successful reconnects (e.g. a list-valued PRIORITY that
+    drops the client each time) kept escalating toward the 1800 s cap
+    instead of restarting at the attempt-1 backoff.
+    `TestLoopReconnectResetsSharedBackoff` runs the REAL `sender.Loop`
+    (synctest fake clock): every attempt connects then fails its payload;
+    the test requires ≥8 attempts in 10 s, which only holds when each
+    connect resets the exponent (non-vacuous: removing the observer
+    wiring drops it to ~4).
+  - A RETRIABLE connect failure reports the ORIGINAL error →
+    `MarkDisconnected` BEFORE the flat 5 s wait (rsyslog.py:62-70 marks
+    disconnected, then sleeps), so the failure is in the health ring
+    immediately and a cancellation during the wait cannot replace it with
+    `context.Canceled`; the sender then returns the original error so the
+    loop applies its jittered exponential backoff on ONE shared counter on
+    top of the flat sleep. The sender keeps no private backoff state.
+    `TestInitRetriableFailureCancelledDuringSleep` asserts the recorded
+    and returned error is the original `ECONNREFUSED`, not
+    `context.Canceled`.
+  - A non-retriable failure (e.g. a missing `rsyslog_server`) returns
+    immediately for the unexpected-exception path; the 5 s wait is a
+    cancelable seam so shutdown never hangs.
   `TestSendFailureRefusedReconnectThenSuccess` (send failure → refused
   reconnect → successful reconnect, with the flat 5 s sleep and a
-  retriable classification),
-  `TestInitRetriableFailureCancelledDuringSleep` and
-  `TestInitLoopNonRetriableReturnsImmediately` pin it.
+  retriable classification) and
+  `TestInitLoopNonRetriableReturnsImmediately` pin the rest.
 - On any send failure the client is dropped so the next attempt
   reconnects (Python's `close()` + `= None`); the shared loop owns the
   batch hold/backoff/retry.
+- CA configuration validation: `ca_certs` presence is preserved so an
+  explicitly empty string still selects TLS (Python's `cacerts is not
+  None`, rsyslog.py:135), and a truthy NON-string value (e.g. `1`) is
+  REJECTED with an error instead of being silently mapped to an empty
+  cafile (system roots) while still selecting TLS — Python's
+  `ssl.create_default_context(cafile=1)` raises. The sanctioned wrong-type
+  deviation permits earlier rejection, not silent acceptance.
+  `TestNonStringCACertsRejected` and `TestEmptyCACertsStillSelectsTLS`
+  pin both halves.
 
 Ground truth:
 
