@@ -187,6 +187,11 @@ capture. Immediately port `systest/test_running_config.py` (7 cases) and
 implementations.
 Acceptance: the same suites pass against the Python binary today and are
 the standing harness every later systest uses.
+Re-scope note (Task 10 review, 2026-10-09): the Go-side harness
+(systest-go/journalpump_process.go) is deferred to Task 18, where the
+Go systest suites land; the Python-side harness rework
+(JOURNALPUMP_BIN selection) was delivered in Task 10 and is the
+mechanism both implementations will use.
 Tests: the two ported suites (both implementations); harness unit tests
 (notify socket, exit-code capture).
 Depends on: Tasks 1, 9.

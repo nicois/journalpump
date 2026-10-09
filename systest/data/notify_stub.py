@@ -8,8 +8,10 @@ harness unit tests for the notify socket and exit-code capture).
 
 Executable script (chmod +x): it speaks the systemd notify protocol on
 the inherited NOTIFY_SOCKET like the real daemon — READY=1 on start,
-RELOADING=1 → READY=1 on SIGHUP, WATCHDOG=1 once started, STOPPING=1
-and exit 0 on SIGTERM — without touching journald or any sender.
+RELOADING=1 → READY=1 on SIGHUP, WATCHDOG=1 once, STOPPING=1 and exit 0
+on SIGTERM — without touching journald or any sender. (The real daemon
+pings WATCHDOG=1 every main-loop iteration; the stub sends it once —
+the harness unit tests only need one.)
 """
 
 import os
@@ -17,6 +19,7 @@ import signal
 import socket
 import sys
 import time
+from types import FrameType
 
 
 def notify(state: str) -> None:
@@ -28,12 +31,12 @@ def notify(state: str) -> None:
     sock.close()
 
 
-def on_hup(signum: int, frame: object) -> None:
+def on_hup(signum: int, frame: FrameType | None) -> None:  # pylint: disable=unused-argument
     notify("RELOADING=1")
     notify("READY=1")
 
 
-def on_term(signum: int, frame: object) -> None:
+def on_term(signum: int, frame: FrameType | None) -> None:  # pylint: disable=unused-argument
     notify("STOPPING=1")
     sys.exit(0)
 

@@ -23,12 +23,12 @@ Source: `test/test_running_config.py` (5 tests), `systest/test_running_config.py
 | test_running_config_path_configured_wins | ported | same subtest as above (configured path is asserted against a set RUNTIME_DIRECTORY) |
 | test_running_config_path_unset | ported | `TestRunningConfigPath/both unset` |
 | test_write_running_config_warns_when_path_set_without_enable | ported | `TestWriteRunningConfigSkips/path set without enable warns` (asserts the exact Python warning text) |
-| systest: writes to runtime directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/sorted full document with modes` (content bytes, file 0600, dir 0700) + `TestWriteRunningConfigRuntimeDirectory` (RUNTIME_DIRECTORY fallback); the spawn-based cases land with the harness in plan Task 10 |
-| systest: with secret filters | Go-idiomatic (unit level here) | raw-document preservation incl. `secret_filters` covered by `TestDecodeGoldenFullConfig` + `TestDecodeIgnoresUnknownKeys`; spawn-based case in Task 10 |
+| systest: writes to runtime directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/sorted full document with modes` (content bytes, file 0600, dir 0700) + `TestWriteRunningConfigRuntimeDirectory` (RUNTIME_DIRECTORY fallback); the spawn-based cases are delivered by the Python systest harness (Task 10 rework, JOURNALPUMP_BIN selection) and the Go binary runs them once its run loop lands (Task 18) |
+| systest: with secret filters | Go-idiomatic (unit level here) | raw-document preservation incl. `secret_filters` covered by `TestDecodeGoldenFullConfig` + `TestDecodeIgnoresUnknownKeys`; spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
 | systest: no write without opt-in | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/not enabled and no path is silent` (no file created) |
-| systest: no write from path alone | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/path set without enable warns` (no write); spawn-based case in Task 10 |
+| systest: no write from path alone | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/path set without enable warns` (no write); spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
 | systest: no write when enabled without path | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/enabled without path warns` |
-| systest: writes to configured path (modes 0600/0700) | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/sorted full document with modes`; spawn-based case in Task 10 |
+| systest: writes to configured path (modes 0600/0700) | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/sorted full document with modes`; spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
 | systest: does not chmod existing directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/existing directory is not chmodded` |
 
 Recorded deviation (user decision, Task 3 review; NEWS in plan Task 28):

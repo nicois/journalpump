@@ -8,9 +8,9 @@ The harness spawns a journalpump BINARY — never an in-process import —
 so every black-box suite built on it runs against BOTH implementations.
 The ``JOURNALPUMP_BIN`` environment variable selects the implementation:
 
-- unset or ``python``: ``python3 -m journalpump`` (the Python daemon;
-  the default keeps ``make systest`` exercising the Python binary
-  during the migration);
+- unset or empty, or ``python``: ``python3 -m journalpump`` (the Python
+  daemon; the default keeps ``make systest`` exercising the Python
+  binary during the migration);
 - ``go``: the built Go binary at ``build/journalpump`` (``make build-go``);
 - any other value: treated as the path of a journalpump-compatible
   binary (or executable stub, as the harness unit tests use).
@@ -41,8 +41,10 @@ _GO_BINARY_PATH = Path(__file__).resolve().parent.parent / "build" / "journalpum
 
 def _command(selection: str | None) -> list[str]:
     """Return the argv for the journalpump implementation selected by
-    the ``JOURNALPUMP_BIN`` value (see the module docstring)."""
-    if selection is None or selection == "python":
+    the ``JOURNALPUMP_BIN`` value (see the module docstring). An empty
+    string is treated like unset (the environment may carry an empty
+    variable where the intent was "no selection")."""
+    if not selection or selection == "python":
         return [sys.executable, "-m", "journalpump"]
     if selection == "go":
         return [str(_GO_BINARY_PATH)]

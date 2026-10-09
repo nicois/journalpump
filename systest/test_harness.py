@@ -58,7 +58,7 @@ def test_harness_captures_notify_datagrams_and_exit_code(tmp_path: Path, stub_pa
         assert returncode == 0
 
 
-def test_harness_reports_exit_before_notification(tmp_path: Path, tmp_path_factory: pytest.TempPathFactory) -> None:
+def test_harness_reports_exit_before_notification(tmp_path: Path) -> None:
     # A binary that exits 1 immediately without any notification: start
     # must surface the exit (code + stderr) instead of hanging.
     broken = tmp_path / "broken_stub"
