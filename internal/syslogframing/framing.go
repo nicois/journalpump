@@ -5,7 +5,10 @@
 
 package syslogframing
 
-import "strconv"
+import (
+	"math"
+	"strconv"
+)
 
 // DefaultMaxMsg is Python's max_msg default (rsyslog.py:118): `max_msg or
 // 2048`, so ONLY the falsy 0 is replaced — negative values are preserved
@@ -67,7 +70,7 @@ func (fr Framing) Frame(message []byte) []byte {
 		out = append(out, body...)
 		return out
 	}
-	body := pySliceEnd(message, fr.MaxMsg-1)
+	body := pySliceEnd(message, maxMsgMinusOne(fr.MaxMsg))
 	out := append([]byte(nil), body...)
 	// The truncation test uses the ORIGINAL length (rsyslog.py:200-202):
 	// a body at or beyond max_msg loses its formatter newline and gets an
@@ -76,4 +79,16 @@ func (fr Framing) Frame(message []byte) []byte {
 		out = append(out, '\n')
 	}
 	return out
+}
+
+// maxMsgMinusOne computes max_msg - 1 with Python's arbitrary-precision
+// semantics at the int64 extremes: subtracting one from math.MinInt would
+// overflow Go int and flip the bound to a large POSITIVE slice index,
+// sending the whole message instead of the newline-only Python produces.
+// Saturate at math.MinInt so pySliceEnd still yields the empty prefix.
+func maxMsgMinusOne(maxMsg int) int {
+	if maxMsg == math.MinInt {
+		return math.MinInt
+	}
+	return maxMsg - 1
 }

@@ -166,8 +166,11 @@ def _cases():
 
     # max_msg edge values: ONLY 0 falls back to the default (2048);
     # negatives are kept and applied as Python negative slice indices.
+    # -(2**63) is the int64 minimum: Python's arbitrary-precision
+    # max_msg - 1 stays hugely negative (newline-only non-transparent),
+    # where a fixed-width int would overflow to a positive bound.
     for octet in [False, True]:
-        for max_msg in [-1, -3, 0, 6, 7]:
+        for max_msg in [-1, -3, 0, 6, 7, -(2**63)]:
             add(
                 rfc="RFC5424",
                 log_format=None,

@@ -83,7 +83,15 @@ def test_missing_cursor_replay_replays_from_head(tmp_path: Path) -> None:
     # pinned byte-exactly by the file-sender fixture).
     file_fixture = gt.load_fixture("file_sender")
     assert file_fixture is not None
-    assert phase1_lines[:10] == file_fixture["expected"]["lines"]
+    expected_lines = file_fixture["expected"]["lines"]
+    # The file sender only flushes a prefix mid-run, so phase1_lines is
+    # that prefix; compare it against the fixture's matching prefix. The
+    # file-sender fixture was expanded (10 -> 40 lines) in Task 16 while
+    # this Task 11 assertion kept a literal [:10], so it went red without
+    # any consumer suite catching it (see the gate-integrity note in
+    # docs/go-test-parity.md).
+    assert len(phase1_lines) >= 10
+    assert expected_lines[: len(phase1_lines)] == phase1_lines
 
     if fixture is None or gt.update_mode():
         fixture = {

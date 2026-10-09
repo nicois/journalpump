@@ -769,6 +769,23 @@
     "facility": 1,
     "hostname": "h",
     "log_format": null,
+    "max_msg": -9223372036854775808,
+    "msg": "abcdef",
+    "msgid": "m",
+    "octet_counted_framing": false,
+    "pid": 1,
+    "program": "a",
+    "rfc": "RFC5424",
+    "sd": null,
+    "severity": 6,
+    "timestamp": "2024-01-01T00:00:00.000000Z",
+    "wire_hex": "0a"
+  },
+  {
+    "escape_newlines": false,
+    "facility": 1,
+    "hostname": "h",
+    "log_format": null,
     "max_msg": -1,
     "msg": "abcdef",
     "msgid": "m",
@@ -848,5 +865,22 @@
     "severity": 6,
     "timestamp": "2024-01-01T00:00:00.000000Z",
     "wire_hex": "37203c31343e312032"
+  },
+  {
+    "escape_newlines": false,
+    "facility": 1,
+    "hostname": "h",
+    "log_format": null,
+    "max_msg": -9223372036854775808,
+    "msg": "abcdef",
+    "msgid": "m",
+    "octet_counted_framing": true,
+    "pid": 1,
+    "program": "a",
+    "rfc": "RFC5424",
+    "sd": null,
+    "severity": 6,
+    "timestamp": "2024-01-01T00:00:00.000000Z",
+    "wire_hex": "3020"
   }
 ]

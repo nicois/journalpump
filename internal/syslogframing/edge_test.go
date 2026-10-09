@@ -16,10 +16,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -45,6 +47,11 @@ func TestFramingNegativeAndZeroMaxMsg(t *testing.T) {
 		{"nontransparent_one", 1, false, "\n"},
 		{"nontransparent_fits_exactly", 7, false, "abcdef"},
 		{"nontransparent_body_at_max", 6, false, "abcde\n"},
+		// int64 extremes: MaxMsg-1 must not overflow to a positive bound.
+		{"octet_min_int", math.MinInt, true, "0 "},
+		{"nontransparent_min_int", math.MinInt, false, "\n"},
+		{"octet_max_int", math.MaxInt, true, "6 abcdef"},
+		{"nontransparent_max_int", math.MaxInt, false, "abcdef"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -218,26 +225,36 @@ func TestSendDoesNotRetryNonRetriable(t *testing.T) {
 	}
 }
 
-// blockingConn blocks in Write until its write deadline is forced.
+// blockingConn blocks in Write until its write deadline is forced, and
+// signals (via entered) the instant Write is entered so a test can cancel
+// only after the worker is provably inside the write.
 type blockingConn struct {
+	entered   chan struct{}
 	unblocked chan struct{}
-	once      sync.Once
+	enterOnce sync.Once
+	deadOnce  sync.Once
 }
 
-func newBlockingConn() *blockingConn { return &blockingConn{unblocked: make(chan struct{})} }
+func newBlockingConn() *blockingConn {
+	return &blockingConn{entered: make(chan struct{}), unblocked: make(chan struct{})}
+}
+
 func (b *blockingConn) Write(_ []byte) (int, error) {
+	b.enterOnce.Do(func() { close(b.entered) })
 	<-b.unblocked
 	return 0, errors.New("write interrupted")
 }
 func (b *blockingConn) Close() error { return nil }
 func (b *blockingConn) SetWriteDeadline(time.Time) error {
-	b.once.Do(func() { close(b.unblocked) })
+	b.deadOnce.Do(func() { close(b.unblocked) })
 	return nil
 }
 
 // TestSendCancellationUnblocksStalledWrite proves a canceled context
 // unblocks a stalled write and returns the ctx error, so a sender worker
-// terminates promptly on shutdown/reload.
+// terminates promptly on shutdown/reload. It waits for the stub to signal
+// that Write was ENTERED before cancelling — no sleep, and Send cannot
+// pass by returning at its initial canceled-context check.
 func TestSendCancellationUnblocksStalledWrite(t *testing.T) {
 	bc := newBlockingConn()
 	c, err := NewClient(context.Background(), Config{RFC: "RFC5424", Dial: func(context.Context) (Conn, error) { return bc, nil }})
@@ -247,7 +264,11 @@ func TestSendCancellationUnblocksStalledWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- c.Send(ctx, []byte("hello\n")) }()
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-bc.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send never entered Write")
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -256,6 +277,77 @@ func TestSendCancellationUnblocksStalledWrite(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Send did not return after context cancellation (worker would hang)")
+	}
+}
+
+// cancelRaceConn cancels its context from INSIDE the first Write and then
+// reports success, deterministically racing cancellation against a
+// completed write.
+type cancelRaceConn struct {
+	cancel      context.CancelFunc
+	writes      int32
+	closes      int32
+	deadlineSet int32
+}
+
+func (c *cancelRaceConn) Write(p []byte) (int, error) {
+	if atomic.AddInt32(&c.writes, 1) == 1 {
+		c.cancel()
+	}
+	return len(p), nil // the write completes in full, so Send sees success
+}
+
+func (c *cancelRaceConn) Close() error {
+	atomic.AddInt32(&c.closes, 1)
+	return nil
+}
+
+func (c *cancelRaceConn) SetWriteDeadline(time.Time) error {
+	atomic.AddInt32(&c.deadlineSet, 1)
+	return nil
+}
+
+// TestSendCancellationRacingCompletedWriteRetiresConn pins the AfterFunc
+// race: ctx is canceled while the first Write is in flight and the write
+// still completes, so Send observes success. The cancel callback must have
+// finished (synchronized) before Send returns, and the connection whose
+// deadline it forced must be retired, not retained as a poisoned socket.
+func TestSendCancellationRacingCompletedWriteRetiresConn(t *testing.T) {
+	var dials int32
+	current := &cancelRaceConn{}
+	c, err := NewClient(context.Background(), Config{RFC: "RFC5424", Dial: func(context.Context) (Conn, error) {
+		atomic.AddInt32(&dials, 1)
+		return current, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	current.cancel = cancel
+	if err := c.Send(ctx, []byte("hello\n")); err != nil {
+		t.Fatalf("Send: %v (the write completed before cancellation)", err)
+	}
+	if atomic.LoadInt32(&current.deadlineSet) == 0 {
+		t.Fatal("cancel callback never forced a write deadline; test did not exercise the race")
+	}
+	if c.conn != nil {
+		t.Fatal("Send retained the connection whose deadline the cancel callback forced")
+	}
+	if atomic.LoadInt32(&current.closes) == 0 {
+		t.Fatal("poisoned connection was not retired (Close not called)")
+	}
+
+	// A later send must NOT reuse the poisoned socket: it reconnects.
+	fresh := &cancelRaceConn{cancel: func() {}}
+	current = fresh
+	if err := c.Send(context.Background(), []byte("again\n")); err != nil {
+		t.Fatalf("second Send: %v", err)
+	}
+	if got := atomic.LoadInt32(&dials); got != 2 {
+		t.Fatalf("dials = %d, want 2 (must reconnect, not reuse the poisoned conn)", got)
+	}
+	if atomic.LoadInt32(&fresh.writes) == 0 {
+		t.Fatal("second Send did not write on the fresh connection")
 	}
 }
 

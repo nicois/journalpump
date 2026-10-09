@@ -218,43 +218,69 @@ func (c *Client) Send(ctx context.Context, message []byte) error {
 			}
 		}
 		frame := c.framing.Frame(message)
-		if err := writeWithContext(ctx, c.conn, frame, c.now); err == nil {
+		deadlineForced, err := writeWithContext(ctx, c.conn, frame, c.now)
+		if err == nil {
+			if deadlineForced {
+				// The cancel callback ran concurrently with (or just after)
+				// a COMPLETED write, so it forced an expired write deadline
+				// onto the retained connection. Retire it rather than reuse
+				// a poisoned socket: the next Send reconnects cleanly. The
+				// message itself was fully written, so the send succeeds.
+				c.close()
+			}
 			return nil
-		} else { //nolint:revive // retry decision below needs err in scope
-			c.close()
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			if !retry || !shouldRetry(err) {
-				return err
-			}
+		}
+		c.close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !retry || !shouldRetry(err) {
+			return err
 		}
 	}
 }
 
 // writeWithContext gives Conn sendall semantics and unblocks a stalled
 // write when ctx is canceled by forcing the write deadline into the past.
-func writeWithContext(ctx context.Context, conn Conn, p []byte, now func() time.Time) error {
+//
+// The returned deadlineForced is true when the cancel callback actually
+// ran. stop() alone does NOT wait for an in-flight callback, so a
+// cancellation racing a successful write could otherwise return success
+// while the callback later forces an expired deadline on the retained
+// connection; waiting on the done channel makes the outcome deterministic
+// and lets Send retire the connection.
+func writeWithContext(ctx context.Context, conn Conn, p []byte, now func() time.Time) (deadlineForced bool, err error) {
+	done := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		if d, ok := conn.(writeDeadliner); ok {
 			_ = d.SetWriteDeadline(now())
 		}
+		close(done)
 	})
-	defer stop()
-	for len(p) > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
+	defer func() {
+		if stop() {
+			// Callback was successfully prevented; it will never run.
+			return
 		}
-		n, err := conn.Write(p)
-		if err != nil {
-			return err
+		// Callback already started (or is starting): wait for it to finish
+		// so no deadline write can race the caller after we return.
+		<-done
+		deadlineForced = true
+	}()
+	for len(p) > 0 {
+		if cerr := ctx.Err(); cerr != nil {
+			return false, cerr
+		}
+		n, werr := conn.Write(p)
+		if werr != nil {
+			return false, werr
 		}
 		if n == 0 {
-			return io.ErrShortWrite
+			return false, io.ErrShortWrite
 		}
 		p = p[n:]
 	}
-	return nil
+	return false, nil
 }
 
 // shouldRetry ports _should_retry (rsyslog.py:211-216) EXACTLY: the
