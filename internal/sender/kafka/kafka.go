@@ -41,9 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -52,7 +50,6 @@ import (
 
 	"github.com/IBM/sarama"
 	"github.com/xdg-go/scram"
-	"golang.org/x/net/proxy"
 
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
@@ -164,9 +161,11 @@ type producerConfig struct {
 // _generate_producer_config).
 func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	// kafka_sender.py:44 silences the client's internal logging
-	// (logging.getLogger("kafka").setLevel(CRITICAL)); sarama's
-	// package-level logger is the analogue.
-	sarama.Logger = log.New(io.Discard, "", 0)
+	// (logging.getLogger("kafka").setLevel(CRITICAL)). sarama's
+	// package-level Logger already defaults to a discarding logger
+	// (log.New(io.Discard, ...)), which is that silence; we deliberately do
+	// NOT assign it here because every constructor writing the shared
+	// global while other clients read it is a data race (review item C9).
 	seconds := defaultMaxSendInterval
 	if raw, present := args.Config["max_send_interval"]; present {
 		parsed, ok := intervalSeconds(raw)
@@ -424,21 +423,6 @@ func saslMechanism(name string) (sarama.SASLMechanism, error) {
 	}
 }
 
-// socks5Dialer builds the SOCKS5 dialer for kafka_sender.py's
-// socks5_proxy (the Aiven kafka-python fork's option; sarama surfaces it
-// as Net.Proxy.Dialer). socks5-kafka is a hard requirement.
-func socks5Dialer(address string) (proxy.Dialer, error) {
-	u, err := url.Parse(address)
-	if err != nil {
-		return nil, fmt.Errorf("socks5_proxy: %w", err)
-	}
-	dialer, err := proxy.FromURL(u, proxy.Direct)
-	if err != nil {
-		return nil, fmt.Errorf("socks5_proxy: %w", err)
-	}
-	return dialer, nil
-}
-
 // connectProducer builds a live sarama SyncProducer.
 func (s *Sender) connectProducer(pc producerConfig) (producer, error) {
 	cfg, err := pc.saramaConfig()
@@ -480,7 +464,7 @@ func (s *Sender) resolvedProducerConfig() (*producerConfig, error) {
 // shared backoff exponent exactly like Python's mark_connected at the
 // end of _init_kafka; a failure is returned so the shared loop marks the
 // sender disconnected, backs off and retries the batch.
-func (s *Sender) ensureProducer(_ context.Context) (producer, error) {
+func (s *Sender) ensureProducer(ctx context.Context) (producer, error) {
 	s.mu.Lock()
 	if s.prod != nil {
 		p := s.prod
@@ -489,12 +473,23 @@ func (s *Sender) ensureProducer(_ context.Context) (producer, error) {
 	}
 	s.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pc, err := s.resolvedProducerConfig()
 	if err != nil {
 		return nil, err
 	}
 	s.logf("Initializing Kafka client, address: %r for %s", strings.Join(pc.brokers, ","), s.name())
-	p, err := s.newProducer(*pc)
+	// The dial is cancellation-aware: a stalled broker or SOCKS
+	// negotiation must not hold shutdown/reload past the grace window
+	// (review item C7). If the context wins the race the late producer is
+	// closed by a drain goroutine so nothing leaks.
+	p, err := runCtx(ctx, func() (producer, error) { return s.newProducer(*pc) }, func(p producer) {
+		if p != nil {
+			_ = p.Close()
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +503,7 @@ func (s *Sender) ensureProducer(_ context.Context) (producer, error) {
 	s.mu.Unlock()
 	// Python creates the topic after a successful connect, tolerating an
 	// already-existing topic (kafka_sender.py:143-153).
-	if err := s.maybeCreateTopic(*pc); err != nil {
+	if err := s.maybeCreateTopic(ctx, *pc); err != nil {
 		s.dropProducer()
 		return nil, err
 	}
@@ -521,21 +516,28 @@ func (s *Sender) ensureProducer(_ context.Context) (producer, error) {
 
 // maybeCreateTopic creates the configured topic when BOTH
 // kafka_topic_config values are present (kafka_sender.py:143-153).
-// TopicAlreadyExists is tolerated; any other error is returned.
-func (s *Sender) maybeCreateTopic(pc producerConfig) error {
+// TopicAlreadyExists is tolerated; any other error is returned. Both the
+// admin dial and the create call are cancellation-aware (item C7).
+func (s *Sender) maybeCreateTopic(ctx context.Context, pc producerConfig) error {
 	numPartitions, repFactor, ok := topicConfig(s.rawConfig)
 	if !ok {
 		return nil
 	}
-	a, err := s.newAdmin(pc)
+	a, err := runCtx(ctx, func() (admin, error) { return s.newAdmin(pc) }, func(a admin) {
+		if a != nil {
+			_ = a.Close()
+		}
+	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = a.Close() }()
-	err = a.CreateTopic(s.topic, &sarama.TopicDetail{
-		NumPartitions:     numPartitions,
-		ReplicationFactor: repFactor,
-	}, false)
+	_, err = runCtx(ctx, func() (struct{}, error) {
+		return struct{}{}, a.CreateTopic(s.topic, &sarama.TopicDetail{
+			NumPartitions:     numPartitions,
+			ReplicationFactor: repFactor,
+		}, false)
+	}, nil)
 	if err != nil {
 		if errors.Is(err, sarama.ErrTopicAlreadyExists) {
 			s.logf("Kafka topic %r already exists for %s", s.topic, s.name())
@@ -547,12 +549,44 @@ func (s *Sender) maybeCreateTopic(pc producerConfig) error {
 	return nil
 }
 
+// runCtx runs fn and returns its result, but gives up as soon as ctx is
+// done. If ctx wins the race, a drain goroutine waits for fn to finish so
+// the abandoned value can be cleaned up (a client that was still dialing)
+// without leaking the goroutine or the client (review item C7).
+func runCtx[T any](ctx context.Context, fn func() (T, error), cleanup func(T)) (T, error) {
+	type result struct {
+		v   T
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		v, err := fn()
+		ch <- result{v, err}
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			r := <-ch
+			if cleanup != nil {
+				cleanup(r.v)
+			}
+		}()
+		var zero T
+		return zero, ctx.Err()
+	case r := <-ch:
+		return r.v, r.err
+	}
+}
+
 // SendMessages implements sender.Sender: one sarama SyncProducer
 // SendMessages per batch (thread A7). A nil return lets the shared loop
 // advance the cursor to the batch's last cursor (ack-then-advance); a
 // failure drops the producer and returns the error for the loop's
 // classification/backoff/retry.
 func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p, err := s.ensureProducer(ctx)
 	if err != nil {
 		return err

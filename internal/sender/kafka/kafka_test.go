@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -41,6 +42,36 @@ func baseConfig() map[string]any {
 		"kafka_address": "localhost:9092",
 		"kafka_topic":   "test-topic",
 	}
+}
+
+// TestNewDoesNotMutateSaramaLogger: New must not write sarama's global
+// Logger (review item C9). sarama already defaults to a discarding logger,
+// so the Python "silence kafka logging" behavior is preserved without a
+// data race against other constructors/clients.
+func TestNewDoesNotMutateSaramaLogger(t *testing.T) {
+	before := sarama.Logger
+	if _, err := New(sender.ConstructorArgs{Name: "test-sender", Config: baseConfig()}); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if sarama.Logger != before {
+		t.Error("New mutated sarama.Logger")
+	}
+}
+
+// TestConcurrentConstruction exercises the constructor from several
+// goroutines; run with -race, it catches a global-logger write (C9).
+func TestConcurrentConstruction(t *testing.T) {
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := New(sender.ConstructorArgs{Name: "test-sender", Config: baseConfig()}); err != nil {
+				t.Errorf("New: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // --- KafkaSender.__init__ parity (test/unit/senders/test_kafka_sender.py) ---
@@ -815,7 +846,7 @@ func TestMaybeCreateTopicWithBothValues(t *testing.T) {
 	pc, _ := resolveProducerConfig(raw)
 	fa := &fakeAdmin{}
 	s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
-	if err := s.maybeCreateTopic(pc); err != nil {
+	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("maybeCreateTopic: %v", err)
 	}
 	if len(fa.created) != 1 || fa.created[0] != "test-topic" {
@@ -838,7 +869,7 @@ func TestMaybeCreateTopicWithJSONNumberConfig(t *testing.T) {
 	pc, _ := resolveProducerConfig(raw)
 	fa := &fakeAdmin{}
 	s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
-	if err := s.maybeCreateTopic(pc); err != nil {
+	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("maybeCreateTopic: %v", err)
 	}
 	if fa.detail == nil || fa.detail.NumPartitions != 2 || fa.detail.ReplicationFactor != 1 {
@@ -853,7 +884,7 @@ func TestMaybeCreateTopicAlreadyExistsTolerated(t *testing.T) {
 	pc, _ := resolveProducerConfig(raw)
 	fa := &fakeAdmin{err: sarama.ErrTopicAlreadyExists}
 	s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
-	if err := s.maybeCreateTopic(pc); err != nil {
+	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("TopicAlreadyExists should be tolerated, got %v", err)
 	}
 }
@@ -874,7 +905,7 @@ func TestMaybeCreateTopicPartialConfigSkips(t *testing.T) {
 			pc, _ := resolveProducerConfig(raw)
 			fa := &fakeAdmin{}
 			s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
-			if err := s.maybeCreateTopic(pc); err != nil {
+			if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 				t.Fatalf("maybeCreateTopic: %v", err)
 			}
 			if len(fa.created) != 0 {
@@ -907,5 +938,135 @@ func TestSourceNotDurableReporter(t *testing.T) {
 	}
 	if _, ok := inst.Transport.(sender.DurableReporter); ok {
 		t.Error("kafka sender must not implement DurableReporter (cursor advances on broker ack)")
+	}
+}
+
+// --- cancellation (review item C7) ---
+
+// signalledProducer signals Close through a channel so tests can wait for
+// an abandoned connection to be cleaned up.
+type signalledProducer struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (p *signalledProducer) SendMessages([]*sarama.ProducerMessage) error { return nil }
+func (p *signalledProducer) Close() error {
+	p.once.Do(func() { close(p.closed) })
+	return nil
+}
+
+// signalledAdmin is the admin analogue of signalledProducer.
+type signalledAdmin struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (a *signalledAdmin) CreateTopic(string, *sarama.TopicDetail, bool) error { return nil }
+func (a *signalledAdmin) Close() error {
+	a.once.Do(func() { close(a.closed) })
+	return nil
+}
+
+// TestEnsureProducerRespectsCancellation: a stalled connect must return
+// promptly when the context is cancelled, and the producer that the dial
+// eventually yields must be closed (no leak), leaving the sender ready to
+// re-init on the next attempt.
+func TestEnsureProducerRespectsCancellation(t *testing.T) {
+	s := newSender(t, baseConfig())
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	late := &signalledProducer{closed: make(chan struct{})}
+	s.newProducer = func(producerConfig) (producer, error) {
+		close(entered)
+		<-release
+		return late, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ensureProducer(ctx)
+		done <- err
+	}()
+	// Cancel only once the dial is in flight, so the runCtx drain path runs.
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ensureProducer error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ensureProducer did not return after cancellation")
+	}
+
+	close(release)
+	select {
+	case <-late.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("abandoned producer was not closed")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prod != nil {
+		t.Error("cancelled connect left a producer installed; reload would reuse a dead client")
+	}
+}
+
+// TestMaybeCreateTopicRespectsCancellation: the admin dial and the create
+// call are both cancellation-aware, and an abandoned admin is closed.
+func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
+	raw := baseConfig()
+	raw["kafka_topic_config"] = map[string]any{"num_partitions": 3, "replication_factor": 1}
+	s := newSender(t, raw)
+	pc, err := resolveProducerConfig(raw)
+	if err != nil {
+		t.Fatalf("resolveProducerConfig: %v", err)
+	}
+	release := make(chan struct{})
+	late := &signalledAdmin{closed: make(chan struct{})}
+	s.newAdmin = func(producerConfig) (admin, error) {
+		<-release
+		return late, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.maybeCreateTopic(ctx, pc) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("maybeCreateTopic error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("maybeCreateTopic did not return after cancellation")
+	}
+
+	close(release)
+	select {
+	case <-late.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("abandoned admin was not closed")
+	}
+}
+
+// TestSendMessagesCancelledContext: a cancelled context short-circuits the
+// send before any dial.
+func TestSendMessagesCancelledContext(t *testing.T) {
+	s := newSender(t, baseConfig())
+	called := false
+	s.newProducer = func(producerConfig) (producer, error) {
+		called = true
+		return &fakeProducer{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.SendMessages(ctx, [][]byte{[]byte("x")}, "c"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SendMessages error = %v, want context.Canceled", err)
+	}
+	if called {
+		t.Error("SendMessages connected despite a cancelled context")
 	}
 }
