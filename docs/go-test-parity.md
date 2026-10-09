@@ -323,8 +323,10 @@ pinned monotonic clock), the Go-written fixture
   ("unsupported value: NaN") where Python's json.dump default
   (allow_nan=True) emits NaN/Infinity literals — unreachable from
   journalpump's own paths (decoded state carries only RFC-valid JSON
-  values; a Python-written file containing NaN already fails Go's
-  strict-JSON Read), but a state value that is not valid RFC JSON
+  values; a Python-written NaN literal fails Go's decode as well —
+  every field, including the lenient raw `start_time` path, is read
+  through encoding/json's decoder, which rejects the literal,
+  probe-confirmed), but a state value that is not valid RFC JSON
   cannot be re-encoded by the writer. `TestWriteParsedRoundTrip`
   replaces the old byte-golden lock: the fresh write parses exactly
   like the committed `state_go_written.json` artifact and re-reads to

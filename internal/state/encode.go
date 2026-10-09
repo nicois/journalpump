@@ -36,8 +36,11 @@ import (
 //     JSON values, which cannot contain non-finite literals — but it
 //     narrows the "any Python-acceptable state file re-writes" guarantee
 //     at the writer: a state value that is not valid RFC JSON cannot be
-//     re-encoded. (A Python-written file containing NaN already fails
-//     Go's strict-JSON Read, so the read-side boundary is unchanged.)
+//     re-encoded. (On the read side, a Python-written NaN literal fails
+//     Go's decode too: every field — including the lenient raw
+//     start_time path, which is still read through encoding/json's
+//     decoder, not a raw byte scan — rejects the NaN literal;
+//     probe-confirmed.)
 //     Deviation boundary recorded in docs/go-test-parity.md (Task 8).
 //
 // What is preserved from Python: the parsed document is equal
