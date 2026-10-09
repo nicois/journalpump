@@ -1076,38 +1076,77 @@ func TestFailedFinalFlushRollsBackState(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Pump.Run supervisor
 
-// TestSenderErrorPropagatesViaErrgroup locks the sender errgroup
-// composition (major 1): a sender loop failure is joined at shutdown and
-// propagated as Run's result instead of being discarded.
-func TestSenderErrorPropagatesViaErrgroup(t *testing.T) {
+// TestSenderErrorFailsFastAndHonorsGrace locks the fail-fast ruling: a
+// sender-LOOP failure terminates the daemon on its own (NO external
+// cancellation), propagates as Run's result, and still honors the full
+// grace window for the OTHER senders (whose buffered messages flush).
+func TestSenderErrorFailsFastAndHonorsGrace(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		disableSignals(t)
 		orig := runSenderLoop
-		runSenderLoop = func(*sender.Loop, context.Context) error { return errors.New("sender boom") }
+		runSenderLoop = func(l *sender.Loop, ctx context.Context) error {
+			if l.Name() == "boom" {
+				// Delay so the reader drains its entries into the other
+				// sender's buffer before the failure surfaces.
+				time.Sleep(5 * pollInterval)
+				return errors.New("sender boom")
+			}
+			return l.Run(ctx)
+		}
 		t.Cleanup(func() { runSenderLoop = orig })
 
 		cfg := testPumpConfig(map[string]config.ReaderConfig{
-			"r": fakeReaderConfig(map[string]any{"s": fakeSenderConfig()}),
+			"r": fakeReaderConfig(map[string]any{
+				"boom": map[string]any{"output_type": "fake"},
+				"ok":   fakeSenderConfig(),
+			}),
 		})
 		p, rt := newTestRuntime(t, cfg, &captureLog{})
-		p.notifier = &fakeNotifier{}
-		rt.reopener = &fakeSource{reader: &fakeReader{firstWait: true}}
+		notifier := &fakeNotifier{}
+		p.notifier = notifier
+		rt.reopener = &fakeSource{reader: &fakeReader{
+			firstWait: true,
+			entries: []journal.Entry{
+				{Cursor: "c1", Fields: []journal.Field{{Key: "MESSAGE", Value: "a"}}},
+				{Cursor: "c2", Fields: []journal.Field{{Key: "MESSAGE", Value: "b"}}},
+			},
+		}}
 
-		ctx, cancel := context.WithCancel(context.Background())
+		// No external cancellation: the sender failure alone must stop it.
 		done := make(chan error, 1)
-		go func() { done <- p.Run(ctx, make(chan os.Signal)) }()
+		go func() { done <- p.Run(context.Background(), make(chan os.Signal)) }()
 
 		synctest.Wait()
-		time.Sleep(2 * pollInterval)
+		time.Sleep(10 * pollInterval)
 		synctest.Wait()
-		cancel()
 		select {
 		case err := <-done:
 			if err == nil || !strings.Contains(err.Error(), "sender boom") {
 				t.Fatalf("Run = %v, want the sender error", err)
 			}
 		case <-time.After(10 * time.Second):
-			t.Fatal("Run did not return after cancellation")
+			t.Fatal("Run did not return after the sender failure (no external cancellation)")
+		}
+		if !notifier.notified(StateStopping) {
+			t.Error("Run did not notify STOPPING=1")
+		}
+		// The OTHER sender must still have received its full grace window:
+		// its two buffered messages were flushed.
+		var okEntry *senderEntry
+		for _, e := range rt.pump.senders["r"] {
+			if e.name == "ok" {
+				okEntry = e
+			}
+		}
+		if okEntry == nil {
+			t.Fatal("ok sender not initialized")
+		}
+		transport, isFake := okEntry.inst.Transport.(*fakeTransport)
+		if !isFake {
+			t.Fatalf("transport type %T", okEntry.inst.Transport)
+		}
+		if got := transport.messages(); got != 2 {
+			t.Errorf("other sender flushed %d messages, want 2 (grace window honored)", got)
 		}
 	})
 }

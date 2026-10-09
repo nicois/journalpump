@@ -269,6 +269,9 @@ type Loop struct {
 // (D9) is the max over the live senders' intervals plus TickInterval.
 func (l *Loop) MaxSendInterval() time.Duration { return l.inst.MaxSendInterval }
 
+// Name is the loop's configured sender name.
+func (l *Loop) Name() string { return l.cfg.Name }
+
 // SetDequeueObserver registers a callback invoked from the loop
 // goroutine with every non-empty batch of items taken out of the
 // buffer channel (the buffer layer uses it to maintain its in-flight

@@ -21,14 +21,16 @@ import (
 // fakeTransport optionally blocks in SendMessages until its gate is
 // closed, so tests control exactly when the loop drains.
 type fakeTransport struct {
-	mu    sync.Mutex
-	calls int
-	gate  chan struct{}
+	mu       sync.Mutex
+	calls    int
+	messages int
+	gate     chan struct{}
 }
 
-func (f *fakeTransport) SendMessages(_ context.Context, _ [][]byte, _ string) error {
+func (f *fakeTransport) SendMessages(_ context.Context, batch [][]byte, _ string) error {
 	f.mu.Lock()
 	f.calls++
+	f.messages += len(batch)
 	f.mu.Unlock()
 	if f.gate != nil {
 		<-f.gate
@@ -44,6 +46,14 @@ func (f *fakeTransport) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// messageCount is the number of messages whose SendMessages COMPLETED —
+// the delivery acknowledgment the drain assertions must wait on.
+func (f *fakeTransport) messageCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.messages
 }
 
 // newWired builds the composed pair in the production order:
@@ -289,18 +299,29 @@ func TestDrainOpensGate(t *testing.T) {
 }
 
 // TestConcurrentEnqueueDrain runs producers against a draining loop
-// under -race.
+// under -race. The drain assertion waits for the transport's DELIVERY
+// acknowledgment (SendMessages completion), not merely the empty
+// counters — collection without delivery was the reproduced race.
 func TestConcurrentEnqueueDrain(t *testing.T) {
 	t.Parallel()
 	tr := &fakeTransport{}
 	loop, buf := newWired(tr, buffer.DefaultMsgBufferMaxLength, 50*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = loop.Run(ctx) }()
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		_ = loop.Run(ctx)
+	}()
+	// Cancel and join the loop before returning (no goroutine leak).
+	defer func() {
+		cancel()
+		<-loopDone
+	}()
 
 	const (
 		producers = 4
 		perProd   = 300 // 1200 total: trips the >1000 flush trigger
+		total     = producers * perProd
 	)
 	var wg sync.WaitGroup
 	for p := range producers {
@@ -317,23 +338,26 @@ func TestConcurrentEnqueueDrain(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Everything enqueued must eventually drain and release its byte
-	// budget — never dropped, never leaked.
+	// Wait for every enqueued message to be DELIVERED (SendMessages
+	// completed), then the buffer accounting must be released.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if buf.Count() == 0 && buf.ByteCount() == 0 {
+		if tr.messageCount() == total {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(time.Millisecond)
+	}
+	if got := tr.messageCount(); got != total {
+		t.Fatalf("delivered %d messages, want %d (empty counters prove collection, not delivery)", got, total)
+	}
+	if got := tr.callCount(); got == 0 {
+		t.Fatal("transport was never called")
 	}
 	if got := buf.Count(); got != 0 {
 		t.Fatalf("Count() = %d after drain, want 0", got)
 	}
 	if got := buf.ByteCount(); got != 0 {
 		t.Fatalf("ByteCount() = %d after drain, want 0", got)
-	}
-	if got := tr.callCount(); got == 0 {
-		t.Fatal("transport was never called")
 	}
 }
 

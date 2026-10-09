@@ -123,6 +123,11 @@ type Pump struct {
 	// SEPARATELY (entry.cancel, after the D9 grace window), never by a
 	// reader failure.
 	senderGroup errgroup.Group
+	// senderErrCh reports a sender-loop failure to Run's select so the
+	// supervisor can fail fast (a returned loop error is a bug-class
+	// failure: transport errors are handled inside the loop). Capacity is
+	// the number of configured senders, so a report is never dropped.
+	senderErrCh chan error
 
 	// linesRead accumulates entries processed since the last supervisor
 	// tick — the global `lines` counter of journalpump.py:1124/1195 (the
@@ -239,7 +244,31 @@ func NewPump(cfg *config.Config, deps PumpDeps) (*Pump, error) {
 		}
 		pump.readers = append(pump.readers, rt)
 	}
+
+	// One report slot per configured sender: a sender goroutine returns
+	// at most once, so the fail-fast channel never drops a report.
+	reportSlots := 0
+	for _, rt := range pump.readers {
+		reportSlots += len(rt.resolved)
+	}
+	if reportSlots < 1 {
+		reportSlots = 1
+	}
+	pump.senderErrCh = make(chan error, reportSlots)
 	return pump, nil
+}
+
+// reportSenderError forwards a sender-loop failure to Run (fail-fast).
+// A returned loop error is a bug-class failure: transport errors are
+// handled inside the loop (retriable/backoff), so the loop itself broke.
+func (p *Pump) reportSenderError(err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case p.senderErrCh <- err:
+	default:
+	}
 }
 
 // startTimeString ports start_time_str (journalpump.py:859):
@@ -684,7 +713,9 @@ func (rt *ReaderRuntime) initSenders() {
 		rt.pump.senders[rt.name] = append(rt.pump.senders[rt.name], entry)
 		rt.pump.senderMu.Unlock()
 		rt.pump.senderGroup.Go(func() error {
-			return runSenderLoop(entry.loop, sctx)
+			err := runSenderLoop(entry.loop, sctx)
+			rt.pump.reportSenderError(err)
+			return err
 		})
 		rt.initialised[resolved.name] = struct{}{}
 		rt.senders[resolved.name] = entry
@@ -1130,6 +1161,15 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 				return err
 			}
 			return shutErr
+		case err := <-p.senderErrCh:
+			// A sender LOOP failed (bug-class: transport errors are
+			// handled inside the loop via retriable/backoff). Fail fast:
+			// full shutdown with the grace window honored for the other
+			// senders; shutdown's sender-group join re-propagates this
+			// error as Run's result.
+			p.log.Printf("Sender failed, stopping daemon: %v", err)
+			p.log.Printf("Received SIGTERM, stopping daemon...")
+			return p.shutdown(cancelReaders, waitReaders)
 		case <-ticker.C:
 			if err := p.tick(); err != nil {
 				p.log.Printf("Housekeeping failed, stopping daemon: %v", err)
