@@ -371,3 +371,66 @@ func TestWaitImmediatePoll(t *testing.T) {
 		t.Fatalf("Wait(0) took %v, want an immediate poll", elapsed)
 	}
 }
+
+// TestOpenAbsorbsInitialNotification pins the root-cause fix: Open's
+// RegisterForPoll (sd_journal_get_fd) consumes the open-time file-snapshot
+// INVALIDATE, exactly like python-systemd's Reader.fileno() at poll
+// registration. Before it, the first wait returned INVALIDATE for an
+// unchanged journal, which the pump would treat as a rotation and use to
+// close/recreate the reader forever.
+func TestOpenAbsorbsInitialNotification(t *testing.T) {
+	r := openFixture(t, "rotated_logs", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if evt, err := r.Wait(ctx, 0); err != nil {
+		t.Fatalf("Wait(0): %v", err)
+	} else if evt != EventNOP {
+		t.Fatalf("first Wait(0) = %v, want EventNOP (opening INVALIDATE not absorbed)", evt)
+	}
+}
+
+// TestPreFirstWaitDeletionReportsInvalidate is the other half of the
+// fix: RegisterForPoll must NOT swallow a genuine rotation/deletion that
+// happens between the open and the first wait. A blanketed first-wait
+// INVALIDATE mask (the previous approach) would downgrade this real
+// event to an append and the required recreation would never happen.
+func TestPreFirstWaitDeletionReportsInvalidate(t *testing.T) {
+	dir := t.TempDir()
+	journals, err := filepath.Glob(filepath.Join(fixturePath("rotated_logs"), "*.journal"))
+	if err != nil || len(journals) == 0 {
+		t.Fatalf("glob fixture journals: %v (%d)", err, len(journals))
+	}
+	copied := make([]string, 0, len(journals))
+	for _, j := range journals {
+		data, err := os.ReadFile(j)
+		if err != nil {
+			t.Fatalf("read %s: %v", j, err)
+		}
+		dst := filepath.Join(dir, filepath.Base(j))
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			t.Fatalf("stage %s: %v", dst, err)
+		}
+		copied = append(copied, dst)
+	}
+
+	FilesAvailableOverride = func(bool, bool) bool { return true }
+	t.Cleanup(func() { FilesAvailableOverride = nil })
+	r, err := Open(OpenConfig{Path: dir})
+	if err != nil {
+		t.Fatalf("open staged dir: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+
+	// Rotate/delete BEFORE the first wait.
+	if err := os.Remove(copied[0]); err != nil {
+		t.Fatalf("remove %s: %v", copied[0], err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if evt, err := r.Wait(ctx, 2*time.Second); err != nil {
+		t.Fatalf("Wait: %v", err)
+	} else if evt != EventInvalidate {
+		t.Fatalf("Wait after pre-first-wait deletion = %v, want EventInvalidate (real rotation swallowed)", evt)
+	}
+}

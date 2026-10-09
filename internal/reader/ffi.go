@@ -56,6 +56,7 @@ typedef int      (*fn_id128_get_boot)(go_id128_t*);
 typedef int      (*fn_wait)(sd_journal*, uint64_t);
 typedef int      (*fn_enumerate_data)(sd_journal*, const void**, size_t*);
 typedef int      (*fn_get_cursor)(sd_journal*, char**);
+typedef int      (*fn_get_fd)(sd_journal*);
 typedef int      (*fn_get_realtime)(sd_journal*, uint64_t*);
 typedef int      (*fn_has_persistent)(sd_journal*);
 typedef int      (*fn_has_runtime)(sd_journal*);
@@ -111,6 +112,7 @@ static int call_enumerate_data(void* f, sd_journal* j, void* buf, size_t buflen,
 	return rc;
 }
 static int call_get_cursor(void* f, sd_journal* j, char** out) { return ((fn_get_cursor)f)(j, out); }
+static int call_get_fd(void* f, sd_journal* j) { return ((fn_get_fd)f)(j); }
 static int call_get_realtime(void* f, sd_journal* j, uint64_t* out) { return ((fn_get_realtime)f)(j, out); }
 static int call_has_persistent(void* f, sd_journal* j) { return ((fn_has_persistent)f)(j); }
 static int call_has_runtime(void* f, sd_journal* j) { return ((fn_has_runtime)f)(j); }
@@ -324,6 +326,22 @@ func bootID() (id128, int, error) {
 	var out C.go_id128_t
 	rc := C.call_id128_get_boot(f, &out)
 	return id128{q0: uint64(out.q0), q1: uint64(out.q1)}, int(rc), nil
+}
+
+// getFd registers the journal's notification fd and returns it (>= 0) or
+// -errno. libsystemd's sd_journal_get_fd calls sd_journal_process
+// internally, so it ABSORBS the open-time file-snapshot INVALIDATE: the
+// first subsequent sd_journal_wait reports NOP for an unchanged journal
+// while a genuine rotation/deletion after the call still reports
+// INVALIDATE. This is the notification-tracking initialization Python
+// gets from python-systemd's Reader.fileno() when the poller registers
+// the reader (journalpump.py:1090-1100, register_for_poll).
+func (h *ffiJournal) getFd() (int, error) {
+	f, err := ffiSymbol("sd_journal_get_fd")
+	if err != nil {
+		return 0, err
+	}
+	return int(C.call_get_fd(f, h.j)), nil
 }
 
 // waitUsec blocks up to timeoutUsec; (1<<63)-1 waits indefinitely.

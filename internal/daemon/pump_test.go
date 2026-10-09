@@ -1064,14 +1064,18 @@ func TestRunLoopAndShutdownGrace(t *testing.T) {
 	})
 }
 
-// TestRunLoopStableJournalIsNotRecreated is the regression for the
-// spurious opening INVALIDATE: sd_journal_wait's first call after an
-// open reports INVALIDATE for the open-time file snapshot, which would
-// close and recreate an unchanged journal every iteration. Python's
-// register_for_poll seeds APPEND and only consults process() once the fd
-// is pollable, so a stable journal is never recreated. Before the fix
-// this test saw invalidated >= 1 and ensureCalls > 1.
-func TestRunLoopStableJournalIsNotRecreated(t *testing.T) {
+// TestRunLoopFirstWaitInvalidateRecreates is the regression guard for the
+// root-cause fix on the pump side: a FIRST-wait INVALIDATE is a genuine
+// rotation/deletion (the open-time snapshot INVALIDATE is absorbed at the
+// reader layer by RegisterForPoll, not here), so the run loop must honor
+// it — drain, invalidate the source, and recreate the reader. The earlier
+// blanket "mask the first INVALIDATE" approach swallowed exactly this
+// event, so this test fails on that code (invalidated stays 0).
+//
+// The complementary stable-journal guarantee (no spurious recreation) is
+// asserted at the reader layer by TestOpenAbsorbsInitialNotification,
+// which pins that a freshly opened unchanged journal's first wait is NOP.
+func TestRunLoopFirstWaitInvalidateRecreates(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
 		_, rt := newTestRuntime(t, cfg, &captureLog{})
@@ -1093,7 +1097,7 @@ func TestRunLoopStableJournalIsNotRecreated(t *testing.T) {
 		go func() { done <- rt.run(ctx) }()
 
 		synctest.Wait()
-		// Several iterations: open, drain, and idle waits.
+		// Several iterations: open, first-wait INVALIDATE -> recreate, idle.
 		time.Sleep(10 * pollInterval)
 		synctest.Wait()
 		cancel()
@@ -1101,14 +1105,14 @@ func TestRunLoopStableJournalIsNotRecreated(t *testing.T) {
 			t.Fatalf("run returned %v, want nil on cancellation", err)
 		}
 
-		if src.invalidated != 0 {
-			t.Errorf("recreated a stable journal %d time(s), want 0 (spurious opening INVALIDATE not masked)", src.invalidated)
+		if src.invalidated < 1 {
+			t.Errorf("invalidated = %d, want >= 1 (first-wait INVALIDATE must trigger recreation)", src.invalidated)
 		}
-		if src.ensureCalls != 1 {
-			t.Errorf("Ensure calls = %d, want 1 (no reopen of a stable journal)", src.ensureCalls)
+		if src.ensureCalls < 2 {
+			t.Errorf("Ensure calls = %d, want >= 2 (reader recreated after invalidation)", src.ensureCalls)
 		}
 		if got := rt.currentCursor(); got != "c3" {
-			t.Errorf("cursor = %q, want c3 (backlog drained exactly once)", got)
+			t.Errorf("cursor = %q, want c3 (backlog drained before recreation)", got)
 		}
 	})
 }

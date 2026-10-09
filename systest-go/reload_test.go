@@ -68,32 +68,43 @@ func TestGoSighupWithChangedReadersKeepsProcessAlive(t *testing.T) {
 // CHANGED-reader SIGHUP (same reader name, changed config blob → the
 // reader set is replaced) via the persisted state cursor, and subsequent
 // journal entries must then arrive with no missing or duplicated message.
-// It also proves the SAVED cursor is the true resume position by
-// restarting from it and observing no replay.
+//
+// The test is deliberately NON-VACUOUS: the reload config keeps
+// initial_position="head" and changes a DIFFERENT reader setting (a
+// search is added) to force the rebuild. If the reload ignored the saved
+// cursor, the rebuilt reader would seek the journal HEAD and replay
+// Messages 0..9 — the line counts below would then be 20 (not 10) and the
+// final restart 20 (not 0). The final fresh-process check runs with
+// initial_position="head" too, so it can only yield 0 lines if the saved
+// cursor is actually honored.
 func TestGoReloadPreservesDeliveryCursors(t *testing.T) {
 	logs := t.TempDir()
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
 	configPath := filepath.Join(dir, "config.json")
 
-	writeCfg := func(out, initialPosition string) {
+	// readerExtra is merged into the reader config: nil for the first
+	// config, a search (a reader-level blob change) for the reload.
+	writeCfg := func(out string, readerExtra map[string]any) {
 		t.Helper()
-		cfg := map[string]any{
-			"readers": map[string]any{
-				"my-reader": map[string]any{
-					"journal_path":     logs,
-					"initial_position": initialPosition,
-					"senders": map[string]any{
-						"out": map[string]any{
-							"output_type": "file",
-							"file_output": out,
-							// Pad past the file sender's 128 KiB buffer so
-							// delivery is observable on disk mid-run.
-							"extra_field_values": map[string]any{"PADDING": strings.Repeat("x", 131088)},
-						},
-					},
+		reader := map[string]any{
+			"journal_path":     logs,
+			"initial_position": "head",
+			"senders": map[string]any{
+				"out": map[string]any{
+					"output_type": "file",
+					"file_output": out,
+					// Pad past the file sender's 128 KiB buffer so
+					// delivery is observable on disk mid-run.
+					"extra_field_values": map[string]any{"PADDING": strings.Repeat("x", 131088)},
 				},
 			},
+		}
+		for k, v := range readerExtra {
+			reader[k] = v
+		}
+		cfg := map[string]any{
+			"readers":              map[string]any{"my-reader": reader},
 			"json_state_file_path": statePath,
 		}
 		data, err := json.Marshal(cfg)
@@ -108,7 +119,7 @@ func TestGoReloadPreservesDeliveryCursors(t *testing.T) {
 	out := filepath.Join(dir, "out.jsonl")
 	r := newRotator(t, logs, "rotated_logs")
 	r.rotate() // file A -> Messages 0..9
-	writeCfg(out, "head")
+	writeCfg(out, nil)
 	p := startJournalpump(t, configPath)
 	waitForAtLeast(t, out, 10, 15*time.Second)
 
@@ -126,14 +137,18 @@ func TestGoReloadPreservesDeliveryCursors(t *testing.T) {
 	}
 	_, cursorBefore, _ := senderSent(t, statePath, "my-reader", "out")
 
-	// CHANGED-reader SIGHUP: same reader name, changed config blob (the
-	// initial_position flips), so the reader is retired and rebuilt. It
-	// must resume from the saved cursor, not re-read the journal head.
-	writeCfg(out, "tail")
+	// CHANGED-reader SIGHUP: same reader name, changed config blob (a
+	// search is added; initial_position stays "head"), so the reader is
+	// retired and rebuilt. It must resume from the saved cursor, not
+	// re-read the journal head.
+	writeCfg(out, map[string]any{
+		"searches": []any{map[string]any{"name": "all", "fields": map[string]any{"MESSAGE": "Message"}}},
+	})
 	p.reload()
 
 	// No replay: a cursor-preserving rebuild delivers nothing new for the
-	// already-consumed file A.
+	// already-consumed file A. With initial_position="head", a rebuild that
+	// ignored the cursor would re-emit Messages 0..9 and this would read 20.
 	time.Sleep(2 * time.Second)
 	if got := lineCount(out); got != 10 {
 		t.Fatalf("after reload wrote %d lines, want 10 (no replay of Messages 0..9)", got)
@@ -151,7 +166,8 @@ func TestGoReloadPreservesDeliveryCursors(t *testing.T) {
 
 	// The final saved cursor advanced past the pre-reload position and is a
 	// correct resume point: a fresh process from the same state replays
-	// nothing.
+	// nothing (again with initial_position="head", so 0 lines requires the
+	// cursor).
 	_, cursorAfter, present := senderSent(t, statePath, "my-reader", "out")
 	if !present || cursorAfter == "" {
 		t.Fatalf("state after reload has no cursor (present=%v)", present)
@@ -161,7 +177,7 @@ func TestGoReloadPreservesDeliveryCursors(t *testing.T) {
 	}
 
 	out2 := filepath.Join(t.TempDir(), "out2.jsonl")
-	writeCfg(out2, "head")
+	writeCfg(out2, nil)
 	p2 := startJournalpump(t, configPath)
 	time.Sleep(2 * time.Second)
 	if code := p2.stop(); code != 0 {

@@ -216,7 +216,35 @@ func Open(cfg OpenConfig) (*SDJournal, error) {
 			return fail(sdErr("add match", rc))
 		}
 	}
+	if err := s.RegisterForPoll(); err != nil {
+		return fail(err)
+	}
 	return s, nil
+}
+
+// RegisterForPoll initializes the journal's notification tracking exactly
+// like Python's fd-registration path: python-systemd's Reader.fileno()
+// calls sd_journal_get_fd, which runs sd_journal_process internally and
+// thereby consumes the open-time file-snapshot INVALIDATE before the pump
+// ever sees it (journalpump.py:1177 register_for_poll → fileno()). Without
+// this call a freshly opened reader's first sd_journal_wait manufactures
+// an INVALIDATE that Python never observes, closing and recreating an
+// unchanged journal — and masking it in the run loop would also swallow a
+// genuine rotation occurring before the first wait. Registering here makes
+// both cases behave correctly: an unchanged journal's first wait is NOP,
+// and a real rotation/deletion after the open still reports INVALIDATE.
+//
+// It is exported so the pump can re-register a reader it reopens, but
+// Open already calls it, so callers normally need not.
+func (s *SDJournal) RegisterForPoll() error {
+	rc, err := s.h.getFd()
+	if err != nil {
+		return err
+	}
+	if rc < 0 {
+		return sdErr("journal get fd", rc)
+	}
+	return nil
 }
 
 // applyInitial ports the position block of get_reader
