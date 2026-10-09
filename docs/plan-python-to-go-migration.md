@@ -469,6 +469,14 @@ Acceptance: `make systest-go` green; **Milestone A**: journal→file with
 cursors surviving restart/reload/Python-state handover.
 Depends on: Tasks 17, 10, 11.
 
+Evidence note (review round, 2026-10-10): the Python suite count is NOT
+Go-binary evidence wholesale. Of the Python sweep, only 9 cases spawn the
+Go binary (test_reload 1, test_running_config 7, test_sigterm 1); the 6
+test_harness cases use a stub binary and the 10 test_rotation cases run
+Python journalpump in-process and ignore `JOURNALPUMP_BIN`. The Go-native
+`make systest-go` run (20 top-level tests, `-race`) is the Go delivery
+evidence. See `docs/go-test-parity.md` Task 18.
+
 ## Phase 2 — Syslog + logplex
 
 ### Task 19. Syslog framing package

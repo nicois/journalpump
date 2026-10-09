@@ -1050,34 +1050,76 @@ is resolved here.
 
 ## Task 18 — core systest suites (Milestone A)
 
-Deferred Go-side harness work lands here together with the systest sweep
-that runs the implementation-agnostic Python suites against the Go binary.
+Deferred Go-side harness work lands here together with the systest sweep.
+See "Evidence correction" below for exactly which Python cases spawn the
+Go binary versus stubs or in-process Python.
 
 Go-native suites (driven through the real binary via the Task 10 harness
-in `systest-go/journalpump_process_test.go`; all run under `-race`):
+in `systest-go/journalpump_process_test.go`; all run under `-race`, and
+the child binary itself is built with `-race`, so race reports come from
+the daemon, not just the parent harness):
 
 | Source | Status | Go counterpart |
 |---|---|---|
 | `systest/test_running_config.py` (7 cases) | ported | `TestGoWritesRunningConfig*` (7 tests) |
 | `systest/test_rotation.py` (rotation behavior; Python is in-process/monkeypatched) | Go-idiomatic | `TestGoRotationThirtyMessagesAcrossRotation`, `TestGoRotationBufferLengthBoundaries`, `TestGoRotationBufferBytesBoundaries`, `TestGoRotationCorruptEntrySkip`, `TestGoRotationDeletedFileFdRelease` |
-| `systest/test_reload.py::test_sighup_with_changed_readers_keeps_process_alive` | ported | `TestGoSighupWithChangedReadersKeepsProcessAlive` |
-| `systest/test_sigterm.py` (sitecustomize slow-flush trick is Python-only) | `go-native` (outside the Python parity set; sanctioned deviation D9) | `TestGoSigtermGraceFlushDeliversBufferedTail` asserts the grace-flush window Python does not exhibit; `TestGoCleanShutdownAfterReloads` asserts every goroutine joins and the process exits 0 after repeated SIGHUPs |
-| D3 pair (`systest/test_state_file_interop.py` is the Python side) | ported | `TestGoResumesFromPythonStateFile` (Python-written fixture → Go resume → python3 `json.load` of the Go rewrite) and `TestGoCursorSurvivesRestart` (Go→Go restart) |
+| `systest/test_reload.py::test_sighup_with_changed_readers_keeps_process_alive` | ported | `TestGoSighupWithChangedReadersKeepsProcessAlive`, plus `TestGoReloadPreservesDeliveryCursors` (journal→file delivery survives a changed-reader SIGHUP with no missing/duplicate message and a correct saved cursor) |
+| `systest/test_sigterm.py` (sitecustomize slow-flush trick is Python-only) | `go-native` (outside the Python parity set; sanctioned deviation D9) | `TestGoSigtermGraceFlushDeliversBufferedTail` asserts the grace-flush window Python does not exhibit; `TestGoCleanShutdownAfterReloads` drives CHANGED-reader reloads with initialized workers and asserts the process still exits 0 within the shutdown timeout. It is a shutdown/hang check, NOT a goroutine-leak check (`os.Exit` abandons goroutines regardless of status); the real join/leak assertion is Go-native: `internal/daemon` `TestReloadJoinsRetiredWorkers` (retired reader + sender `done` channels closed after a changed-reader reload) with negative control `TestJoinedWorkerCheckDetectsUnjoined` |
+| D3 pair (`systest/test_state_file_interop.py` is the Python side) | ported | `TestGoResumesFromPythonStateFile` (Python-written fixture → Go resume → real Python `PumpReader` resume reads no remaining messages), `TestGoCursorSurvivesRestart` (Go→Go restart), `TestPythonToGoToPythonRoundTrip` (Python writes an INTERMEDIATE-cursor state with search counters → Go delivers the remaining messages → Python resumes from Go's end cursor and reads the persisted counters) |
 
-The Task 10 Python systest harness now runs against the Go build
-(`JOURNALPUMP_BIN=go make build-go` prerequisite): `test_harness.py`,
-`test_reload.py`, `test_sigterm.py`, `test_running_config.py` (15 passed)
-and `test_rotation.py` (10 passed) all green, so the implementation-agnostic
-suites are proven on both implementations.
+Boundary granularity: `TestReadMessagesHonorsBufferBoundaries`
+(`internal/daemon`) asserts the exact per-chunk admission count and the
+byte-crossing boundary (plus order and complete delivery) against a live
+`buffer.Gate` — the granularity of the Python `_threshold`/`_threshold_bytes`
+suites. The Go systest byte cases are end-to-end only (a file sender has no
+mid-run flush), so they use controlled non-oversized payloads and assert
+ordered complete delivery; they do not pin the per-drain count.
 
-Defect fixed while bringing the reload suite up: the port installed its
-SIGHUP/SIGTERM handlers (`cmd/journalpump/main.go` `newSignals()`) only
-AFTER both startup `READY=1` notifications, so a supervisor reacting to
-readiness (SIGHUP immediately after the first `READY=1`) raced ahead of
-handler installation and the reload was dropped. Python installs its
-handlers in `ServiceDaemon.__init__` (daemon.py:52-54), before main's
-final `READY=1`. The handlers are now installed before the READY loop;
-no operator-visible change, so no §2 entry.
+### Evidence correction (review round)
+
+An earlier revision of the Task 18 ledger row claimed the
+implementation-agnostic Python suites "now run against the Go binary"
+(`test_harness`/`test_reload`/`test_sigterm`/`test_running_config` 15
+passed, `test_rotation` 10 passed, 25 total) as Go delivery evidence.
+That conflated the whole Python suite count with Go-binary passes. What
+actually runs, per case (verified by the reviewer via `/proc/<pid>/exe`
+tracing and re-confirmed here; `JOURNALPUMP_BIN=build/journalpump`):
+
+- 9 cases DO spawn the Go binary: `test_reload.py` (1),
+  `test_running_config.py` (7), `test_sigterm.py` (1).
+- 6 cases (`test_harness.py`) run a deterministic STUB binary
+  (`systest/data/notify_stub.py`), not Go.
+- 10 cases (`test_rotation.py`, 7 functions/10 collected) run the Python
+  journalpump IN PROCESS and ignore `JOURNALPUMP_BIN` entirely; they are
+  Python-implementation evidence only and must not be cited as Go
+  delivery. The Python `test_sigterm.py` case spawns Go but its
+  `PYTHONPATH`/sitecustomize injection is neutralized, so its slow-flush
+  trick has no effect on the Go process. The Go grace-flush behavior is
+  asserted by the Go-native `TestGoSigtermGraceFlushDeliversBufferedTail`.
+
+### Defect fixed (real defect, category 1)
+
+`internal/daemon/pump.go`: on reader recreation the run loop preserved a
+pending INVALIDATE through `maxEvent`, and the first `sd_journal_wait`
+after a fresh open reports INVALIDATE for the open-time file snapshot
+(probe-confirmed) — Python's `register_for_poll` path seeds APPEND and
+never manufactures one (`journalpump.py:1179`). With partial drains this
+repeatedly closed/reopened unchanged journals (reproduced: ~60 s for 30
+messages under a tiny byte buffer). The loop now masks the first
+post-open INVALIDATE (`freshReader`) and the recreate path REPLACES the
+pending event with APPEND instead of maxing it. Regression:
+`TestRunLoopStableJournalIsNotRecreated` (fails on the pre-fix code with
+one spurious invalidation + one extra recreate).
+
+### Signal-install fix (cosmetic, no §2 entry)
+
+The port installed its SIGHUP/SIGTERM handlers (`cmd/journalpump/main.go`
+`newSignals()`) only AFTER both startup `READY=1` notifications, so a
+supervisor reacting to readiness (SIGHUP immediately after the first
+`READY=1`) raced ahead of handler installation and the reload was
+dropped. Python installs its handlers in `ServiceDaemon.__init__`
+(daemon.py:52-54), before main's final `READY=1`. The handlers are now
+installed on the success path before the READY loop.
 
 Test-only shim (not operator-visible): `internal/daemon/pump.go`'s
 `pollInterval` is a `var` so the systest build honors
