@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/xdg-go/scram"
 	"golang.org/x/net/proxy"
 
 	"github.com/Aiven-Open/journalpump/internal/sender"
@@ -229,11 +230,11 @@ func resolveClientConfig(raw map[string]any) (clientConfig, error) {
 		cfg.apiVersion = &ver
 	}
 	if v, present := raw["kafka_address"]; present && v != nil {
-		s, ok := v.(string)
-		if !ok {
-			return cfg, fmt.Errorf("kafka_address: %v is not a string", v)
+		brokers, err := parseBrokers(v)
+		if err != nil {
+			return cfg, err
 		}
-		cfg.brokers = splitBrokers(s)
+		cfg.brokers = brokers
 	}
 	// security_protocol: explicit value (validated) or derived from ssl.
 	if v, present := raw["security_protocol"]; present && truthy(v) {
@@ -349,6 +350,14 @@ func (pc producerConfig) saramaConfig() (*sarama.Config, error) {
 		cfg.Net.SASL.Mechanism = mechanism
 		cfg.Net.SASL.User = pc.saslUsername
 		cfg.Net.SASL.Password = pc.saslPassword
+		// sarama rejects a SCRAM config without a client generator before
+		// it ever dials; supply working xdg-go/scram clients (item B5).
+		switch mechanism {
+		case sarama.SASLTypeSCRAMSHA256:
+			cfg.Net.SASL.SCRAMClientGeneratorFunc = scramClientGenerator(scram.SHA256)
+		case sarama.SASLTypeSCRAMSHA512:
+			cfg.Net.SASL.SCRAMClientGeneratorFunc = scramClientGenerator(scram.SHA512)
+		}
 	}
 	if pc.socks5Proxy != "" {
 		dialer, err := socks5Dialer(pc.socks5Proxy)
@@ -751,15 +760,85 @@ func validSecurityProtocol(name string) bool {
 	}
 }
 
-// splitBrokers splits a kafka_address string into broker addresses.
-func splitBrokers(address string) []string {
-	var out []string
-	for _, part := range strings.Split(address, ",") {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			out = append(out, trimmed)
+// defaultKafkaPort is kafka-python's DEFAULT_KAFKA_PORT
+// (kafka/conn.py); an address without a port uses it.
+const defaultKafkaPort = "9092"
+
+// parseBrokers ports kafka-python's collect_hosts + get_ip_port_afi onto
+// Go: kafka_address may be a comma-separated string or a list, each entry
+// may carry a leading scheme://, hostnames without a port default to
+// 9092, and IPv6 literals may be bracketed ("[::1]:9092") or bare
+// ("::1"). sarama requires host:port, so entries are normalized (review
+// item B6).
+func parseBrokers(value any) ([]string, error) {
+	var entries []string
+	switch v := value.(type) {
+	case string:
+		entries = strings.Split(strings.TrimSpace(v), ",")
+	case []any:
+		for _, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("kafka_address: %v is not a string", e)
+			}
+			entries = append(entries, s)
 		}
+	case []string:
+		entries = v
+	default:
+		return nil, fmt.Errorf("kafka_address: %v is not a string or list", value)
 	}
-	return out
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		host, port, err := normalizeBroker(e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, net.JoinHostPort(host, port))
+	}
+	return out, nil
+}
+
+// normalizeBroker resolves one address entry to a (host, port) pair with
+// the default port applied.
+func normalizeBroker(entry string) (host, port string, err error) {
+	s := strings.TrimSpace(entry)
+	// Strip a leading scheme, mimicking kafka-python's `re.sub('^.*://')`.
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if s == "" {
+		return "", "", errors.New("kafka_address: empty broker entry")
+	}
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end < 0 {
+			return "", "", fmt.Errorf("kafka_address: %q: missing closing bracket", entry)
+		}
+		host = s[1:end]
+		rest := s[end+1:]
+		if rest == "" {
+			return host, defaultKafkaPort, nil
+		}
+		if !strings.HasPrefix(rest, ":") {
+			return "", "", fmt.Errorf("kafka_address: %q: malformed bracketed address", entry)
+		}
+		return host, rest[1:], nil
+	}
+	if !strings.Contains(s, ":") {
+		return s, defaultKafkaPort, nil
+	}
+	// A colon without brackets: an IPv6 literal (with or without a port
+	// that reads as part of the literal) or a host:port pair. kafka-python
+	// tries the whole string as IPv6 first.
+	if net.ParseIP(s) != nil {
+		return s, defaultKafkaPort, nil
+	}
+	host, port, err = net.SplitHostPort(s)
+	if err != nil {
+		return "", "", fmt.Errorf("kafka_address: %q: %w", entry, err)
+	}
+	return host, port, nil
 }
 
 // configString returns a config string value or "" when absent/null. A

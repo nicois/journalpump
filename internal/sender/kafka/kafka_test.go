@@ -151,6 +151,55 @@ func TestClientConfigMultiBrokerAddress(t *testing.T) {
 	}
 }
 
+// TestClientConfigBootstrapAddressForms covers the accepted kafka_address
+// forms: hostnames without a port default to 9092, IPv6 literals work
+// bracketed or bare, entries may carry a scheme prefix, and the value may
+// be a list (review item B6).
+func TestClientConfigBootstrapAddressForms(t *testing.T) {
+	cases := []struct {
+		name  string
+		value any
+		want  []string
+	}{
+		{"hostname no port", "kafka.example.org", []string{"kafka.example.org:9092"}},
+		{"host port", "kafka.example.org:19092", []string{"kafka.example.org:19092"}},
+		{"bracketed ipv6", "[::1]:9092", []string{"[::1]:9092"}},
+		{"bracketed ipv6 no port", "[2001:db8::1]", []string{"[2001:db8::1]:9092"}},
+		{"bare ipv6", "::1", []string{"[::1]:9092"}},
+		{"scheme prefix", "PLAINTEXT://broker:9092", []string{"broker:9092"}},
+		{"mixed csv", "a:9092,b.example.org,[::1]:9092", []string{"a:9092", "b.example.org:9092", "[::1]:9092"}},
+		{"list string values", []any{"a", "b:9092", "[::1]"}, []string{"a:9092", "b:9092", "[::1]:9092"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := baseConfig()
+			raw["kafka_address"] = tc.value
+			cfg, err := resolveClientConfig(raw)
+			if err != nil {
+				t.Fatalf("resolveClientConfig: %v", err)
+			}
+			if len(cfg.brokers) != len(tc.want) {
+				t.Fatalf("brokers = %v, want %v", cfg.brokers, tc.want)
+			}
+			for i := range tc.want {
+				if cfg.brokers[i] != tc.want[i] {
+					t.Errorf("brokers[%d] = %q, want %q", i, cfg.brokers[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestClientConfigRejectsBadBootstrapAddress(t *testing.T) {
+	for _, value := range []any{123, []any{"ok", 5}, "[::1"} {
+		raw := baseConfig()
+		raw["kafka_address"] = value
+		if _, err := resolveClientConfig(raw); err == nil {
+			t.Errorf("kafka_address=%v: want error, got nil", value)
+		}
+	}
+}
+
 func TestClientConfigExplicitSSL(t *testing.T) {
 	raw := baseConfig()
 	raw["security_protocol"] = "SSL"
