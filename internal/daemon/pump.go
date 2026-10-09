@@ -1087,6 +1087,12 @@ var (
 // inject a failure here to exercise that path.
 var runSenderLoop = func(l *sender.Loop, ctx context.Context) error { return l.Run(ctx) }
 
+// graceWaitHook is a test seam invoked at the start of shutdown's grace
+// wait, after the readers are joined and BEFORE the grace timer blocks
+// and the senders are cancelled. nil in production. It lets a test
+// observe "shutdown is parked in its grace window" deterministically.
+var graceWaitHook func()
+
 // Run drives the pump until ctx is done or a component fails: reader
 // goroutines, the per-second housekeeping tick, and the D9 shutdown
 // sequence (spec §4.3): STOPPING notify, reader drain, the sender
@@ -1218,6 +1224,9 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 	grace := p.maxSenderGrace() + sender.TickInterval
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
+	if graceWaitHook != nil {
+		graceWaitHook()
+	}
 	<-timer.C
 
 	// liveSender remembers which reader owns each entry so a flush

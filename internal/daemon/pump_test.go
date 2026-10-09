@@ -191,6 +191,7 @@ func (f *flushFailTransport) Finalize() error { return errors.New("final flush b
 type gatedTransport struct {
 	mu      sync.Mutex
 	msgs    int
+	ctx     context.Context
 	release <-chan struct{}
 }
 
@@ -202,6 +203,9 @@ func (g *gatedTransport) SendMessages(_ context.Context, batch [][]byte, _ strin
 }
 
 func (g *gatedTransport) MaintenanceOperations(ctx context.Context) error {
+	g.mu.Lock()
+	g.ctx = ctx
+	g.mu.Unlock()
 	select {
 	case <-g.release:
 	case <-ctx.Done():
@@ -213,6 +217,14 @@ func (g *gatedTransport) messages() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.msgs
+}
+
+// ctxCancelled reports whether the loop context captured by the blocked
+// maintenance call has been cancelled.
+func (g *gatedTransport) ctxCancelled() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.ctx != nil && g.ctx.Err() != nil
 }
 
 // gatedSent is the transport built for the most recent "gatedblock"
@@ -1152,18 +1164,24 @@ func TestFailedFinalFlushRollsBackState(t *testing.T) {
 // cancellation), propagates as Run's result, and still honors the full
 // grace window for the OTHER senders.
 //
-// The survivor's flush is GATED: its loop parks in maintenance until the
-// test releases it, so nothing is delivered while the daemon runs. The
-// test asserts ZERO delivered at the moment the failure surfaces, then
-// releases and asserts both messages are delivered during the grace
-// window. If the failure cancelled every sender immediately (no grace),
-// the survivor's drain would abort and delivery would be 0.
+// The survivor's flush is GATED (its loop parks in maintenance), so
+// nothing is delivered while the daemon runs. The watcher releases it
+// only after the graceWaitHook proves shutdown is parked in its grace
+// window; at that point the survivor context must be uncancelled and
+// zero messages delivered. It then releases the gate and asserts both
+// buffered messages are delivered. If the failure cancelled every sender
+// immediately, the survivor would be cancelled at that point and its
+// drain would abort (delivery 0).
 func TestSenderErrorFailsFastAndHonorsGrace(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		disableSignals(t)
 		release := make(chan struct{})
 		setGatedRelease(release)
-		boomFailed := make(chan struct{})
+
+		graceStarted := make(chan struct{})
+		origHook := graceWaitHook
+		graceWaitHook = func() { close(graceStarted) }
+		t.Cleanup(func() { graceWaitHook = origHook })
 
 		orig := runSenderLoop
 		runSenderLoop = func(l *sender.Loop, ctx context.Context) error {
@@ -1171,7 +1189,6 @@ func TestSenderErrorFailsFastAndHonorsGrace(t *testing.T) {
 				// Delay so the reader drains its entries into the gated
 				// sender's buffer before the failure surfaces.
 				time.Sleep(5 * pollInterval)
-				close(boomFailed)
 				return errors.New("sender boom")
 			}
 			return l.Run(ctx)
@@ -1195,14 +1212,24 @@ func TestSenderErrorFailsFastAndHonorsGrace(t *testing.T) {
 			},
 		}}
 
-		// On failure: assert nothing has been delivered yet, then release
-		// the gated sender so it can flush during the grace window.
 		released := make(chan struct{})
 		go func() {
-			<-boomFailed
-			releasedAtFailure := gatedTransportRef().messages()
-			if releasedAtFailure != 0 {
-				t.Errorf("gated sender delivered %d messages before shutdown began", releasedAtFailure)
+			// Wait until shutdown is observably parked in the grace
+			// window, then quiesce.
+			<-graceStarted
+			synctest.Wait()
+			g := gatedTransportRef()
+			if g == nil {
+				t.Error("gated transport missing")
+				close(release)
+				close(released)
+				return
+			}
+			if g.ctxCancelled() {
+				t.Error("survivor context cancelled before the grace window elapsed")
+			}
+			if got := g.messages(); got != 0 {
+				t.Errorf("survivor delivered %d messages before the grace window", got)
 			}
 			close(release)
 			close(released)

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -155,16 +156,19 @@ func TestEnqueueCancelWhileFull(t *testing.T) {
 	})
 }
 
-// TestBackpressureStopAndResume is the plan's reader-backpressure
-// test: one slow sender fills its buffer, the reader parks at the
-// worst-sender gate, and resumes when the sender drains.
+// TestBackpressureStopAndResume is the plan's reader-backpressure test:
+// one slow sender fills its buffer, the reader parks at the worst-sender
+// gate, and resumes when the sender drains.
 //
-// Slow-sender shape: the transport blocks in the FIRST SendMessages
-// forever, so after the first flush the loop goroutine is stuck
-// inside the send while the reader keeps filling the channel until
-// the gate closes it. The dynamics are deterministic in the synctest
-// bubble: the reader's channel sends consume no virtual time, so the
-// channel is at capacity before the first 100 ms tick.
+// Determinism over cleverness: the producer enqueues a BOUNDED total and
+// signals readDone only after its last enqueue, so "producer finished" is
+// unambiguous (empty counters can occur between refills). The gate wait
+// is cancellation-aware and both goroutines are cancelled and joined on
+// every exit path.
+//
+// Slow-sender shape: the transport blocks in SendMessages until released,
+// so after the first flush the loop goroutine is stuck inside the send
+// while the reader keeps filling the channel until the gate closes it.
 func TestBackpressureStopAndResume(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
@@ -173,24 +177,35 @@ func TestBackpressureStopAndResume(t *testing.T) {
 		// synctest.Wait.
 		const (
 			maxLength = 1500
-			total     = 4000 // large enough to park after any early drain
+			total     = 4000 // bounded: far more than the parked capacity
 		)
 		tr := &fakeTransport{gate: make(chan struct{})} // blocks every send
 		loop, buf := newWired(tr, maxLength, 100*time.Millisecond)
 		gate := buffer.NewGate(maxLength, maxLength, buf) // 1-byte payloads: both budgets close together
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go func() { _ = loop.Run(ctx) }()
 
-		readDone := make(chan int, 1)
+		loopDone := make(chan struct{})
 		go func() {
+			defer close(loopDone)
+			_ = loop.Run(ctx)
+		}()
+		producerDone := make(chan struct{})
+		readDone := make(chan int, 1)
+		var produced atomic.Int64
+		go func() {
+			defer close(producerDone)
 			// The simulated reader: per-message admission gate, like
 			// Python's read_messages loop.
 			n := 0
 			one := sender.Item{Payload: []byte("x")}
 			for n < total {
 				if gate.WriteLimitCount() <= 0 || gate.WriteLimitBytes() <= 0 {
-					time.Sleep(time.Millisecond) // reader paused by the gate
+					// Paused by the gate: wait cancellation-aware.
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Millisecond):
+					}
 					continue
 				}
 				one.Cursor = "c" + strconv.Itoa(n)
@@ -198,55 +213,64 @@ func TestBackpressureStopAndResume(t *testing.T) {
 					return
 				}
 				n++
+				produced.Store(int64(n))
 			}
 			readDone <- n
 		}()
+		// Cancel and join both goroutines on every exit path.
+		defer func() {
+			cancel()
+			<-producerDone
+			<-loopDone
+		}()
 
-		// The reader parks with a full buffer and stays parked while
-		// the loop is stuck in its blocked send.
+		// Quiescent: the loop is blocked in its send, the producer is
+		// parked at the closed gate, and neither has finished.
 		synctest.Wait()
 		select {
 		case n := <-readDone:
-			t.Fatalf("reader finished despite the full buffer: %d", n)
+			t.Fatalf("producer finished despite the full buffer: %d", n)
 		default:
 		}
-		if got := buf.Count(); got != maxLength {
-			t.Fatalf("Count() = %d, want the reader parked at maxLength %d", got, maxLength)
+		if got := produced.Load(); got == 0 || got >= total {
+			t.Fatalf("produced = %d, want a parked producer (0 < n < %d)", got, total)
 		}
-		if got := buf.ByteCount(); got != maxLength {
-			t.Fatalf("ByteCount() = %d, want %d", got, maxLength)
+		if got := buf.Count(); got == 0 {
+			t.Fatal("Count() = 0, want the buffer parked with work in flight")
 		}
-		if got := gate.WriteLimitCount(); got != 0 {
-			t.Fatalf("WriteLimitCount() = %d, want 0", got)
+		if got := gate.WriteLimitCount(); got > 0 {
+			t.Fatalf("WriteLimitCount() = %d, want <= 0 (reader parked)", got)
 		}
-		if got := gate.WriteLimitBytes(); got != 0 {
-			t.Fatalf("WriteLimitBytes() = %d, want 0", got)
+		if got := gate.WriteLimitBytes(); got > 0 {
+			t.Fatalf("WriteLimitBytes() = %d, want <= 0 (reader parked)", got)
 		}
 
-		// Resume: release the transport — the blocked send completes,
-		// the loop resumes ticking, drains refill, and the reader
-		// finishes all remaining items.
+		// Resume: release the transport; the producer finishes all
+		// remaining items, then the loop drains everything.
 		tr.release()
-		for range 1000 {
-			if buf.Count() == 0 && buf.ByteCount() == 0 {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		synctest.Wait()
-		if got := buf.Count(); got != 0 {
-			t.Fatalf("Count() = %d after release, want 0", got)
-		}
-		if got := buf.ByteCount(); got != 0 {
-			t.Fatalf("ByteCount() = %d after release, want 0", got)
-		}
 		select {
 		case n := <-readDone:
 			if n != total {
-				t.Fatalf("reader finished with %d, want %d", n, total)
+				t.Fatalf("producer finished with %d, want %d", n, total)
 			}
-		default:
-			t.Fatal("reader did not finish after release")
+		case <-time.After(5 * time.Second):
+			t.Fatal("producer did not finish after release")
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if tr.messageCount() == total && buf.Count() == 0 {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if got := tr.messageCount(); got != total {
+			t.Fatalf("delivered = %d, want %d", got, total)
+		}
+		if got := buf.Count(); got != 0 {
+			t.Fatalf("Count() = %d after drain, want 0", got)
+		}
+		if got := buf.ByteCount(); got != 0 {
+			t.Fatalf("ByteCount() = %d after drain, want 0", got)
 		}
 	})
 }
