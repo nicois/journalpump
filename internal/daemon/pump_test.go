@@ -424,10 +424,32 @@ type fakeReader struct {
 	// are consumed, so the reader loop keeps draining like a real journal.
 	firstWait    bool
 	repeatAppend bool
-	closed       bool
+	// invalidateFirst models sd_journal_wait's spurious opening
+	// INVALIDATE: the first wait after an open reports it, then nopPoll
+	// keeps returning NOP (paced by the fake clock) so the loop keeps
+	// iterating over a stable journal.
+	invalidateFirst bool
+	firstDone       bool
+	nopPoll         bool
+	closed          bool
 }
 
 func (r *fakeReader) Wait(ctx context.Context, _ time.Duration) (reader.Event, error) {
+	r.mu.Lock()
+	if r.invalidateFirst && !r.firstDone {
+		r.firstDone = true
+		r.mu.Unlock()
+		return reader.EventInvalidate, nil
+	}
+	r.mu.Unlock()
+	if r.nopPoll {
+		select {
+		case <-time.After(20 * time.Millisecond):
+			return reader.EventNOP, nil
+		case <-ctx.Done():
+			return reader.EventNOP, ctx.Err()
+		}
+	}
 	if r.repeatAppend {
 		r.mu.Lock()
 		done := r.idx >= len(r.entries)
@@ -832,6 +854,122 @@ func TestProcessEnqueues(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// read_messages admission boundaries
+
+// TestReadMessagesHonorsBufferBoundaries ports the granularity of the
+// Python rotation threshold tests (test_journalpump_rotated_files_threshold
+// and _threshold_bytes): the reader admits at most msg_buffer_max_length
+// messages per chunk, and stops AFTER the message that crosses the byte
+// budget (journalpump.py:1027-1042). A test that asserted only eventual
+// delivery would pass if a limit were ignored entirely; these assert the
+// exact admitted count and admission order, and would fail on a broken
+// gate.
+func TestReadMessagesHonorsBufferBoundaries(t *testing.T) {
+	build := func(t *testing.T, maxLength, maxBytes, entries int) (*ReaderRuntime, *buffer.SenderBuffer) {
+		t.Helper()
+		cfg := testPumpConfig(map[string]config.ReaderConfig{
+			"r": fakeReaderConfig(map[string]any{"s": fakeSenderConfig()}),
+		})
+		_, rt := newTestRuntime(t, cfg, &captureLog{})
+		// Inject a live sender whose loop never drains, so the buffer
+		// occupancy (and therefore the gate) is observable in place.
+		buf := buffer.NewSenderBuffer("s", maxLength)
+		loop := sender.NewLoop(sender.LoopConfig{Name: "s", Tags: map[string]string{}}, sender.Instance{}, buf.Chan())
+		buf.Attach(loop)
+		rt.mu.Lock()
+		rt.senders["s"] = &senderEntry{name: "s", loop: loop, buffer: buf}
+		rt.senderOrder = append(rt.senderOrder, "s")
+		rt.mu.Unlock()
+		rt.gate = buffer.NewGate(maxLength, maxBytes, buf)
+		rt.msgBufferMaxBytes = maxBytes
+
+		items := make([]journal.Entry, 0, entries)
+		for i := 0; i < entries; i++ {
+			items = append(items, journal.Entry{
+				Cursor: fmt.Sprintf("c%d", i),
+				Fields: []journal.Field{{Key: "MESSAGE", Value: fmt.Sprintf("message-%02d", i)}},
+			})
+		}
+		rt.journaldReader = &fakeReader{entries: items}
+		return rt, buf
+	}
+
+	t.Run("length limit admits exactly the configured count in order", func(t *testing.T) {
+		rt, buf := build(t, 3, buffer.DefaultMsgBufferMaxBytes, 10)
+		exhausted, lines, err := rt.readMessages(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exhausted {
+			t.Error("exhausted = true, want false (a full buffer pauses, it does not exhaust)")
+		}
+		if lines != 3 {
+			t.Fatalf("admitted %d messages, want 3 (10 if the limit were ignored)", lines)
+		}
+		var got []string
+		for buf.Count() > 0 {
+			got = append(got, (<-buf.Chan()).Cursor)
+		}
+		if want := []string{"c0", "c1", "c2"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("admitted cursors = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a limit above the backlog admits everything, in order", func(t *testing.T) {
+		rt, _ := build(t, 100, buffer.DefaultMsgBufferMaxBytes, 10)
+		exhausted, lines, err := rt.readMessages(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !exhausted {
+			t.Error("exhausted = false, want true (backlog fully drained)")
+		}
+		if lines != 10 {
+			t.Fatalf("admitted %d messages, want 10", lines)
+		}
+	})
+
+	t.Run("byte limit admits up to and including the crossing message", func(t *testing.T) {
+		// Measure one serialized payload first (all entries are equal).
+		rt, buf := build(t, 1000, buffer.DefaultMsgBufferMaxBytes, 6)
+		_, lines, err := rt.readMessages(context.Background())
+		if err != nil || lines != 6 {
+			t.Fatalf("measure run: lines=%d err=%v, want 6", lines, err)
+		}
+		var sizes []int
+		for buf.Count() > 0 {
+			sizes = append(sizes, len((<-buf.Chan()).Payload))
+		}
+		if len(sizes) != 6 {
+			t.Fatalf("measured %d payloads, want 6", len(sizes))
+		}
+		p := sizes[0]
+		for _, s := range sizes {
+			if s != p {
+				t.Fatalf("payload sizes differ: %v", sizes)
+			}
+		}
+
+		cases := []struct {
+			budget int
+			want   int
+		}{
+			{p, 1}, {p - 1, 1}, {2 * p, 2}, {2*p - 1, 2}, {3 * p, 3}, {3*p + 1, 4},
+		}
+		for _, tc := range cases {
+			rt, _ := build(t, 1000, tc.budget, 6)
+			_, got, err := rt.readMessages(context.Background())
+			if err != nil {
+				t.Fatalf("budget %d: %v", tc.budget, err)
+			}
+			if got != tc.want {
+				t.Errorf("budget %d (payload %d): admitted %d, want %d", tc.budget, p, got, tc.want)
+			}
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // state
 
 // TestBuildState locks the state_to_save shape: cursor, search hits,
@@ -922,6 +1060,55 @@ func TestRunLoopAndShutdownGrace(t *testing.T) {
 		}
 		if got := transport.messages(); got != 2 {
 			t.Errorf("flushed messages = %d, want 2 (grace-window final flush)", got)
+		}
+	})
+}
+
+// TestRunLoopStableJournalIsNotRecreated is the regression for the
+// spurious opening INVALIDATE: sd_journal_wait's first call after an
+// open reports INVALIDATE for the open-time file snapshot, which would
+// close and recreate an unchanged journal every iteration. Python's
+// register_for_poll seeds APPEND and only consults process() once the fd
+// is pollable, so a stable journal is never recreated. Before the fix
+// this test saw invalidated >= 1 and ensureCalls > 1.
+func TestRunLoopStableJournalIsNotRecreated(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+		_, rt := newTestRuntime(t, cfg, &captureLog{})
+
+		fr := &fakeReader{
+			invalidateFirst: true,
+			nopPoll:         true,
+			entries: []journal.Entry{
+				{Cursor: "c1", Fields: []journal.Field{{Key: "MESSAGE", Value: "a"}}},
+				{Cursor: "c2", Fields: []journal.Field{{Key: "MESSAGE", Value: "b"}}},
+				{Cursor: "c3", Fields: []journal.Field{{Key: "MESSAGE", Value: "c"}}},
+			},
+		}
+		src := &fakeSource{reader: fr}
+		rt.reopener = src
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- rt.run(ctx) }()
+
+		synctest.Wait()
+		// Several iterations: open, drain, and idle waits.
+		time.Sleep(10 * pollInterval)
+		synctest.Wait()
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("run returned %v, want nil on cancellation", err)
+		}
+
+		if src.invalidated != 0 {
+			t.Errorf("recreated a stable journal %d time(s), want 0 (spurious opening INVALIDATE not masked)", src.invalidated)
+		}
+		if src.ensureCalls != 1 {
+			t.Errorf("Ensure calls = %d, want 1 (no reopen of a stable journal)", src.ensureCalls)
+		}
+		if got := rt.currentCursor(); got != "c3" {
+			t.Errorf("cursor = %q, want c3 (backlog drained exactly once)", got)
 		}
 	})
 }

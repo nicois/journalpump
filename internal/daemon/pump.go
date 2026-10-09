@@ -504,7 +504,14 @@ type ReaderRuntime struct {
 	// run state (single goroutine).
 	journaldReader reader.Reader
 	pending        reader.Event
-	readyFlag      bool // Python _is_ready
+	// freshReader marks a reader that was (re)opened but has not yet
+	// completed a wait cycle. The first sd_journal_wait after an open
+	// reports INVALIDATE for the open-time file snapshot; Python's
+	// register_for_poll path never manufactures one (it seeds the
+	// buffered event with APPEND and only consults process() once the fd
+	// is pollable). run() masks that one spurious INVALIDATE.
+	freshReader bool
+	readyFlag   bool // Python _is_ready
 
 	// goroutine lifecycle, set by startReader: cancelRun cancels this
 	// reader's context (a reload retire) and done closes when run returns.
@@ -988,6 +995,18 @@ func (rt *ReaderRuntime) run(ctx context.Context) error {
 				}
 				return err
 			}
+			if rt.freshReader {
+				// The opening wait's INVALIDATE reflects the file
+				// snapshot taken at open time, not a real rotation;
+				// Python never sees it (register_for_poll seeds APPEND
+				// and process() is only consulted once the fd is
+				// pollable). Treat the opening event as an append so a
+				// stable journal is not closed and recreated forever.
+				if evt == reader.EventInvalidate {
+					evt = reader.EventAppend
+				}
+				rt.freshReader = false
+			}
 			rt.pending = maxEvent(rt.pending, evt)
 		} else {
 			if err := sleepCtx(ctx, pollInterval); err != nil {
@@ -1064,7 +1083,13 @@ func (rt *ReaderRuntime) updateStatus(ctx context.Context) error {
 			if ctx.Err() == nil {
 				rt.initSenders() // get_reader tail: initialize_senders LAST
 			}
-			rt.pending = maxEvent(rt.pending, reader.EventAppend)
+			// Python's register_for_poll REPLACES the buffered event with
+			// APPEND for a newly registered reader
+			// (buffered_events[reader] = journal.APPEND,
+			// journalpump.py:1177-1179) — it does NOT keep a stale
+			// INVALIDATE, which would re-close the reader just opened.
+			rt.pending = reader.EventAppend
+			rt.freshReader = true
 		}
 	}
 

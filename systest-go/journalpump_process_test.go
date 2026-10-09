@@ -25,6 +25,10 @@ import (
 // used by every systest suite. Built once in TestMain.
 var goBinaryPath string
 
+// raceExitCode is the exit status the Go race runtime uses on a detected
+// race (runtime.raceExitCode).
+const raceExitCode = 66
+
 // TestMain builds the systest-tagged binary once (the files-available
 // shim is compiled in behind JOURNALPUMP_FILES_AVAILABLE, like the
 // Python harness's sitecustomize patch) and runs the suites.
@@ -40,7 +44,11 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "repo root: %v\n", err)
 		os.Exit(1)
 	}
-	build := exec.Command("go", "build", "-tags", "systest", "-o", goBinaryPath, "./cmd/journalpump")
+	// Built with -race so the systest-go race claims instrument the child
+	// daemon, not just the parent harness. A race in the child makes it exit
+	// with raceExitCode (66) and prints "WARNING: DATA RACE"; stop() turns
+	// either into a test failure.
+	build := exec.Command("go", "build", "-race", "-tags", "systest", "-o", goBinaryPath, "./cmd/journalpump")
 	build.Dir = repoRoot
 	build.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
 	if out, err := build.CombinedOutput(); err != nil {
@@ -251,6 +259,9 @@ func (p *journalpumpProcess) stop() int {
 		}
 		if p.cmd.ProcessState != nil {
 			code = p.cmd.ProcessState.ExitCode()
+		}
+		if code == raceExitCode || strings.Contains(p.stderr.String(), "WARNING: DATA RACE") {
+			p.t.Errorf("child daemon reported a data race (exit %d); stderr:\n%s", code, p.stderr.String())
 		}
 	})
 	return code

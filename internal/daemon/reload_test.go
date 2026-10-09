@@ -669,6 +669,125 @@ type reloadBoomError struct{}
 
 func (*reloadBoomError) Error() string { return "config load boom" }
 
+// workerJoined reports whether a worker lifecycle channel is closed — the
+// "is this goroutine actually joined?" check used by the reload leak tests.
+// A closed channel means the worker finished; an open one means it is still
+// running (a leak, or an unjoined retire).
+func workerJoined(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+// TestJoinedWorkerCheckDetectsUnjoined verifies the leak assertion itself is
+// not vacuous: workerJoined must report false for a still-open lifecycle
+// channel and true once it is closed. Without this negative control a test
+// that merely asserts workerJoined twice would pass even if the helper always
+// returned true.
+func TestJoinedWorkerCheckDetectsUnjoined(t *testing.T) {
+	open := make(chan struct{})
+	if workerJoined(open) {
+		t.Fatal("workerJoined reported a running worker as joined")
+	}
+	close(open)
+	if !workerJoined(open) {
+		t.Fatal("workerJoined reported a finished worker as unjoined")
+	}
+}
+
+// TestReloadJoinsRetiredWorkers is the lifecycle-leak assertion the binary
+// systest cannot make (os.Exit abandons goroutines regardless of exit status).
+// It drives a CHANGED-reader SIGHUP reload through the real Run loop with an
+// already-initialized reader+sender, then asserts the retired reader's run
+// goroutine and every one of its sender loops have been joined (their done
+// channels closed) before Run reports the reload complete.
+func TestReloadJoinsRetiredWorkers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		disableSignals(t)
+		registerFakeSenders()
+		overrideReopener(t)
+
+		initial := decodeConfig(t, `{"readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`)
+		updated := decodeConfig(t, `{"readers":{"r2":{"senders":{"s":{"output_type":"fake"}}}}}`)
+
+		var statCalls int
+		t0 := time.Now()
+		p, err := NewPump(initial, PumpDeps{
+			Log:        &captureLog{},
+			Notifier:   &fakeNotifier{},
+			ConfigPath: filepath.Join(t.TempDir(), "config.json"),
+			StatConfig: func(string) (time.Time, error) {
+				statCalls++
+				if statCalls <= 1 {
+					return t0, nil
+				}
+				return t0.Add(time.Hour), nil
+			},
+			LoadConfig: func(string) (*config.Config, error) { return updated, nil },
+			ReadState:  func(string) (*state.State, error) { return stateWithCursor("r2", "s", "cur9"), nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		hup := make(chan os.Signal, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- p.Run(ctx, hup) }()
+
+		// Let the r1 reader open and initialize its sender: without this the
+		// changed-reader reload has no running worker to join and the test
+		// would pass vacuously.
+		time.Sleep(2 * pollInterval)
+		synctest.Wait()
+
+		old := p.readers[0]
+		if old.name != "r1" {
+			t.Fatalf("initial reader = %q, want r1", old.name)
+		}
+		if workerJoined(old.done) {
+			t.Fatal("r1 reader goroutine already finished before reload; test would not exercise joining")
+		}
+		old.mu.Lock()
+		oldEntries := make([]*senderEntry, 0, len(old.senders))
+		for _, e := range old.senders {
+			oldEntries = append(oldEntries, e)
+		}
+		old.mu.Unlock()
+		if len(oldEntries) == 0 {
+			t.Fatal("r1 sender was never initialized; cannot test worker joining")
+		}
+
+		hup <- syscall.SIGHUP
+		synctest.Wait()
+
+		if len(p.readers) != 1 || p.readers[0].name != "r2" {
+			t.Fatalf("readers after reload = %v, want [r2]", readerNames(p.readers))
+		}
+		if !workerJoined(old.done) {
+			t.Errorf("retired r1 reader goroutine not joined after reload")
+		}
+		for _, e := range oldEntries {
+			if !workerJoined(e.done) {
+				t.Errorf("retired r1 sender loop %q not joined after reload", e.name)
+			}
+		}
+
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("Run did not return")
+		}
+	})
+}
+
 // readerNames lists the reader names for diagnostics.
 func readerNames(readers []*ReaderRuntime) []string {
 	names := make([]string, 0, len(readers))

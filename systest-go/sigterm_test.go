@@ -8,6 +8,7 @@
 package systestgo
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,27 +59,63 @@ func TestGoSigtermGraceFlushDeliversBufferedTail(t *testing.T) {
 }
 
 // TestGoCleanShutdownAfterReloads exercises the Task 17 acceptance
-// "no leaked goroutines on exit (errgroup wait verified)": after several
-// SIGHUP reloads the process must still join every goroutine and exit 0
-// within the shutdown timeout, rather than hang.
+// "clean shutdown after reloads" with CHANGED-reader reloads: each SIGHUP
+// replaces the reader (new name), so the previous reader and its already
+// initialized sender goroutines must be retired and joined before the new
+// ones start. The process must then still exit 0 within the shutdown
+// timeout rather than hang. This is a shutdown/hang check, not a
+// goroutine-leak check: os.Exit abandons any remaining goroutines
+// regardless of exit status, so the real leak assertion lives in the
+// Go-native daemon test (TestReloadJoinsRetiredWorkers). The child is
+// built with -race, and stop() fails the test on a detected race.
 func TestGoCleanShutdownAfterReloads(t *testing.T) {
 	logs := stageJournals(t, "rotated_logs")
-	out := filepath.Join(t.TempDir(), "out.jsonl")
-	config := journalConfig(logs, out, "", nil)
-	configPath := writeConfig(t, t.TempDir(), config)
-	p := startJournalpump(t, configPath)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.jsonl")
+	configPath := filepath.Join(dir, "config.json")
 
-	// Each SIGHUP only reloads when the config file's ctime changed
-	// (daemon.py's guard), so touch the file before every reload.
-	for range 3 {
-		data, err := os.ReadFile(configPath)
+	namedReaderConfig := func(name string) map[string]any {
+		return map[string]any{
+			"readers": map[string]any{
+				name: map[string]any{
+					"journal_path":     logs,
+					"initial_position": "head",
+					"senders": map[string]any{
+						"out": map[string]any{
+							"output_type": "file",
+							"file_output": out,
+							// Pad past the file sender's buffer so the
+							// replaced reader's sender has flushed a line
+							// before the next reload retires it.
+							"extra_field_values": map[string]any{"PADDING": strings.Repeat("x", 131088)},
+						},
+					},
+				},
+			},
+		}
+	}
+	write := func(name string) {
+		data, err := json.Marshal(namedReaderConfig(name))
 		if err != nil {
-			t.Fatalf("read config: %v", err)
+			t.Fatalf("marshal config: %v", err)
 		}
 		if err := os.WriteFile(configPath, data, 0o644); err != nil {
-			t.Fatalf("touch config: %v", err)
+			t.Fatalf("write config: %v", err)
 		}
+	}
+	write("reader-1")
+	p := startJournalpump(t, configPath)
+	// Let reader-1 open its journal and initialize its sender before the
+	// first replacement: a changed-reader reload only exercises retirement
+	// if the old reader has live workers to join.
+	waitForAtLeast(t, out, 1, 5*time.Second)
+
+	for _, name := range []string{"reader-2", "reader-3", "reader-4"} {
+		write(name)
 		p.reload()
+		// Give the replacement reader time to initialize its sender so the
+		// next reload retires a live worker set too.
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	if code := p.stop(); code != 0 {

@@ -257,6 +257,21 @@ func assertMessageSet(t *testing.T, got, want []string) {
 	}
 }
 
+// assertMessageOrder asserts the delivered messages equal want in order —
+// a reordered delivery (a broken admission/drain sequence) passes the
+// set-based assertion above but fails here.
+func assertMessageOrder(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("delivered %d messages, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("message %d = %q, want %q (out of order)", i, got[i], want[i])
+		}
+	}
+}
+
 func messageRange(lo, hi int) []string {
 	out := make([]string, 0, hi-lo)
 	for i := lo; i < hi; i++ {
@@ -309,20 +324,48 @@ func TestGoRotationBufferLengthBoundaries(t *testing.T) {
 			if code := p.stop(); code != 0 {
 				t.Fatalf("exit status = %d, want 0; stderr:\n%s", code, p.stderr.String())
 			}
-			assertMessageSet(t, outputMessages(t, out), messageRange(0, 30))
+			// Ordered, not just set-equal: a broken admission/drain
+			// sequence that reorders messages must fail here.
+			assertMessageOrder(t, outputMessages(t, out), messageRange(0, 30))
 		})
 	}
 }
 
+// bufferBytesPadding sizes each output line to ~600 bytes so that a
+// msg_buffer_max_bytes budget of 50 admits exactly one message and 1000
+// admits exactly two (ceil(B/P) ≈ 1 and 2, the Python suite's
+// size/num_messages pairs). The previous value (rotatePadding, 100000)
+// made every message exceed BOTH budgets, collapsing the two cases into
+// one oversized-message admission.
+const bufferBytesPadding = 200
+
 // TestGoRotationBufferBytesBoundaries ports
-// test_journalpump_rotated_files_threshold_bytes: a byte-limited buffer
-// still delivers all 30 rotated messages.
+// test_journalpump_rotated_files_threshold_bytes: byte-limited buffers of
+// 50 (one message per drain) and 1000 (two per drain) still deliver all
+// 30 rotated messages, in order and without loss. The EXACT per-drain
+// admission boundary is asserted byte-for-byte by the in-process test
+// TestReadMessagesHonorsBufferBoundaries (internal/daemon): a
+// file-sender systest observes only end-to-end output, so an
+// end-to-end test alone cannot pin the boundary counts.
 func TestGoRotationBufferBytesBoundaries(t *testing.T) {
-	for _, size := range []int{50, 1000} {
-		t.Run(fmt.Sprintf("max_bytes_%d", size), func(t *testing.T) {
+	for _, tc := range []struct {
+		size        int
+		numMessages int
+	}{{50, 1}, {1000, 2}} {
+		t.Run(fmt.Sprintf("max_bytes_%d_%d_messages", tc.size, tc.numMessages), func(t *testing.T) {
 			logs := t.TempDir()
 			out := filepath.Join(t.TempDir(), "out.jsonl")
-			config := journalConfig(logs, out, "", map[string]any{"msg_buffer_max_bytes": size})
+			statePath := filepath.Join(t.TempDir(), "state.json")
+			config := journalConfig(logs, out, statePath, map[string]any{"msg_buffer_max_bytes": tc.size})
+			// Replace the oversized default padding with a controlled size
+			// that keeps both byte budgets non-degenerate (the Python
+			// suite's 50→1 and 1000→2 message pairs). Small lines never
+			// fill the file sender's 128 KiB buffer and it has no mid-run
+			// flush, so delivery is observed via the state file's
+			// sent.count and asserted after SIGTERM flushes the tail.
+			sender := config["readers"].(map[string]any)["my-reader"].(map[string]any)["senders"].(map[string]any)["out"].(map[string]any)
+			sender["extra_field_values"] = map[string]any{"PADDING": strings.Repeat("x", bufferBytesPadding)}
+
 			p := startJournalpump(t, writeConfig(t, t.TempDir(), config))
 			r := newRotator(t, logs, "rotated_logs")
 			r.rotate()
@@ -330,11 +373,23 @@ func TestGoRotationBufferBytesBoundaries(t *testing.T) {
 			r.rotate()
 			r.rotate()
 			time.Sleep(rotateSettle)
-			waitForAtLeast(t, out, 29, 150*time.Second)
+
+			// Wait until the byte-gated reader has actually drained all 30
+			// messages into the sender (recorded by the periodic state save).
+			deadline := time.Now().Add(90 * time.Second)
+			for {
+				if n, ok := stateSentCountMaybe(statePath, "my-reader", "out"); ok && n >= 30 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("reader did not deliver 30 messages under max_bytes=%d; stderr:\n%s", tc.size, p.stderr.String())
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
 			if code := p.stop(); code != 0 {
 				t.Fatalf("exit status = %d, want 0; stderr:\n%s", code, p.stderr.String())
 			}
-			assertMessageSet(t, outputMessages(t, out), messageRange(0, 30))
+			assertMessageOrder(t, outputMessages(t, out), messageRange(0, 30))
 		})
 	}
 }
