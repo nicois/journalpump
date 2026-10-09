@@ -290,6 +290,12 @@ func assertGoldenReader(t *testing.T, cfg *Config) {
 	if len(reader.Searches) != 2 || reader.Searches[1].(map[string]any)["name"] != "ips" {
 		t.Errorf("searches = %v", reader.Searches)
 	}
+	// Tag key order is captured from the raw JSON: search 0 has no
+	// "tags" object (nil row), search 1 declares {"geo": ...}.
+	wantTagOrder := [][]string{nil, {"geo"}}
+	if !reflect.DeepEqual(reader.SearchTagOrder, wantTagOrder) {
+		t.Errorf("SearchTagOrder = %v want %v", reader.SearchTagOrder, wantTagOrder)
+	}
 	if len(reader.SecretFilters) != 1 || reader.SecretFilters[0].Pattern != "AVNS_[A-Za-z0-9-_]{15,123}" ||
 		reader.SecretFilters[0].Replacement != "[REDACTED]" {
 		t.Errorf("secret_filters = %+v", reader.SecretFilters)
@@ -383,6 +389,37 @@ func TestDecodeIgnoresUnknownKeys(t *testing.T) {
 	sender := cfg.Readers["r"].Senders["s"].(map[string]any)
 	if sender["future_sender_key"] != int64(2) {
 		t.Error("unknown sender key dropped")
+	}
+}
+
+// TestCaptureSearchTagOrder locks the raw-JSON tag-order capture that
+// keeps perform_searches' config-order callable evaluation working
+// (encoding/json's map decode discards key order; Python's json.load
+// preserves it, journalpump.py:629-634).
+func TestCaptureSearchTagOrder(t *testing.T) {
+	t.Parallel()
+	cfg := mustDecode(t, `{
+        "readers": {
+            "r": {
+                "searches": [
+                    {"name": "no-tags"},
+                    {"name": "ordered", "tags": {"zeta": "1", "alpha": "ip_to_geohash(zeta,5)", "mid": "2"}},
+                    {"name": "tags-not-object", "tags": ["x"]}
+                ],
+                "senders": {}
+            },
+            "other": {"senders": {}}
+        }
+    }`)
+	// Rows exist only for searches that DECLARE a tags object (the
+	// capture pads up to the declaring index); shorter rows mean the
+	// order is unknown and NewSearches falls back to sorted keys.
+	want := [][]string{nil, {"zeta", "alpha", "mid"}}
+	if got := cfg.Readers["r"].SearchTagOrder; !reflect.DeepEqual(got, want) {
+		t.Errorf("r.SearchTagOrder = %v want %v", got, want)
+	}
+	if cfg.Readers["other"].SearchTagOrder != nil {
+		t.Errorf("other.SearchTagOrder = %v want nil", cfg.Readers["other"].SearchTagOrder)
 	}
 }
 

@@ -254,6 +254,69 @@ func TestPerformSearches(t *testing.T) {
 	})
 }
 
+// TestTagCallablesRunInConfigOrder locks the Python visibility rule:
+// perform_searches evaluates the tags dict in config order
+// (journalpump.py:629-634), so a callable whose args[0] names an earlier
+// static tag sees that value — and when the same search's tags run in
+// the reverse order, the earlier tag is not yet set (Python KeyError →
+// sanctioned crash-free "").
+func TestTagCallablesRunInConfigOrder(t *testing.T) {
+	t.Parallel()
+	newSearcher := func(t *testing.T, tagOrder []string) (*recordingStats, *filter.Searcher) {
+		t.Helper()
+		searches, err := filter.NewSearches([]any{
+			map[string]any{
+				"name":   "s",
+				"fields": map[string]any{"MESSAGE": `ip`},
+				"tags": map[string]any{
+					"gateway": "10.0.0.1",
+					"geo":     "ip_to_geohash(gateway,5)",
+				},
+			},
+		}, tagOrder)
+		if err != nil {
+			t.Fatalf("NewSearches: %v", err)
+		}
+		stats := &recordingStats{}
+		searcher, err := filter.NewSearcher(searches, 0.001, stats, tagged.New(map[string]string{"reader": "r"}), nil,
+			map[string]filter.TagFunc{
+				"ip_to_geohash": func(tags map[string]string, args []string) string {
+					return "geo:" + tags[args[0]]
+				},
+			})
+		if err != nil {
+			t.Fatalf("NewSearcher: %v", err)
+		}
+		return stats, searcher
+	}
+
+	t.Run("document order sees the earlier tag", func(t *testing.T) {
+		t.Parallel()
+		stats, searcher := newSearcher(t, []string{"gateway", "geo"})
+		if !searcher.PerformSearches(map[string]any{"MESSAGE": "ip"}) {
+			t.Fatal("want match")
+		}
+		// The callable produced "geo:10.0.0.1"; the metrics path
+		// sanitizes ":" (unsafe value class) to "_".
+		if got := stats.increases[0].tags["geo"]; got != "geo_10.0.0.1" {
+			t.Errorf("geo tag = %q want geo_10.0.0.1", got)
+		}
+	})
+
+	t.Run("reverse order loses visibility like Python", func(t *testing.T) {
+		t.Parallel()
+		stats, searcher := newSearcher(t, []string{"geo", "gateway"})
+		if !searcher.PerformSearches(map[string]any{"MESSAGE": "ip"}) {
+			t.Fatal("want match")
+		}
+		// The callable produced "geo:"; sanitization drops the trailing
+		// run of unsafe characters (Python: strip of the same class).
+		if got := stats.increases[0].tags["geo"]; got != "geo" {
+			t.Errorf("geo tag = %q want geo (gateway not set yet)", got)
+		}
+	})
+}
+
 // TestPerformSearchesSlowRegex locks the slow-regex gauge: a search
 // slower than threshold_for_metric_emit emits
 // journal.perform_search_regex_duration with the regex pattern tag.

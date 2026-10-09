@@ -28,6 +28,11 @@ var base32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 // errInvalidLatitude mirrors Python's ValueError("invalid latitude.").
 var errInvalidLatitude = errors.New("invalid latitude.") //nolint:staticcheck,revive // error-strings: mirrors Python's exact ValueError("invalid latitude.") text
 
+// errInvalidLongitude is Go-native: Python's longitude failure path is
+// the message-less `assert o is not None` AssertionError in
+// _float_hex_to_int (only NaN longitude reaches it).
+var errInvalidLongitude = errors.New("invalid longitude")
+
 // floatHexToInt ports geohash.py:_float_hex_to_int for f in [-1, 1).
 // Python computes it from float.hex()'s "0x1.<13 hex digits>p<exp>"
 // rendering; for a normal double that is exactly the 52-bit mantissa and
@@ -54,6 +59,13 @@ func floatHexToInt(f float64) (r *big.Int, bits int, ok bool) {
 	if biased == 0 {
 		// Subnormal: Python's float.hex has no "0x1." here and its assert
 		// raises AssertionError. See the doc comment.
+		return nil, 0, false
+	}
+	if biased == 0x7FF {
+		// NaN (±Inf never reaches here: the |f| >= 1 range checks reject
+		// it first). NaN fails every Python comparison too, float.hex(NaN)
+		// is "nan" with no "0x1.", and the assert raises — the Go port
+		// reports not-ok instead of computing a negative shift.
 		return nil, 0, false
 	}
 	exp := biased - 1023
@@ -128,13 +140,18 @@ func Encode(latitude, longitude float64, precision int) (string, error) {
 
 	a, aBits, ok := floatHexToInt(latitude / 90.0)
 	if !ok {
-		// Python: AssertionError on the subnormal assert; unreachable for
-		// normal latitudes (latitude/90 underflows to 0.0 below ~1e-321).
-		return "", errors.New("invalid latitude.") //nolint:staticcheck,revive // error-strings: Python-parity message
+		// Python: AssertionError from the subnormal/NaN float.hex assert;
+		// normal latitudes never get here (latitude/90 underflows to 0.0
+		// below ~1e-321). Go reports the latitude error instead of
+		// crashing (sanctioned crash-free tolerance).
+		return "", errInvalidLatitude
 	}
 	o, oBits, ok := floatHexToInt(longitude / 180.0)
 	if !ok {
-		return "", errors.New("invalid longitude.") //nolint:staticcheck,revive // error-strings: Python-parity message family
+		// Python: `assert o is not None` — a message-less AssertionError
+		// (NaN longitude is the only reachable input). The Go error text
+		// is Go-native; callers degrade to an empty tag either way.
+		return "", errInvalidLongitude
 	}
 
 	ai := new(big.Int)

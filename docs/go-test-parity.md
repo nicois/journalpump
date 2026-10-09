@@ -153,13 +153,39 @@ values with the real Python encoder → `geoip_expectations.json`.
 | `geoip_database` .mmdb loading at config time | ported | `geoip.Open` (oschwald/geoip2-golang/v2, same .mmdb format); open failures surface at load like Python's Reader() construction |
 
 Deviations and notes:
-- **Crash-free ip_to_geohash failure paths (sanctioned, charter §2)**:
-  Python raises mid-run for every failure mode — `int(precision)`
-  ValueError, missing tag KeyError, geoip2 AddressValueError (invalid IP
-  string), AddressNotFoundError (IP not in the DB), AttributeError when
-  a record has NO location object (`loc.latitude` on None), and
-  geohash's ValueError for out-of-range coordinates. Go returns "" for
-  all of them (empty tag, processing continues).
+- **Crash-free ip_to_geohash failure paths (sanctioned, charter §2 —
+  user decision 2026-10-09, Task 6 review, extending the runtime
+  entry-value tolerance)**: Python raises mid-run for every failure
+  mode — `int(precision)` ValueError, missing tag KeyError, geoip2
+  AddressValueError (invalid IP string), AddressNotFoundError (IP not
+  in the DB), AttributeError when a record has NO location object
+  (`loc.latitude` on None), and geohash's ValueError for out-of-range
+  coordinates. The DIVERGENCE IS NOT JUST THE ERROR HANDLING: Python's
+  `read_single_message` (journalpump.py:1011-1018) catches those
+  exceptions at the read-loop boundary, logs "Unexpected exception
+  while handling entry for %s", emits `stats.unexpected_exception`,
+  sleeps 0.5 s and DROPS the entry; Go returns "" for the geohash tag
+  and FORWARDS the entry (whose search still matches, so the hit
+  counter and the increase metric fire). Forwarded-with-empty-tag vs
+  dropped-with-unexpected-exception is the user-approved delta.
+- **Precision parsing deltas** (`int(args[1])` vs `strconv.Atoi`):
+  Python int() accepts underscores ("1_0" == 10) and
+  arbitrary-precision literals; Atoi rejects both, so those configs
+  return "" in Go where Python geohashes (with precision 10, or an
+  absurdly large precision). Ordinary "5"-style args parse identically.
+- **Reload quirk (replicate, do not fix)**: Python's handle_new_config
+  (journalpump.py:957-965) never resets `self.geoip` — a reloaded
+  config that omits `geoip_database` keeps the previous database open
+  across reloads, forever. The Task 16/17 pump wiring must do the same.
+- **Tag callable evaluation order — no deviation**: Python evaluates
+  the tags dict in config document order (journalpump.py:629-634);
+  encoding/json's map decode discards key order, so the config layer
+  captures it from the raw JSON (a token walk →
+  `ReaderConfig.SearchTagOrder`) and `PerformSearches` iterates the
+  ordered tag list, keeping earlier tags visible to later callables.
+  Documents without captured order (synthetic test maps) fall back to
+  sorted keys — deterministic, and not parity-relevant because they
+  never come from a real config file.
 - **No-DB behavior is Python-faithful, not "fixed"**: `geoip_database`
   unconfigured → Python returns "" (the config keeps working with empty
   geohash tags) and Go does the same (`self.geoip is None`

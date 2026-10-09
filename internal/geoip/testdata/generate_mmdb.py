@@ -58,13 +58,28 @@ CASES = [
 ]
 
 
+class PinnedEpochWriter(mmdb.MMDBWriter):
+    """MMDBWriter._build_meta stamps int(time.time()); overriding it pins
+    the metadata epoch so regeneration is byte-reproducible."""
+
+    BUILD_EPOCH = 1700000000
+
+    def __init__(self) -> None:
+        super().__init__(
+            ip_version=4,
+            database_type="GeoLite2-City",
+            languages=["en"],
+            description={"en": "journalpump Go-port test database"},
+        )
+
+    def _build_meta(self) -> dict:
+        meta = super()._build_meta()
+        meta["build_epoch"] = self.BUILD_EPOCH
+        return meta
+
+
 def main() -> None:
-    writer = mmdb.MMDBWriter(
-        ip_version=4,
-        database_type="GeoLite2-City",
-        languages=["en"],
-        description={"en": "journalpump Go-port test database"},
-    )
+    writer = PinnedEpochWriter()
     for network, content in NETWORKS:
         writer.insert_network(network, content)
     out = pathlib.Path(__file__).parent

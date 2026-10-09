@@ -864,6 +864,42 @@
   "error": "ValueError: invalid latitude."
  },
  {
+  "lat": "NaN",
+  "lon": 0.0,
+  "precision": 8,
+  "error": "AssertionError: "
+ },
+ {
+  "lat": "NaN",
+  "lon": 4.8975,
+  "precision": 8,
+  "error": "AssertionError: "
+ },
+ {
+  "lat": "NaN",
+  "lon": 179.999999,
+  "precision": 8,
+  "error": "AssertionError: "
+ },
+ {
+  "lat": "NaN",
+  "lon": 180.0,
+  "precision": 8,
+  "error": "AssertionError: "
+ },
+ {
+  "lat": "NaN",
+  "lon": -180.0001,
+  "precision": 8,
+  "error": "AssertionError: "
+ },
+ {
+  "lat": "NaN",
+  "lon": 540.0,
+  "precision": 8,
+  "error": "AssertionError: "
+ },
+ {
   "lat": 52.3759,
   "lon": 0.0,
   "precision": 8,
@@ -976,6 +1012,12 @@
   "lon": 123.456789,
   "precision": 8,
   "geohash": "y9rccqdr"
+ },
+ {
+  "lat": 52.3759,
+  "lon": "NaN",
+  "precision": 8,
+  "error": "AssertionError: "
  },
  {
   "lat": 52.3759,
@@ -1300,5 +1342,11 @@
   "lon": 4.8975,
   "precision": 8,
   "error": "ValueError: invalid latitude."
+ },
+ {
+  "lat": "NaN",
+  "lon": 4.8975,
+  "precision": 8,
+  "error": "AssertionError: "
  }
 ]

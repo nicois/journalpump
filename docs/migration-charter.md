@@ -131,7 +131,16 @@ NEWS entry — plan Task 28):
   unit) are tolerated by Go — the value is left untouched or the field
   does not match, and processing continues. User decision (2026-10-09,
   Task 5 review): sanctioned crash-free deviation. NEWS-recorded
-  (Task 28).
+  (Task 28). EXTENDED (user decision, 2026-10-09, Task 6 review) to the
+  ip_to_geohash failure paths (`int(precision)` ValueError, missing tag
+  KeyError, geoip2 AddressValueError/AddressNotFoundError, AttributeError
+  on a record without location, geohash's ValueError): Go degrades to an
+  empty geohash tag and FORWARDS the entry, where Python's
+  read_single_message (journalpump.py:1011-1018) catches, logs
+  "Unexpected exception while handling entry for %s", emits
+  stats.unexpected_exception, sleeps 0.5 s and DROPS the entry —
+  forwarded-with-empty-tag vs dropped-with-unexpected-exception is the
+  sanctioned delta.
 - Regex warn-and-disable policy: secret-filter patterns that are
   Python-valid but use constructs RE2 cannot compile (backreferences,
   lookarounds, atomic groups, possessive quantifiers, `{,n}`, `\Z`,

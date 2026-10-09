@@ -14,7 +14,7 @@ import (
 // Python either crashed mid-run on these or (for the few truthiness-coerced
 // keys) silently ignored them — both are covered by the typed-decoding
 // deviation (spec §6.1a).
-func newConfig(raw map[string]any) (*Config, error) {
+func newConfig(raw map[string]any, searchTagOrders map[string][][]string) (*Config, error) {
 	cfg := &Config{
 		raw:         raw,
 		Tags:        map[string]string{},
@@ -58,7 +58,7 @@ func newConfig(raw map[string]any) (*Config, error) {
 	if cfg.UnitLogLevels, err = decodeUnitLogLevels(raw); err != nil {
 		return nil, err
 	}
-	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw); err != nil {
+	if cfg.Readers, cfg.readersBlob, err = decodeReaders(raw, searchTagOrders); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -245,7 +245,7 @@ func decodeUnitLogLevels(raw map[string]any) (map[string][]UnitLogLevelEntry, er
 	return levels, nil
 }
 
-func decodeReaders(raw map[string]any) (map[string]ReaderConfig, map[string]any, error) {
+func decodeReaders(raw map[string]any, searchTagOrders map[string][][]string) (map[string]ReaderConfig, map[string]any, error) {
 	readers := map[string]ReaderConfig{}
 	value, ok := raw["readers"]
 	if !ok {
@@ -261,7 +261,7 @@ func decodeReaders(raw map[string]any) (map[string]ReaderConfig, map[string]any,
 		if !ok {
 			return nil, nil, fmt.Errorf("readers.%s: must be an object", name)
 		}
-		reader, err := decodeReader(name, entry)
+		reader, err := decodeReader(name, entry, searchTagOrders[name])
 		if err != nil {
 			return nil, nil, err
 		}
@@ -270,7 +270,7 @@ func decodeReaders(raw map[string]any) (map[string]ReaderConfig, map[string]any,
 	return readers, blob, nil
 }
 
-func decodeReader(name string, entry map[string]any) (ReaderConfig, error) {
+func decodeReader(name string, entry map[string]any, searchTagOrder [][]string) (ReaderConfig, error) {
 	reader := ReaderConfig{Name: name}
 	var err error
 	if reader.JournalFlagNames, reader.JournalFlagsInt, err = decodeJournalFlags(entry, name); err != nil {
@@ -297,6 +297,7 @@ func decodeReader(name string, entry map[string]any) (ReaderConfig, error) {
 	if reader.Searches, err = decodeSearches(entry, name); err != nil {
 		return reader, err
 	}
+	reader.SearchTagOrder = searchTagOrder
 	if reader.SecretFilters, err = decodeSecretFilters(entry, name); err != nil {
 		return reader, err
 	}

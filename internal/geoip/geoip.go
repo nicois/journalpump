@@ -24,6 +24,12 @@ import (
 
 // DB wraps one open MaxMind .mmdb reader. The zero value / nil *DB is
 // the "geoip_database not configured" state (Python: self.geoip None).
+//
+// Reload quirk (note for the Task 16/17 pump wiring): Python's
+// handle_new_config (journalpump.py:957-965) only ever SETS self.geoip —
+// a new config that omits geoip_database keeps the PREVIOUS database
+// open across reloads, forever. The wiring must replicate that (replace
+// the DB only when the new config configures one), not "fix" it.
 type DB struct {
 	reader *geoip2.Reader
 }
@@ -66,8 +72,12 @@ func (db *DB) IPToGeohash(tags map[string]string, args []string) string {
 	}
 	precision := 8
 	if len(args) > 1 {
-		// The tag-function regex constrains args to [a-z0-9_,]+, so
-		// Atoi's acceptance matches Python int()'s here.
+		// Parity delta: Python int() also accepts underscores ("1_0" ==
+		// 10) and arbitrary-precision literals, which Atoi rejects — the
+		// Go callable returns "" where Python would geohash with
+		// precision 10 (or an absurdly large one). The tag-function regex
+		// constrains args to [a-z0-9_,]+, so ordinary configs ("5") parse
+		// identically; only underscore/novel-literal configs diverge.
 		parsed, err := strconv.Atoi(args[1])
 		if err != nil {
 			// Python: int(args[1]) raises ValueError mid-run.

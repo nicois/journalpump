@@ -137,6 +137,14 @@ type ReaderConfig struct {
 	// Searches is the raw parsed search list; compiled by internal/filter
 	// (Task 5) and the tag callables (Task 6). Empty means no searches.
 	Searches []any
+	// SearchTagOrder holds, per search index, the document-order keys of
+	// the search's "tags" object. encoding/json's map decoding discards
+	// key order, but Python's perform_searches evaluates tag callables
+	// in config order (journalpump.py:629-634) so earlier tags must stay
+	// visible to later callables; the order is captured from the raw
+	// JSON by captureSearchTagOrders. Nil rows mean the order is unknown
+	// (no "tags" object, or a synthetic document).
+	SearchTagOrder [][]string
 	// SecretFilters is the validated structure only; regexes compile in
 	// internal/filter (Task 5).
 	SecretFilters          []SecretFilterConfig
@@ -308,7 +316,9 @@ func Decode(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("parsing journalpump.json: extra data after the JSON document")
 	}
 	normalizeNumbers(raw)
-	return newConfig(raw)
+	// The tag order must come from the raw bytes: the typed map decode
+	// below discards object key order (see captureSearchTagOrders).
+	return newConfig(raw, captureSearchTagOrders(data))
 }
 
 // isIntegerLiteral reports whether the JSON number literal has no fraction

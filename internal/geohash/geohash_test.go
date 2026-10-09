@@ -7,6 +7,8 @@ package geohash_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"os"
 	"testing"
 
@@ -15,12 +17,28 @@ import (
 
 // goldenCase is one row of geohash_golden.json, produced by running the
 // REAL journalpump.geohash.encode (see testdata/generate_golden.py).
+// Lat/Lon are `any`: NaN inputs arrive as the string "NaN" (bare NaN is
+// not valid JSON for the Go decoder).
 type goldenCase struct {
-	Lat       float64 `json:"lat"`
-	Lon       float64 `json:"lon"`
-	Precision int     `json:"precision"`
-	Geohash   string  `json:"geohash,omitempty"`
-	Error     string  `json:"error,omitempty"`
+	Lat       any    `json:"lat"`
+	Lon       any    `json:"lon"`
+	Precision int    `json:"precision"`
+	Geohash   string `json:"geohash,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func toFloat(t *testing.T, v any) float64 {
+	t.Helper()
+	switch typed := v.(type) {
+	case float64:
+		return typed
+	case string:
+		if typed == "NaN" {
+			return math.NaN()
+		}
+	}
+	t.Fatalf("unexpected coordinate value %v", v)
+	return 0
 }
 
 func loadGolden(t *testing.T) []goldenCase {
@@ -45,20 +63,21 @@ func TestEncodeGolden(t *testing.T) {
 	t.Parallel()
 	for _, tc := range loadGolden(t) {
 		tc := tc
-		t.Run("", func(t *testing.T) {
+		t.Run(fmt.Sprintf("lat=%v lon=%v prec=%d", tc.Lat, tc.Lon, tc.Precision), func(t *testing.T) {
 			t.Parallel()
-			got, err := geohash.Encode(tc.Lat, tc.Lon, tc.Precision)
+			lat, lon := toFloat(t, tc.Lat), toFloat(t, tc.Lon)
+			got, err := geohash.Encode(lat, lon, tc.Precision)
 			if tc.Error != "" {
 				if err == nil {
-					t.Fatalf("lat=%v lon=%v precision=%d: want error %q, got %q", tc.Lat, tc.Lon, tc.Precision, tc.Error, got)
+					t.Fatalf("lat=%v lon=%v precision=%d: want error %q, got %q", lat, lon, tc.Precision, tc.Error, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("lat=%v lon=%v precision=%d: %v", tc.Lat, tc.Lon, tc.Precision, err)
+				t.Fatalf("lat=%v lon=%v precision=%d: %v", lat, lon, tc.Precision, err)
 			}
 			if got != tc.Geohash {
-				t.Errorf("lat=%v lon=%v precision=%d: got %q want %q", tc.Lat, tc.Lon, tc.Precision, got, tc.Geohash)
+				t.Errorf("lat=%v lon=%v precision=%d: got %q want %q", lat, lon, tc.Precision, got, tc.Geohash)
 			}
 		})
 	}

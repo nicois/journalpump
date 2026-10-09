@@ -53,8 +53,15 @@ type Search struct {
 	// non-MESSAGE fields first, then MESSAGE last (Python's dict
 	// insertion order after the sorted rebuild, journalpump.py:520-524).
 	fields []searchField
-	// tags holds static tag values and tag function calls.
-	tags map[string]searchTag
+	// tags holds static tag values and tag function calls in CONFIG
+	// DOCUMENT order (Python's dict insertion order — perform_searches
+	// evaluates them in that order, journalpump.py:629-634, so a callable
+	// whose args name an earlier tag must see the earlier value). The
+	// order arrives from the config layer (ReaderConfig.SearchTagOrder,
+	// captured from the raw JSON); without it the fallback order is
+	// sorted, which is deterministic but only parity-faithful for
+	// synthetic documents.
+	tags []searchTag
 	// hits mirrors search["hits"] (journalpump.py:639): a mutable
 	// counter used by the state file. Only the reader's goroutine
 	// touches it.
@@ -67,8 +74,9 @@ type searchField struct {
 }
 
 // searchTag is either a static string value or a parsed tag function
-// call.
+// call, together with the tag name it populates.
 type searchTag struct {
+	name     string
 	static   string
 	funcName string
 	args     []string
@@ -85,10 +93,18 @@ type searchTag struct {
 // parsed config, so Python's running-config dump includes "tags" and
 // "fields" keys the config never had; the Go port does not mutate the
 // parsed document (sanctioned deviation, recorded in the parity doc).
-func NewSearches(searches []any) ([]*Search, error) {
+// NewSearches compiles the raw searches configuration. The optional
+// tagOrders arguments carry, per search index, the document-order tag
+// keys captured by the config layer (ReaderConfig.SearchTagOrder);
+// without them the tag order falls back to sorted keys.
+func NewSearches(searches []any, tagOrders ...[]string) ([]*Search, error) {
 	result := make([]*Search, 0, len(searches))
-	for _, raw := range searches {
-		search, err := newSearch(raw)
+	for i, raw := range searches {
+		var tagOrder []string
+		if len(tagOrders) > i {
+			tagOrder = tagOrders[i]
+		}
+		search, err := newSearch(raw, tagOrder)
 		if err != nil {
 			return nil, err
 		}
@@ -97,7 +113,7 @@ func NewSearches(searches []any) ([]*Search, error) {
 	return result, nil
 }
 
-func newSearch(raw any) (*Search, error) {
+func newSearch(raw any, tagOrder []string) (*Search, error) {
 	search, ok := raw.(map[string]any)
 	if !ok {
 		return nil, errors.New("searches: each search must be an object")
@@ -161,8 +177,30 @@ func newSearch(raw any) (*Search, error) {
 			return nil, fmt.Errorf("search %s: tags must be an object", pythonRepr(name))
 		}
 	}
-	tags := make(map[string]searchTag, len(rawTags))
-	for tag, value := range rawTags {
+	// Build the tag list in document order when the config layer
+	// captured it; keys missing from rawTags (inconsistent input) are
+	// skipped, and keys absent from tagOrder fall back to sorted order
+	// so the result is always deterministic.
+	orderedKeys := make([]string, 0, len(rawTags))
+	seen := map[string]bool{}
+	for _, tag := range tagOrder {
+		if _, ok := rawTags[tag]; ok && !seen[tag] {
+			orderedKeys = append(orderedKeys, tag)
+			seen[tag] = true
+		}
+	}
+	remaining := make([]string, 0, len(rawTags))
+	for tag := range rawTags {
+		if !seen[tag] {
+			remaining = append(remaining, tag)
+		}
+	}
+	sort.Strings(remaining)
+	orderedKeys = append(orderedKeys, remaining...)
+
+	tags := make([]searchTag, 0, len(rawTags))
+	for _, tag := range orderedKeys {
+		value := rawTags[tag]
 		text, ok := value.(string)
 		if !ok {
 			// Python: `"(" in value` raises TypeError for non-strings at
@@ -180,10 +218,10 @@ func newSearch(raw any) (*Search, error) {
 			}
 			argsText := match[tagFuncRe.SubexpIndex("args")]
 			args := strings.Split(argsText, ",")
-			tags[tag] = searchTag{funcName: funcName, args: args}
+			tags = append(tags, searchTag{name: tag, funcName: funcName, args: args})
 			continue
 		}
-		tags[tag] = searchTag{static: text}
+		tags = append(tags, searchTag{name: tag, static: text})
 	}
 
 	return &Search{name: name, fields: fields, tags: tags}, nil
@@ -329,14 +367,16 @@ func (s *Searcher) PerformSearches(entry map[string]any) bool {
 		if !allMatch {
 			continue
 		}
-		// Add static tags + possible callables (journalpump.py:629-634).
-		for tag, spec := range search.tags {
+		// Add static tags + possible callables (journalpump.py:629-634),
+		// in config document order so a callable whose args name an
+		// earlier tag sees the value Python would see.
+		for _, spec := range search.tags {
 			if spec.funcName != "" {
 				// Construction guaranteed the callable is wired.
-				tags[tag] = s.tagFuncs[spec.funcName](tags, spec.args)
+				tags[spec.name] = s.tagFuncs[spec.funcName](tags, spec.args)
 				continue
 			}
-			tags[tag] = spec.static
+			tags[spec.name] = spec.static
 		}
 		if s.stats != nil {
 			s.stats.Increase(search.name, s.tagged.MakeTags(tags))
