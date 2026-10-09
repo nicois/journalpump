@@ -10,11 +10,43 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/Aiven-Open/journalpump/internal/journal"
 )
 
 const pythonFixture = "testdata/state_python_written.json"
+
+// rawString renders a Go string as raw JSON bytes (for constructing
+// states in Go; the decoder stores decoded values verbatim).
+func rawString(s string) json.RawMessage {
+	return json.RawMessage(journal.PythonJSONString(s))
+}
+
+// rawInt renders an int64 as raw JSON bytes.
+func rawInt(n int64) json.RawMessage {
+	return json.RawMessage(strconv.FormatInt(n, 10))
+}
+
+// parsedEqual compares two JSON documents as PARSED structures
+// (encoding/json maps/slices), never as bytes: the Go writers emit
+// Go-native key order that is nondeterministic across writes (user
+// decision 2026-10-09, charter §2), so no test may assert a
+// Go-written file's key order.
+func parsedEqual(t *testing.T, got, want []byte) bool {
+	t.Helper()
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("parsing got document: %v", err)
+	}
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("parsing want document: %v", err)
+	}
+	return reflect.DeepEqual(gotValue, wantValue)
+}
 
 // quirkStateFile is hand-crafted: the senders object lists zulu before
 // alpha, so the file key order is NOT the sorted order Python's
@@ -137,10 +169,14 @@ func TestReadPythonFixture(t *testing.T) {
 	}
 }
 
-// TestWriteRoundTripByteIdentical proves the Go writer is byte-faithful
-// with Python's json.dump(indent=4, sort_keys=True): re-writing the
-// decoded Python fixture reproduces the original file exactly.
-func TestWriteRoundTripByteIdentical(t *testing.T) {
+// TestWriteRoundTripParsedEqual proves the Go writer preserves the
+// Python fixture's parsed document: re-writing the decoded Python
+// fixture produces a file whose parsed structure equals the original's.
+// The bytes are Go-native (sanctioned deviation, user decision
+// 2026-10-09 — charter §2): key order is Go map iteration order,
+// strings are raw UTF-8 instead of ensure_ascii, floats render
+// Go-style — so the comparison is deliberately order-independent.
+func TestWriteRoundTripParsedEqual(t *testing.T) {
 	t.Parallel()
 	state, err := Read(pythonFixture)
 	if err != nil {
@@ -158,8 +194,16 @@ func TestWriteRoundTripByteIdentical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	if string(got) != string(want) {
-		t.Fatalf("rewrite differs from Python fixture\ngot:\n%s\nwant:\n%s", got, want)
+	if !parsedEqual(t, got, want) {
+		t.Fatalf("rewrite parses differently than the Python fixture\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	// Optional export for the permanent Python interop test
+	// (test/test_state_file_interop.py): it json.loads this rewrite and
+	// asserts Python-side parsed equality with the fixture.
+	if out := os.Getenv("STATE_REWRITE_OUT"); out != "" {
+		if err := os.WriteFile(out, got, 0o600); err != nil {
+			t.Fatalf("WriteFile(%s): %v", out, err)
+		}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -172,11 +216,15 @@ func TestWriteRoundTripByteIdentical(t *testing.T) {
 	}
 }
 
-// TestWriteGolden asserts the Go-written fixture byte-for-byte (the
-// committed file is what the permanent Python interop test
-// test/test_state_file_interop.py reads). Regenerate with:
-// UPDATE_STATE_GOLDEN=1 go test ./internal/state/
-func TestWriteGolden(t *testing.T) {
+// TestWriteParsedRoundTrip locks the Go-written state file's SEMANTIC
+// contract, order-independently (user decision 2026-10-09 — charter §2):
+// the fresh write parses exactly like the committed Go-written artifact
+// (test/test_state_file_interop.py reads it), and the file re-reads to
+// the same logical state with senders keyed by name — no assertion may
+// depend on the written key order, which is Go map iteration order
+// (nondeterministic across writes). Regenerate the committed interop
+// artifact with: UPDATE_STATE_GOLDEN=1 go test ./internal/state/
+func TestWriteParsedRoundTrip(t *testing.T) {
 	t.Parallel()
 	cursorPrimary := "cursor=primary-1"
 	cursorBackup := "cursor=backup-2"
@@ -190,9 +238,9 @@ func TestWriteGolden(t *testing.T) {
 					"zeta":  rawInt(3),
 					"alpha": rawInt(10),
 				},
-				// Deliberately NON-sorted in-memory order: the writer
-				// sorts on disk (sort_keys=True) and the health errors
-				// list keeps its order (lists are not sorted).
+				// Deliberately NON-sorted in-memory order: the writer does
+				// not sort anything (Go-native key order on disk) and the
+				// health errors list keeps its order (lists are lists).
 				Senders: []NamedSenderState{
 					{
 						Name: "kafka_backup",
@@ -240,26 +288,97 @@ func TestWriteGolden(t *testing.T) {
 		t.Logf("updated %s", goldenPath)
 		return
 	}
+	// The committed artifact (consumed by the permanent Python interop
+	// test) must parse exactly like a fresh write of the same state —
+	// compared as parsed structures, never as bytes or key order.
 	want, err := os.ReadFile(goldenPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v (regenerate with UPDATE_STATE_GOLDEN=1 go test ./internal/state/)", err)
 	}
-	if string(got) != string(want) {
-		t.Fatalf("Go-written state differs from committed golden\ngot:\n%s\nwant:\n%s", got, want)
+	if !parsedEqual(t, got, want) {
+		t.Fatalf("Go-written state parses differently from the committed interop artifact\ngot:\n%s\nwant:\n%s", got, want)
 	}
 
-	// The Go-written file must re-read identically (the sender order on
-	// disk is sorted, so the decoded order follows the file).
-	decoded, err := Read(goldenPath)
+	// Semantic round trip: the fresh write re-reads to the same logical
+	// state. Sender file order on disk is nondeterministic, so compare
+	// keyed by name — only the resume quirk's DECODE side cares about
+	// file order, and it reads whatever order the file holds.
+	decoded, err := Read(path)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	senders := decoded.Readers["reader_two"].Senders
-	if senders[0].Name != "kafka_backup" || senders[1].Name != "kafka_primary" {
-		t.Errorf("decoded sender order = [%s, %s]", senders[0].Name, senders[1].Name)
+	verifyWrittenReaderState(t, decoded, cursorPrimary, cursorBackup, bufferCursor)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
 	}
-	if errs := senders[0].State.Health.Errors; len(errs) != 2 || errs[0] != "connection reset été" {
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", info.Mode().Perm())
+	}
+}
+
+// verifyWrittenReaderState asserts the decoded round trip of the state
+// built in TestWriteParsedRoundTrip, order-independently: senders are
+// compared keyed by name (their file order on disk is nondeterministic),
+// everything else field by field.
+func verifyWrittenReaderState(t *testing.T, decoded *State, cursorPrimary, cursorBackup, bufferCursor string) {
+	t.Helper()
+	reader := decoded.Readers["reader_two"]
+	if reader == nil {
+		t.Fatalf("reader_two missing: %+v", decoded.Readers)
+	}
+	if reader.Cursor == nil || *reader.Cursor != cursorPrimary {
+		t.Errorf("cursor = %v", reader.Cursor)
+	}
+	if got := string(reader.Searches["zeta"]); got != "3" {
+		t.Errorf("search zeta = %s, want 3", got)
+	}
+	if got := string(reader.Searches["alpha"]); got != "10" {
+		t.Errorf("search alpha = %s, want 10", got)
+	}
+	if got := string(reader.TotalLines); got != "42" {
+		t.Errorf("total_lines = %s, want 42", got)
+	}
+	if got := string(reader.TotalBytes); got != "84" {
+		t.Errorf("total_bytes = %s, want 84", got)
+	}
+	if got := string(decoded.StartTime); got != `"2026-10-09T13:00:00.000000"` {
+		t.Errorf("start_time = %s", got)
+	}
+	byName := make(map[string]SenderState, len(reader.Senders))
+	for _, sender := range reader.Senders {
+		byName[sender.Name] = sender.State
+	}
+	if len(byName) != 2 {
+		t.Fatalf("senders = %v, want kafka_backup + kafka_primary", byName)
+	}
+	backup := byName["kafka_backup"]
+	if backup.Sent.Cursor == nil || *backup.Sent.Cursor != cursorBackup ||
+		backup.Sent.Count != 7 || backup.Sent.Bytes != 65_536 {
+		t.Errorf("backup sent = %+v", backup.Sent)
+	}
+	if backup.Health.Status != "connected" || backup.Health.Elapsed != 3.5 {
+		t.Errorf("backup health = %+v", backup.Health)
+	}
+	// Lists keep their order (only object keys are order-free).
+	if errs := backup.Health.Errors; len(errs) != 2 || errs[0] != "connection reset été" || errs[1] != "first error stays" {
 		t.Errorf("errors order = %q (lists must keep their order)", errs)
+	}
+	if got := string(backup.Buffer.Cursor); got != `"`+bufferCursor+`"` {
+		t.Errorf("buffer cursor = %s", got)
+	}
+	if backup.Buffer.TotalSize != 4096 || backup.Buffer.EntryNum != 9 || backup.Buffer.CurrentQueue != 2 {
+		t.Errorf("backup buffer = %+v", backup.Buffer)
+	}
+	primary := byName["kafka_primary"]
+	if primary.Sent.Cursor != nil {
+		t.Errorf("primary sent cursor = %v, want nil", primary.Sent.Cursor)
+	}
+	if primary.Health.Status != "stale" || primary.Health.Elapsed != 0 {
+		t.Errorf("primary health = %+v", primary.Health)
+	}
+	if primary.Type != "LogSender" || backup.Type != "LogSender" {
+		t.Errorf("types = %q, %q", primary.Type, backup.Type)
 	}
 }
 
@@ -537,9 +656,10 @@ func TestDuplicateSendersKeyReplacesWholeObject(t *testing.T) {
 
 // TestLenientWriteOnlyFieldsRoundTrip: the write-only fields decode
 // leniently (Python never reads them back) and the writer re-emits the
-// decoded raw bytes verbatim, so unusual values survive a Go
-// read/write cycle unchanged — Go must not refuse state files Python
-// accepts.
+// decoded raw values (the encoder inlines RawMessage verbatim — the
+// scalars tested here survive byte-for-byte), so unusual values survive
+// a Go read/write cycle unchanged — Go must not refuse state files
+// Python accepts.
 func TestLenientWriteOnlyFieldsRoundTrip(t *testing.T) {
 	t.Parallel()
 	file := `{

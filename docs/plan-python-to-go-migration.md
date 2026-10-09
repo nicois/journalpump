@@ -145,10 +145,16 @@ health/errors`, totals, `start_time`; atomic tmp+rename; 10 s cadence;
 read+write. **Ordered decode**: the per-reader `senders` object is parsed
 with `json.Decoder` token streaming into ordered `(name, cursor)` pairs —
 resume semantics depend on state-file KEY ORDER (`journalpump.py:890`)
-and `encoding/json` into a map would discard it. **Sorted encode**: the
-Go writer emits alphabetically sorted keys, matching Python's
-`json.dump(..., sort_keys=True)` (`journalpump.py:1070`), so the file is
-byte-faithful in both directions.
+and `encoding/json` into a map would discard it. **Encode (amended,
+user decision 2026-10-09 — charter §2)**: originally the writer emitted
+alphabetically sorted keys byte-faithful to Python's
+`json.dump(..., sort_keys=True)` (`journalpump.py:1070`); per the
+governing principle sort_keys is over-prescription, so the writer now
+uses Go 1.27's `encoding/json/v2` with Go-native key order — the
+compatibility contract is the PARSED document, no test asserts a
+Go-written file's key ordering, and the ordered decode above is
+unchanged (the resume quirk reads the file's key order whatever it
+is).
 Acceptance: reads a Python-written state file; a Go-written state file is
 readable by Python — locked permanently, not one-off.
 Tests: round-trip tests against a committed Python-generated fixture; a
@@ -536,12 +542,17 @@ wrong-typed config values are rejected at load where Python crashed
 mid-run — extended (user decision, Task 3 review) to values Python
 silently coerced or truthiness-tested: numeric strings/floats for integer
 keys, non-string values for string keys, boolean/float tag values,
-readers: null** (thread A17); **sanctioned deviation: the running-config
-dump is parsed-JSON-equal to Python's json.dump(sort_keys=True) but not
-byte-identical — float rendering (60.0 → "60", 1e-05 → "0.00001",
-1e+20 → "100000000000000000000") and
-non-ASCII emitted as raw UTF-8 instead of ensure_ascii \uXXXX** (user
-decision, Task 3 review); **sanctioned deviation: runtime tolerance of
+readers: null** (thread A17); **sanctioned deviation: the state-file and
+running-config writers use Go 1.27's `encoding/json/v2` encoder — the
+parsed document stays equal to Python's `json.dump(indent=4,
+sort_keys=True)` output, but the bytes are Go-native: object key order
+follows Go map iteration (NOT sorted and NOT deterministic across
+writes; nothing may assume an ordering in Go-written files), floats
+render Go-style (60.0 → "60", 1e-05 → "0.00001",
+1e+20 → "100000000000000000000"), and non-ASCII is raw UTF-8 instead of
+ensure_ascii \uXXXX; the resume-cursor quirk is unaffected because
+reading walks the file's key order in both implementations** (user
+decision, 2026-10-09, extending the Task 3 review decision); **sanctioned deviation: runtime tolerance of
 malformed entry values — values that crash Python mid-run (truthy
 non-string MESSAGE in the secret-filter/apply paths, float/exotic search
 field values, non-numeric PRIORITY, non-string unit) are tolerated: the

@@ -23,22 +23,28 @@ Source: `test/test_running_config.py` (5 tests), `systest/test_running_config.py
 | test_running_config_path_configured_wins | ported | same subtest as above (configured path is asserted against a set RUNTIME_DIRECTORY) |
 | test_running_config_path_unset | ported | `TestRunningConfigPath/both unset` |
 | test_write_running_config_warns_when_path_set_without_enable | ported | `TestWriteRunningConfigSkips/path set without enable warns` (asserts the exact Python warning text) |
-| systest: writes to runtime directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/sorted full document with modes` (content bytes, file 0600, dir 0700) + `TestWriteRunningConfigRuntimeDirectory` (RUNTIME_DIRECTORY fallback); the spawn-based cases are delivered by the Python systest harness (Task 10 rework, JOURNALPUMP_BIN selection) and the Go binary runs them once its run loop lands (Task 18) |
+| systest: writes to runtime directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/full parsed document with modes` (parsed-equality, file 0600, dir 0700) + `TestWriteRunningConfigRuntimeDirectory` (RUNTIME_DIRECTORY fallback); the spawn-based cases are delivered by the Python systest harness (Task 10 rework, JOURNALPUMP_BIN selection) and the Go binary runs them once its run loop lands (Task 18) |
 | systest: with secret filters | Go-idiomatic (unit level here) | raw-document preservation incl. `secret_filters` covered by `TestDecodeGoldenFullConfig` + `TestDecodeIgnoresUnknownKeys`; spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
 | systest: no write without opt-in | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/not enabled and no path is silent` (no file created) |
 | systest: no write from path alone | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/path set without enable warns` (no write); spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
 | systest: no write when enabled without path | Go-idiomatic (unit level here) | `TestWriteRunningConfigSkips/enabled without path warns` |
-| systest: writes to configured path (modes 0600/0700) | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/sorted full document with modes`; spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
+| systest: writes to configured path (modes 0600/0700) | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/full parsed document with modes`; spawn-based case in the Task 10 Python systest harness (Go runs it in Task 18) |
 | systest: does not chmod existing directory | Go-idiomatic (unit level here) | `TestWriteRunningConfigWrites/existing directory is not chmodded` |
 
-Recorded deviation (user decision, Task 3 review; NEWS in plan Task 28):
-the running-config dump is parsed-JSON-equal to Python's
-`json.dump(..., sort_keys=True)` but **not byte-identical** — Go renders
-floats like 60.0 as "60", 1e-05 as "0.00001", and 1e+20 as
-"100000000000000000000" (Python: "60.0", "1e-05", "1e+20"), and emits
-non-ASCII as raw UTF-8 where Python's `ensure_ascii=True` writes \uXXXX.
-All parity assertions above compare parsed JSON, so none of them depend
-on the byte-level difference.
+Recorded deviation (user decision, 2026-10-09, extending the Task 3
+review decision; NEWS in plan Task 28): the running-config writer —
+like the state-file writer — uses Go 1.27's `encoding/json/v2`
+encoder. The output is parsed-JSON-equal to Python's
+`json.dump(..., sort_keys=True)` but **not byte-identical**: object key
+order is Go-native (map iteration order — NOT sorted and NOT
+deterministic across writes, so no test may assert a Go-written file's
+key ordering and all comparisons are parsed-structure comparisons),
+Python's 4-space json.dump layout is kept, floats render Go-native
+(60.0 as "60", 1e-05 as "0.00001", 1e+20 as
+"100000000000000000000"; Python: "60.0", "1e-05", "1e+20"), and
+non-ASCII is raw UTF-8 where Python's `ensure_ascii=True` writes
+\uXXXX. All parity assertions above compare parsed JSON, so none of
+them depend on the byte-level difference.
 
 ## Task 4 — journal entry model, converters, JSON serialization
 
@@ -297,15 +303,31 @@ pinned monotonic clock), the Go-written fixture
 (`state_go_written.json`) is read by the permanent pytest
 `test/test_state_file_interop.py`.
 
-- **Byte-faithful in both directions, proven**: `TestWriteRoundTripByteIdentical`
-  re-writes the decoded Python fixture and asserts byte-identity — the Go
-  writer reproduces `json.dump(state, fp, indent=4, sort_keys=True)`
-  exactly: every object's keys sorted recursively (a hand-ordered
-  sub-object regression is caught by the fixture round-trip), 4-space
-  indent, items at `depth*4` and closing delimiters at `(depth-1)*4`
-  spaces, empty containers as `{}`/`[]`, ensure_ascii escaping
-  (`journal.PythonJSONString`), Python float repr for `health.elapsed`,
-  and no trailing newline.
+- **Parsed-equal in both directions, proven order-independently**
+  (sanctioned deviation, user decision 2026-10-09 — charter §2):
+  `TestWriteRoundTripParsedEqual` re-writes the decoded Python fixture
+  and asserts the PARSED document equals the original's — the Go writer
+  uses Go 1.27's `encoding/json/v2` encoder and emits Go-native JSON,
+  NOT `json.dump(indent=4, sort_keys=True)` bytes: object key order is
+  Go-native (struct declaration order, and map keys in Go map iteration
+  order — not sorted and NOT deterministic across writes; the writer's
+  senders dedup to a name-keyed map with last-value-wins, matching the
+  parsed semantics of Python's dict), non-ASCII strings are raw UTF-8
+  instead of ensure_ascii escapes, and `health.elapsed` renders
+  Go-native (12.5 → 12.5, 0 → 0). Kept from Python: the parsed document
+  is equal, the 4-space json.dump layout (items on their own lines,
+  empty containers as `{}`/`[]`), no trailing newline, file mode 0600,
+  and the lenient write-only raw fields are inlined (whitespace
+  re-indented under indentation, values preserved). `TestWriteParsedRoundTrip`
+  replaces the old byte-golden lock: the fresh write parses exactly
+  like the committed `state_go_written.json` artifact and re-reads to
+  the same logical state compared with senders keyed by NAME — no
+  assertion may depend on a Go-written key order (the committed
+  artifact still exists only as the Python interop test's input;
+  regenerate with `UPDATE_STATE_GOLDEN=1 go test ./internal/state/`).
+  The WIRE-path serializer (`internal/journal`) keeps Python
+  byte-faithful output — that path is byte-parity-critical and
+  unaffected.
 - **Ordered decode is quirk-critical, no deviation**: the resume loop
   iterates `reader_state.get("senders", {}).items()` in FILE key order
   (journalpump.py:890-905) — the LAST listed sender wins and any null

@@ -6,8 +6,11 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -80,52 +83,56 @@ func TestWriteRunningConfigSkips(t *testing.T) {
 	})
 }
 
-// TestWriteRunningConfigWrites locks the writer behavior: full parsed
-// document (including unknown keys), alphabetically sorted keys, four-space
-// indent, no trailing newline, file mode 0600, parent directory created
-// with mode 0700 (existing directories untouched, like Python's
-// exist_ok=True).
+// TestWriteRunningConfigWrites locks the writer behavior: the full
+// parsed document (including unknown keys) round-trips parsed-equal,
+// the four-space Python-style indentation is kept, there is no
+// trailing newline, the file mode is 0600, and the parent directory is
+// created with mode 0700 (existing directories untouched, like
+// Python's exist_ok=True). Key order is deliberately NOT asserted: the
+// writer is Go-native (user decision 2026-10-09, charter §2) and its
+// map key order is nondeterministic across writes — tests compare
+// parsed structures, never bytes or key sequences.
 func TestWriteRunningConfigWrites(t *testing.T) {
 	t.Parallel()
-	t.Run("sorted full document with modes", func(t *testing.T) {
+	t.Run("full parsed document with modes", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
 		target := filepath.Join(dir, "nested", "deeper", "running.json")
-		cfg := mustDecode(t, `{
+		input := `{
             "b": {"x": [1, 2.5, null], "y": {}},
             "a": 1,
             "write_running_config": true,
-            "json_running_config_path": "`+target+`",
+            "json_running_config_path": "` + target + `",
             "unknown_key": {"kept": [true]}
-        }`)
+        }`
+		cfg := mustDecode(t, input)
 		reason, err := cfg.WriteRunningConfigFile()
 		if err != nil || reason != "" {
 			t.Fatalf("WriteRunningConfig = %q, %v", reason, err)
 		}
-		want := `{
-    "a": 1,
-    "b": {
-        "x": [
-            1,
-            2.5,
-            null
-        ],
-        "y": {}
-    },
-    "json_running_config_path": "` + target + `",
-    "unknown_key": {
-        "kept": [
-            true
-        ]
-    },
-    "write_running_config": true
-}`
 		content, err := os.ReadFile(target)
 		if err != nil {
 			t.Fatalf("reading running config: %v", err)
 		}
-		if string(content) != want {
-			t.Errorf("running config content:\n%s\nwant:\n%s", content, want)
+		// Parsed equality with the input document (order-independent).
+		var want any
+		if err := json.Unmarshal([]byte(input), &want); err != nil {
+			t.Fatalf("parsing input document: %v", err)
+		}
+		var got any
+		if err := json.Unmarshal(content, &got); err != nil {
+			t.Fatalf("parsing written running config: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("running config parses differently:\ngot:\n%s\nwant:\n%s", content, input)
+		}
+		// Python-parity shape: four-space indentation, no trailing
+		// newline (Python's json.dump appends none).
+		if !strings.Contains(string(content), "\n    \"") {
+			t.Errorf("running config is not four-space indented:\n%s", content)
+		}
+		if strings.HasSuffix(string(content), "\n") {
+			t.Errorf("running config has a trailing newline (Python's json.dump has none):\n%s", content)
 		}
 		info, err := os.Stat(target)
 		if err != nil {

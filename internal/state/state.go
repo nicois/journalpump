@@ -12,8 +12,10 @@
 // Bidirectional compatibility with Python is locked by tests in both
 // directions: the Go reader reads a committed Python-written fixture,
 // a committed Go-written fixture is read by the permanent pytest
-// test/test_state_file_interop.py, and the Go rewrite of the Python
-// fixture is byte-identical.
+// test/test_state_file_interop.py, and Go's rewrite of the Python
+// fixture is parsed-equal (the writer is Go-native since the
+// 2026-10-09 encoder decision — see encode.go; the parsed document,
+// not its bytes, is the compatibility contract).
 package state
 
 import (
@@ -50,8 +52,8 @@ type SentState struct {
 // HealthState mirrors the "health" object. Elapsed is a monotonic
 // float exactly like Python's (meaningless across restarts, but part
 // of the file); Errors is a bounded list of the most recent error
-// messages — lists are NOT sorted on write (Python's sort_keys only
-// sorts object keys).
+// messages — lists keep their order (Python's sort_keys only sorts
+// object keys, and the Go writer does not sort at all).
 type HealthState struct {
 	Status  string   `json:"status"`
 	Elapsed float64  `json:"elapsed"`
@@ -117,19 +119,19 @@ type Logger interface {
 // without an explicit mode.
 const StateFileMode os.FileMode = 0o600
 
-// Write renders state exactly like Python's
-// json.dump(state, fp, indent=4, sort_keys=True) — alphabetically
-// sorted keys at every nesting level, 4-space indent, ensure_ascii
-// string escaping, Python float repr — and replaces the file atomically
-// with mode 0600 via util.AtomicReplaceFile (Python's
-// atomic_replace_file without an explicit mode). Sender lists are
-// sorted by name on write: sort_keys sorts OBJECT keys, so the file
-// order is alphabetical regardless of the in-memory order — but lists
-// (health.errors) keep their order.
+// Write encodes the state with Go 1.27's encoding/json/v2 encoder — a
+// sanctioned deviation from Python's json.dump(indent=4,
+// sort_keys=True) (user decision 2026-10-09, charter §2): Go-native
+// key order (nondeterministic map iteration — nothing may assume an
+// ordering), raw UTF-8 strings instead of ensure_ascii escapes, and
+// Go-native float rendering. The parsed document stays equal to
+// Python's, the 4-space json.dump layout and the 0600 atomic replace
+// are kept, and the file is re-readable by Python. See encode.go for
+// the full deviation list. The resume quirk is unaffected: Read walks
+// the senders in FILE key order whatever the writer emitted.
 func Write(path string, state *State) error {
 	return util.AtomicReplaceFile(path, StateFileMode, func(w io.Writer) error {
-		_, err := w.Write([]byte(render(state)))
-		return err
+		return writeStateJSON(w, state)
 	})
 }
 

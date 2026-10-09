@@ -7,7 +7,8 @@ package config
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -61,32 +62,34 @@ func (c *Config) WriteRunningConfigFile() (skipReason string, err error) {
 		return "", fmt.Errorf("creating directory for running config %s: %w", path, err)
 	}
 	if err := util.AtomicReplaceFile(path, 0o600, func(writer io.Writer) error {
-		return writeSortedJSON(writer, c.raw)
+		return writeJSON(writer, c.raw)
 	}); err != nil {
 		return "", fmt.Errorf("writing running config to %s: %w", path, err)
 	}
 	return "", nil
 }
 
-// writeSortedJSON dumps the parsed document the way Python does:
-// json.dump(config, fp, indent=4, sort_keys=True) — four-space indent,
-// alphabetically sorted keys (encoding/json sorts map keys byte-wise, which
-// matches Python's str ordering for UTF-8), no trailing newline, and no
-// HTML escaping (Python never escapes <, >, & either). Recorded deviation
-// (NEWS, Task 28): the output is parsed-JSON-equal to Python's dump, not
-// byte-identical — Python's ensure_ascii=True writes non-ASCII as \uXXXX
-// (Go emits raw UTF-8) and Python renders floats like 60.0 as "60.0"
-// (Go renders the same value as "60"); the parity tests assert
+// writeJSON encodes the parsed document with Go 1.27's
+// encoding/json/v2 encoder (user decision 2026-10-09, charter §2): a
+// sanctioned deviation from Python's json.dump(indent=4,
+// sort_keys=True). Kept from Python: the four-space json.dump layout,
+// no trailing newline, no HTML escaping (Python never escapes <, >, &
+// either), and the parsed document's equality with Python's dump.
+// Go-native, order-independent by decision: object key order follows
+// Go map iteration — NOT sorted and NOT deterministic across writes,
+// so parsers (and tests) must compare parsed structures, never key
+// order. Also Go-native: non-ASCII characters are raw UTF-8 (Python's
+// ensure_ascii writes \uXXXX) and floats render Go-style (60.0 → 60).
+// Recorded deviation (NEWS, Task 28); parity tests assert
 // parsed-equality, which is what the systests assert too.
-func writeSortedJSON(writer io.Writer, raw map[string]any) error {
+func writeJSON(writer io.Writer, raw map[string]any) error {
 	var buf bytes.Buffer
-	encoder := json.NewEncoder(&buf)
-	encoder.SetEscapeHTML(false)
-	encoder.SetIndent("", "    ")
-	if err := encoder.Encode(raw); err != nil {
+	enc := jsontext.NewEncoder(&buf, jsontext.WithIndent("    "), jsontext.Multiline(true))
+	if err := jsonv2.MarshalEncode(enc, raw); err != nil {
 		return err
 	}
-	// json.Encoder.Encode appends a newline; Python's json.dump does not.
+	// The jsontext encoder terminates the value with a newline; Python's
+	// json.dump does not.
 	_, err := writer.Write(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
 	return err
 }

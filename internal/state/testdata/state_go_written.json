@@ -3,54 +3,54 @@
         "reader_two": {
             "cursor": "cursor=primary-1",
             "searches": {
-                "alpha": 10,
-                "zeta": 3
+                "zeta": 3,
+                "alpha": 10
             },
             "senders": {
                 "kafka_backup": {
+                    "type": "LogSender",
                     "buffer": {
-                        "current_queue": 2,
                         "cursor": "cursor=buffer-3",
+                        "total_size": 4096,
                         "entry_num": 9,
-                        "total_size": 4096
+                        "current_queue": 2
+                    },
+                    "sent": {
+                        "cursor": "cursor=backup-2",
+                        "count": 7,
+                        "bytes": 65536
                     },
                     "health": {
+                        "status": "connected",
                         "elapsed": 3.5,
                         "errors": [
-                            "connection reset \u00e9t\u00e9",
+                            "connection reset été",
                             "first error stays"
-                        ],
-                        "status": "connected"
-                    },
-                    "sent": {
-                        "bytes": 65536,
-                        "count": 7,
-                        "cursor": "cursor=backup-2"
-                    },
-                    "type": "LogSender"
+                        ]
+                    }
                 },
                 "kafka_primary": {
+                    "type": "LogSender",
                     "buffer": {
-                        "current_queue": 0,
                         "cursor": null,
+                        "total_size": 0,
                         "entry_num": 0,
-                        "total_size": 0
-                    },
-                    "health": {
-                        "elapsed": 0.0,
-                        "errors": [],
-                        "status": "stale"
+                        "current_queue": 0
                     },
                     "sent": {
-                        "bytes": 0,
+                        "cursor": null,
                         "count": 0,
-                        "cursor": null
+                        "bytes": 0
                     },
-                    "type": "LogSender"
+                    "health": {
+                        "status": "stale",
+                        "elapsed": 0,
+                        "errors": []
+                    }
                 }
             },
-            "total_bytes": 84,
-            "total_lines": 42
+            "total_lines": 42,
+            "total_bytes": 84
         }
     },
     "start_time": "2026-10-09T13:00:00.000000"

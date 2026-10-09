@@ -6,242 +6,91 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
-	"sort"
-	"strconv"
-	"strings"
-
-	"github.com/Aiven-Open/journalpump/internal/journal"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
+	"fmt"
+	"io"
 )
 
-// rawString renders a Go string as raw JSON bytes (for constructing
-// states in Go; the decoder stores decoded values verbatim).
-func rawString(s string) json.RawMessage {
-	return json.RawMessage(journal.PythonJSONString(s))
+// The state-file WRITER encodes with Go 1.27's new encoding/json/v2
+// encoder (user decision 2026-10-09, charter §2). The output is
+// Go-native JSON, a sanctioned deviation from Python's
+// json.dump(state, fp, indent=4, sort_keys=True):
+//
+//   - object key order is Go-native — struct fields in declaration
+//     order, map keys in Go map iteration order, which is
+//     NONDETERMINISTIC across writes. Nothing (in Go or Python) may
+//     depend on a Go-written file's key order; Python's json.load and
+//     Go's Read both parse order-independently, and the resume quirk
+//     walks the file's key order whatever it is.
+//   - strings are not ensure_ascii-escaped: non-ASCII characters are
+//     raw UTF-8 (v2 does not escape HTML either, like the old writer).
+//   - floats render Go-native (health.elapsed 3.5 → 3.5, 0 → 0; no
+//     Python float repr).
+//
+// What is preserved from Python: the parsed document is equal
+// (json.load-compatible structure and values), the 4-space
+// json.dump-style indentation (items on their own lines, empty
+// containers as {} and []), no trailing newline, and the 0600 file
+// mode. The WIRE-path serializer (internal/journal) keeps Python
+// byte-faithful output — that path is byte-parity-critical and
+// unaffected by this decision.
+
+// stateJSON mirrors State for encoding: the same data, with the
+// name-keyed levels as maps (order Go-native, see above) and the
+// lenient write-only fields as json.RawMessage, which the encoder
+// inlines (whitespace-reformatted under indentation, values preserved).
+type stateJSON struct {
+	Readers   map[string]readerJSON `json:"readers"`
+	StartTime json.RawMessage       `json:"start_time"`
 }
 
-// rawInt renders an int64 as raw JSON bytes.
-func rawInt(n int64) json.RawMessage {
-	return json.RawMessage(strconv.FormatInt(n, 10))
+// readerJSON mirrors ReaderState for encoding. The senders slice
+// becomes a map keyed by sender name: Python's senders value is a
+// dict, duplicate names collapse to the LAST value (the previous
+// writer's semantics, kept), and only the decode side preserves file
+// order for the resume quirk.
+type readerJSON struct {
+	Cursor     *string                    `json:"cursor"`
+	Searches   map[string]json.RawMessage `json:"searches"`
+	Senders    map[string]SenderState     `json:"senders"`
+	TotalLines json.RawMessage            `json:"total_lines"`
+	TotalBytes json.RawMessage            `json:"total_bytes"`
 }
 
-// render produces the exact bytes of Python's
-// json.dump(state, fp, indent=4, sort_keys=True): every OBJECT's keys
-// sorted alphabetically (recursively), 4-space indentation, items
-// separated by ",\n" and keys by ": ", empty containers as "{}"/"[]",
-// ensure_ascii string escaping, Python float repr, and no trailing
-// newline (json.dump does not append one).
-func render(state *State) []byte {
-	out := &lineBuffer{indent: 4}
-	out.beginContainer('{')
-	out.key("readers")
-	renderReaders(out, state.Readers)
-	out.key("start_time")
-	out.raw(state.StartTime)
-	out.endContainer('}')
-	return out.bytes()
-}
-
-func renderReaders(out *lineBuffer, readers map[string]*ReaderState) {
-	// Readers is a map; sort_keys sorts every level, so the object is
-	// written in sorted name order regardless of the decode order.
-	names := make([]string, 0, len(readers))
-	for name := range readers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	out.beginContainer('{')
-	for _, name := range names {
-		out.key(name)
-		renderReader(out, readers[name])
-	}
-	out.endContainer('}')
-}
-
-func renderReader(out *lineBuffer, reader *ReaderState) {
-	out.beginContainer('{')
-	out.key("cursor")
-	renderNullableString(out, reader.Cursor)
-	out.key("searches")
-	searchNames := make([]string, 0, len(reader.Searches))
-	for name := range reader.Searches {
-		searchNames = append(searchNames, name)
-	}
-	sort.Strings(searchNames)
-	out.beginContainer('{')
-	for _, name := range searchNames {
-		out.key(name)
-		// Write-only field: emitted verbatim from the lenient decode (or
-		// rawInt for states constructed in Go).
-		out.raw(reader.Searches[name])
-	}
-	out.endContainer('}')
-	out.key("senders")
-	senderNames := make([]string, 0, len(reader.Senders))
-	byName := make(map[string]SenderState, len(reader.Senders))
-	for _, sender := range reader.Senders {
-		if _, ok := byName[sender.Name]; !ok {
-			senderNames = append(senderNames, sender.Name)
+// marshalable builds the encoder view of a decoded state.
+func marshalable(state *State) stateJSON {
+	out := stateJSON{Readers: make(map[string]readerJSON, len(state.Readers)), StartTime: state.StartTime}
+	for name, reader := range state.Readers {
+		rj := readerJSON{
+			Cursor:     reader.Cursor,
+			Searches:   reader.Searches,
+			TotalLines: reader.TotalLines,
+			TotalBytes: reader.TotalBytes,
+			Senders:    make(map[string]SenderState, len(reader.Senders)),
 		}
-		byName[sender.Name] = sender.State // duplicate name: last value wins
-	}
-	sort.Strings(senderNames)
-	out.beginContainer('{')
-	for _, name := range senderNames {
-		out.key(name)
-		renderSender(out, byName[name])
-	}
-	out.endContainer('}')
-	out.key("total_bytes")
-	out.raw(reader.TotalBytes)
-	out.key("total_lines")
-	out.raw(reader.TotalLines)
-	out.endContainer('}')
-}
-
-func renderSender(out *lineBuffer, sender SenderState) {
-	out.beginContainer('{')
-	out.key("buffer")
-	out.beginContainer('{')
-	// Sorted keys (sort_keys=True): current_queue < cursor < entry_num
-	// < total_size.
-	out.key("current_queue")
-	out.literal(strconv.FormatInt(sender.Buffer.CurrentQueue, 10))
-	out.key("cursor")
-	// Write-only field: emitted verbatim from the lenient decode (or
-	// rawNullableString for states constructed in Go).
-	out.raw(sender.Buffer.Cursor)
-	out.key("entry_num")
-	out.literal(strconv.FormatInt(sender.Buffer.EntryNum, 10))
-	out.key("total_size")
-	out.literal(strconv.FormatInt(sender.Buffer.TotalSize, 10))
-	out.endContainer('}')
-	out.key("health")
-	out.beginContainer('{')
-	out.key("elapsed")
-	out.literal(journal.PythonFloatRepr(sender.Health.Elapsed))
-	out.key("errors")
-	if len(sender.Health.Errors) == 0 {
-		out.literal("[]")
-	} else {
-		out.beginContainer('[')
-		for _, err := range sender.Health.Errors {
-			out.item()
-			out.string(err)
+		if rj.Searches == nil {
+			rj.Searches = map[string]json.RawMessage{}
 		}
-		out.endContainer(']')
+		for _, sender := range reader.Senders {
+			rj.Senders[sender.Name] = sender.State // duplicate name: last value wins
+		}
+		out.Readers[name] = rj
 	}
-	out.key("status")
-	out.string(sender.Health.Status)
-	out.endContainer('}')
-	out.key("sent")
-	out.beginContainer('{')
-	out.key("bytes")
-	out.literal(strconv.FormatInt(sender.Sent.Bytes, 10))
-	out.key("count")
-	out.literal(strconv.FormatInt(sender.Sent.Count, 10))
-	out.key("cursor")
-	renderNullableString(out, sender.Sent.Cursor)
-	out.endContainer('}')
-	out.key("type")
-	out.string(sender.Type)
-	out.endContainer('}')
+	return out
 }
 
-func renderNullableString(out *lineBuffer, s *string) {
-	if s == nil {
-		out.literal("null")
-	} else {
-		out.string(*s)
+// writeStateJSON encodes state with the 4-space json.dump layout and no
+// trailing newline (the jsontext encoder terminates the top-level value
+// with one; Python's json.dump does not append it).
+func writeStateJSON(w io.Writer, state *State) error {
+	var buf bytes.Buffer
+	enc := jsontext.NewEncoder(&buf, jsontext.WithIndent("    "), jsontext.Multiline(true))
+	if err := jsonv2.MarshalEncode(enc, marshalable(state)); err != nil {
+		return fmt.Errorf("encoding state file: %w", err)
 	}
-}
-
-// lineBuffer builds indent-formatted JSON the way json.dump does: every
-// container item starts on a fresh line indented depth*indent spaces,
-// with ",\n" separators and ": " after keys; a container without items
-// renders as "{}"/"[]".
-type lineBuffer struct {
-	out    []byte
-	indent int
-	depth  int
-	// pending, top of the stack, records whether the innermost open
-	// container already received an item (and therefore needs a comma
-	// before the next one).
-	pending []bool
-}
-
-func (b *lineBuffer) bytes() []byte { return b.out }
-
-// spaces returns n indent spaces (json.dump's indentation).
-func spaces(n int) []byte {
-	return []byte(strings.Repeat(" ", n))
-}
-
-func (b *lineBuffer) push() {
-	b.depth++
-	b.pending = append(b.pending, false)
-}
-
-func (b *lineBuffer) pop() {
-	b.depth--
-	b.pending = b.pending[:len(b.pending)-1]
-}
-
-// beginContainer opens a container; the caller passes '{' or '['.
-func (b *lineBuffer) beginContainer(open byte) {
-	b.out = append(b.out, open)
-	b.push()
-}
-
-// endContainer closes a container: if it received items, the closing
-// delimiter sits on its own line at the container's own indent.
-func (b *lineBuffer) endContainer(closer byte) {
-	if b.pending[len(b.pending)-1] {
-		b.out = append(b.out, '\n')
-		b.out = append(b.out, spaces(b.depth*b.indent-b.indent)...)
-	}
-	b.out = append(b.out, closer)
-	b.pop()
-}
-
-// itemStart starts one item of the innermost container: newline plus
-// one indent per depth, and a comma when this is not the first item.
-func (b *lineBuffer) itemStart() {
-	top := len(b.pending) - 1
-	if b.pending[top] {
-		b.out = append(b.out, ',')
-	}
-	b.out = append(b.out, '\n')
-	b.out = append(b.out, spaces(b.depth*b.indent)...)
-	b.pending[top] = true
-}
-
-func (b *lineBuffer) key(name string) {
-	b.itemStart()
-	b.out = append(b.out, journal.PythonJSONString(name)...)
-	b.out = append(b.out, ": "...)
-}
-
-func (b *lineBuffer) item() {
-	b.itemStart()
-}
-
-func (b *lineBuffer) literal(s string) {
-	b.out = append(b.out, s...)
-}
-
-// raw emits pre-rendered JSON bytes: the lenient decode stores
-// write-only values verbatim, so re-emission is byte-faithful. An
-// empty value renders as null — only reachable for hand-constructed
-// states that left the field unset.
-func (b *lineBuffer) raw(raw json.RawMessage) {
-	if len(raw) == 0 {
-		b.literal("null")
-		return
-	}
-	b.literal(string(raw))
-}
-
-func (b *lineBuffer) string(s string) {
-	b.out = append(b.out, journal.PythonJSONString(s)...)
+	_, err := w.Write(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
+	return err
 }
