@@ -242,6 +242,20 @@ type Loop struct {
 	// held is the not-yet-acked tail of the current drain (retry from
 	// its head on the next flush); loop-goroutine only.
 	held []Item
+	// onDequeue, when set (buffer layer, internal/buffer), is called by
+	// the loop goroutine with every non-empty batch taken out of the
+	// channel — the drain side of MsgBuffer.get_items' buffer_size
+	// reset. Set before Run; loop-goroutine only.
+	onDequeue func([]Item)
+}
+
+// SetDequeueObserver registers a callback invoked from the loop
+// goroutine with every non-empty batch of items taken out of the
+// buffer channel (the buffer layer uses it to maintain its in-flight
+// byte accounting). The held retry tail is not re-reported — those
+// items were already dequeued. Must be called before Run.
+func (l *Loop) SetDequeueObserver(fn func(items []Item)) {
+	l.onDequeue = fn
 }
 
 // NewLoop wires a transport into the shared loop. in is the per-sender
@@ -397,7 +411,9 @@ func (l *Loop) hold(items []Item) {
 
 // collect takes the pending items: the held retry tail if any,
 // otherwise everything currently buffered (base.py:MsgBuffer.get_items
-// snapshot; items enqueued mid-drain stay for the next trigger).
+// snapshot; items enqueued mid-drain stay for the next trigger). The
+// dequeue observer fires only on the channel-drain path, with the
+// taken batch.
 func (l *Loop) collect() []Item {
 	l.mu.Lock()
 	held := l.held
@@ -412,6 +428,9 @@ func (l *Loop) collect() []Item {
 		case item := <-l.in:
 			items = append(items, item)
 		default:
+			if len(items) > 0 && l.onDequeue != nil {
+				l.onDequeue(items)
+			}
 			return items
 		}
 	}

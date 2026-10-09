@@ -594,3 +594,40 @@ Deferred and forward notes from the Task 13 review:
   is logged, not the pre-jitter base.
 - Unknown `output_type` error text matches Python's `%r` rendering
   (single quotes): `Unknown sender type 'nonexistent'`.
+
+## Task 14 — per-sender buffer and reader backpressure (MsgBuffer port)
+
+`internal/buffer` ports `senders/base.py:MsgBuffer` and the reader
+backpressure of `journalpump.py:210-244, 1019-1043` as a
+channel-per-sender handoff (spec §4.3): the sender loop consumes the
+buffer's channel (its `len` is the flush trigger — the same signal
+Python's loop takes from `len(msg_buffer)`), and the reader consults
+the worst-sender `Gate` (`WriteLimitCount` / `WriteLimitBytes`,
+defaults 50000 / 5 MiB, no-senders limits CHUNK_SIZE / _5_MB) before
+reading more entries — one full sender pauses the whole reader,
+nothing is ever dropped (`Enqueue` retries on the context), no
+head-of-line blocking between senders.
+
+Python facts pinned:
+
+- Occupancy resets exactly where Python's `get_items` resets
+  `buffer_size`: the loop's drain (collect) fires the buffer's
+  dequeue observer — `TestDrainOpensGate` pins that a raw receive
+  would NOT do (the budget releases through the loop only).
+- Cumulative counters (`entry_num`/`total_size`/`cursor`) advance at
+  admission via the loop's `TrackEnqueue`, exactly when Python's
+  `add_item` runs (`TestEnqueueAccounting`).
+- The gate subtracts the WORST sender's occupancy, not the sum
+  (`TestGateLimits`); the `_failed_senders and not senders → 0`
+  variant belongs to the reader wiring (Task 16).
+- Reader stops when the worst-sender limit reaches zero and resumes
+  when the sender drains, in a synctest bubble with a blocked
+  transport (`TestBackpressureStopAndResume`); enqueue retry/cancel
+  (`TestEnqueueCancelWhileFull`) and concurrent producer/consumer
+  under `-race` (`TestConcurrentEnqueueDrain`).
+
+Accepted cosmetic divergence: Python measures the transient byte
+budget with `sys.getsizeof(item)` (CPython bytes-object overhead,
+~33 B/item); Go counts plain payload lengths. `buffer_size` is never
+serialized (the state file carries `total_size`, which is
+len-based in both) — the budget only feeds the admission gate.
