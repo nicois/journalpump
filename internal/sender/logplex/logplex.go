@@ -5,8 +5,8 @@
 
 // Package logplex implements the logplex sender: the port of
 // journalpump/senders/logplex.py (plan Task 21). It is a fire-and-forget
-// HTTP sender — the response status is ignored, the batch is always marked
-// sent, and there is no retry or disconnect on an HTTP error response.
+// HTTP sender — the response STATUS is ignored, so a 4xx/5xx still marks the
+// batch sent and does not retry or disconnect.
 //
 // SANCTIONED DEVIATION (charter §2/D6): Python's format_msg f-strings the
 // ENCODED packet, so the wire carries the bytes REPR (b'...') of each frame
@@ -14,19 +14,36 @@
 // CLEAN RFC frame instead; the length prefix counts the frame's own bytes.
 // The Python ground-truth capture is therefore compared STRUCTURALLY (field
 // values via the repr-stripped frame list), never byte-for-byte.
+//
+// SANCTIONED DEVIATION (charter §2, Task 21 review ruling): on a TRANSPORT
+// error (dial/read/timeout) Python's uncaught requests exception aborts
+// get_and_send_messages, silently drops the drained batch and leaves the
+// sender marked connected — silent data loss. Go instead returns the error,
+// so the shared loop retains the batch, retries it, and marks the sender
+// disconnected. This follows the framework-wide retry semantics the approved
+// spec mandates; it is the "Python is incorrect" clause, not an accidental
+// divergence.
 package logplex
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"golang.org/x/net/http/httpproxy"
+
+	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
 
@@ -37,6 +54,12 @@ const defaultMaxSendInterval = 5.0
 // defaultRequestTimeout is logplex.py:13's
 // config.get("logplex_request_timeout", 2) (seconds).
 const defaultRequestTimeout = 2.0
+
+// defaultSessionTimeout mirrors util.py:get_requests_session's TimeoutAdapter
+// default (60 s): requests substitutes the session timeout whenever the
+// per-request timeout is FALSY, so logplex_request_timeout = 0 means 60 s,
+// not "no timeout".
+const defaultSessionTimeout = 60.0
 
 // Fixed frame fields (logplex.py:16-17, 26): PRI is always 190, and the
 // msgid and structured-data slots are the literal "-".
@@ -117,31 +140,88 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	}, nil
 }
 
-// newHTTPClient builds the production HTTP client: the per-request timeout
-// (Python's timeout=self.request_timeout) and a TLS config with verification
-// DISABLED (Python's verify=False — deliberate, spec §2/D6).
+// resolvedTimeout maps the configured logplex_request_timeout to the
+// effective per-connection timeout: requests substitutes the session's 60 s
+// default whenever the value is falsy (0 or negative), and Python's timeout
+// is an INACTIVITY timeout (connect and per-read), not a total deadline.
+func resolvedTimeout(timeoutSeconds float64) time.Duration {
+	if timeoutSeconds <= 0 {
+		return time.Duration(defaultSessionTimeout * float64(time.Second))
+	}
+	return time.Duration(timeoutSeconds * float64(time.Second))
+}
+
+// newHTTPClient builds the production HTTP client with Python's requests
+// semantics:
+//
+//   - timeout: an INACTIVITY timeout, applied to the dial and to every
+//     socket read (see idleTimeoutConn), with 0 → the 60 s session default.
+//     There is deliberately NO http.Client.Timeout — that would be a TOTAL
+//     request deadline and would abort a slow-but-progressing response.
+//   - proxy: the standard environment (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) is
+//     honored, like requests.Session.
+//   - TLS verification is DISABLED (Python's verify=False — deliberate,
+//     spec §2).
 func newHTTPClient(timeoutSeconds float64) *http.Client {
+	idle := resolvedTimeout(timeoutSeconds)
+	dialer := &net.Dialer{Timeout: idle}
 	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &idleTimeoutConn{Conn: conn, idle: idle}, nil
+		},
+		// Read the proxy environment at request time (httpproxy, the same
+		// logic net/http.ProxyFromEnvironment uses, but without its
+		// process-wide sync.Once cache).
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
+		},
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, //nolint:gosec // verify=False is the ported Python behavior (spec §2)
 		},
 	}
-	return &http.Client{
-		Timeout:   time.Duration(timeoutSeconds * float64(time.Second)),
-		Transport: transport,
-	}
+	return &http.Client{Transport: transport}
+}
+
+// idleTimeoutConn resets the read/write deadline before every operation, so
+// a stalled peer trips the timeout while a slow-but-progressing transfer does
+// not — Python's socket inactivity timeout semantics.
+type idleTimeoutConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleTimeoutConn) Read(b []byte) (int, error) {
+	_ = c.SetReadDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(b)
+}
+
+func (c *idleTimeoutConn) Write(b []byte) (int, error) {
+	_ = c.SetWriteDeadline(time.Now().Add(c.idle))
+	return c.Conn.Write(b)
 }
 
 // formatMsg ports logplex.py:20-29 into the CLEAN frame (sanctioned
-// deviation D6): "<190>1 <format-now> localhost <token> localhost - -<MESSAGE>"
+// deviation D6): "<190>1 <format-now> <hostname> <token> <pid> - -<MESSAGE>"
 // prefixed by its byte length. The hostname/pid lookups keep Python's
-// `entry.get("_HOSTNAME", "localhost")` shape; because the journal processor
-// strips leading underscores before the sender sees a payload
-// (journalpump.py:708-714), those keys never match and the values are always
-// the literal "localhost" (the named quirk).
+// `entry.get("_HOSTNAME", "localhost")` shape. For the JOURNAL fields the
+// processor strips leading underscores before the sender sees a payload
+// (journalpump.py:708-714), so those keys never match and the values are the
+// literal "localhost"; that qualifies the quirk rather than claiming it
+// unconditionally, because extra_field_values are merged AFTER the stripping
+// and CAN carry _HOSTNAME/_PID.
 func (s *Sender) formatMsg(msg []byte) (string, error) {
+	// UseNumber keeps integer fields as integer literals so _PID/_HOSTNAME
+	// supplied through extra_field_values (merged AFTER the underscore
+	// stripping, so these keys ARE reachable) render like Python's ints
+	// rather than collapsing to float64.
 	var m map[string]any
-	if err := json.Unmarshal(msg, &m); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(msg))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
 		// Python: json.loads(msg.decode("utf8")) raises on bad JSON.
 		return "", fmt.Errorf("logplex sender: decode payload: %w", err)
 	}
@@ -192,27 +272,99 @@ func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) err
 	if err != nil {
 		return err
 	}
-	// Fire-and-forget: the status code is not inspected (Python never calls
-	// raise_for_status and always marks the batch sent).
+	// requests.post CONSUMES the response body before returning (and raises
+	// on a truncated/stalled body), so read it fully and propagate read
+	// failures. The HTTP STATUS is still ignored: Python never calls
+	// raise_for_status, so a 500 still marks the batch sent.
+	_, readErr := io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	return nil
+	return readErr
 }
 
 // MaintenanceOperations implements sender.Sender; logplex has none (no
 // base.py override).
 func (s *Sender) MaintenanceOperations(context.Context) error { return nil }
 
-// pyStr mirrors Python's str(value) for the f-string interpolation of a
-// possibly non-string _HOSTNAME/_PID (unreachable through the journal
-// processor, kept for exact parity).
+// pyStr mirrors Python's f-string interpolation (format(value, ""), i.e.
+// str(value)) for the _HOSTNAME/_PID values. Those keys are unreachable for
+// the journal fields (the processor strips the leading underscores), but
+// extra_field_values are merged AFTER the stripping, so a sender extra can
+// supply them, and its values are ordinary JSON (strings, ints, floats,
+// bools, lists, objects) — all must render as Python would.
 func pyStr(v any) string {
-	if v == nil {
+	switch t := v.(type) {
+	case nil:
 		return "None"
-	}
-	if s, ok := v.(string); ok {
+	case string:
+		return t
+	case bool:
+		if t {
+			return "True"
+		}
+		return "False"
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case float64:
+		return journal.PythonFloatRepr(t)
+	case json.Number:
+		// An integer literal (no . e E) is a Python int and str()s to the
+		// literal; a float literal uses Python's float repr.
+		s := t.String()
+		if strings.ContainsAny(s, ".eE") {
+			if f, err := t.Float64(); err == nil {
+				return journal.PythonFloatRepr(f)
+			}
+		}
 		return s
+	case []any:
+		parts := make([]string, len(t))
+		for i, item := range t {
+			parts[i] = pyRepr(item)
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys) // JSON decoding lost insertion order
+		parts := make([]string, len(keys))
+		for i, k := range keys {
+			parts[i] = pyRepr(k) + ": " + pyRepr(t[k])
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		return fmt.Sprintf("%v", v)
 	}
-	return fmt.Sprintf("%v", v)
+}
+
+// pyRepr renders repr(value), used inside list/object interpolation. Strings
+// are single-quoted with the common escapes (Python's repr).
+func pyRepr(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		return pyStr(v)
+	}
+	var b strings.Builder
+	b.WriteByte('\'')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '\'':
+			b.WriteString(`\'`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('\'')
+	return b.String()
 }
 
 // numberSeconds renders a decoded JSON number as float seconds, rejecting

@@ -8,6 +8,7 @@ package logplex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -22,9 +24,10 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
 
-// fakeDoer records requests and returns a canned response.
+// fakeDoer records requests and returns a canned response (or an error).
 type fakeDoer struct {
 	status int
+	err    error
 	calls  []capturedRequest
 }
 
@@ -38,6 +41,9 @@ type capturedRequest struct {
 func (d *fakeDoer) Do(req *http.Request) (*http.Response, error) {
 	body, _ := io.ReadAll(req.Body)
 	d.calls = append(d.calls, capturedRequest{method: req.Method, url: req.URL.String(), headers: req.Header, body: body})
+	if d.err != nil {
+		return nil, d.err
+	}
 	status := d.status
 	if status == 0 {
 		status = 200
@@ -352,11 +358,12 @@ func parseContent(t *testing.T, content string) frameFields {
 }
 
 // TestFixtureStructuralParity replays the Task 11 Python ground-truth
-// fixture's repr-STRIPPED frame content through the Go sender and compares
-// the parsed fields (never the raw Python bytes, which carry the sanctioned
-// b'...' framing bug). This pins the field VALUES Python intends: PRI 190,
-// literal localhost hostname/pid, the configured token, msgid/sd "-", and
-// the message text.
+// fixture at the HTTP CAPTURE boundary: the fixture-derived batch goes
+// through the PRODUCTION HTTP client to a recording server, and every
+// captured length-prefixed frame is parsed and compared field-by-field with
+// the fixture's parsed values (never byte-for-byte against Python's raw
+// bytes-repr wire, which is the sanctioned D6 deviation). It also rejects
+// any b'...' repr framing.
 func TestFixtureStructuralParity(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "..", "systest-go", "fixtures", "logplex.json"))
 	if err != nil {
@@ -377,42 +384,328 @@ func TestFixtureStructuralParity(t *testing.T) {
 	if got := fixture.Request.Headers["content-type"]; got != "application/logplex-1" {
 		t.Fatalf("fixture content-type = %q", got)
 	}
-	s, _ := newTestSender(t, baseConfig())
+
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusInternalServerError) // status must still be ignored
+	}))
+	defer srv.Close()
+
+	cfg := baseConfig()
+	cfg["logplex_log_input_url"] = srv.URL
+	inst, err := New(sender.ConstructorArgs{Name: "x", Config: cfg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := inst.Transport.(*Sender)
 	s.now = func() time.Time { return time.Unix(0, 0) }
 
-	for i, want := range fixture.Frames {
-		wanted := parseContent(t, want)
-		payload, err := json.Marshal(map[string]any{"MESSAGE": wanted.message, "HOSTNAME": "ignored", "PID": "9"})
+	batch := make([][]byte, 0, len(fixture.Frames))
+	want := make([]frameFields, 0, len(fixture.Frames))
+	for _, raw := range fixture.Frames {
+		parsed := parseContent(t, raw)
+		payload, err := json.Marshal(map[string]any{"MESSAGE": parsed.message, "HOSTNAME": "ignored", "PID": "9"})
 		if err != nil {
 			t.Fatalf("marshal payload: %v", err)
 		}
-		frame, err := s.formatMsg(payload)
-		if err != nil {
-			t.Fatalf("frame %d formatMsg: %v", i, err)
+		batch = append(batch, payload)
+		want = append(want, parsed)
+	}
+	if err := s.SendMessages(context.Background(), batch, "c"); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	if strings.Contains(string(body), "b'") {
+		t.Fatalf("captured body reproduces the sanitized-away bytes-repr bug: %q", body)
+	}
+	got := parseFrames(t, body)
+	if len(got) != len(want) {
+		t.Fatalf("captured %d frames, want %d", len(got), len(want))
+	}
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.pri != w.pri || g.version != w.version {
+			t.Fatalf("frame %d PRI/version = %q/%q, want %q/%q", i, g.pri, g.version, w.pri, w.version)
 		}
-		if strings.Contains(frame, "b'") {
-			t.Fatalf("frame %d = %q reproduces the sanitized-away bytes-repr bug", i, frame)
+		if g.hostname != "localhost" || g.pid != "localhost" {
+			t.Fatalf("frame %d hostname/pid = %q/%q, want localhost/localhost", i, g.hostname, g.pid)
 		}
-		got := parseFrame(t, frame)
-		if got.pri != wanted.pri || got.version != wanted.version {
-			t.Fatalf("frame %d PRI/version = %q/%q, want %q/%q", i, got.pri, got.version, wanted.pri, wanted.version)
+		if g.token != "token" {
+			t.Fatalf("frame %d token = %q, want token", i, g.token)
 		}
-		if got.hostname != "localhost" || got.pid != "localhost" {
-			t.Fatalf("frame %d hostname/pid = %q/%q, want localhost/localhost", i, got.hostname, got.pid)
+		if g.msgID != "-" || g.sd != "-" {
+			t.Fatalf("frame %d msgid/sd = %q/%q, want -/-", i, g.msgID, g.sd)
 		}
-		if got.token != "token" {
-			t.Fatalf("frame %d token = %q, want token", i, got.token)
+		if g.message != w.message {
+			t.Fatalf("frame %d message = %q, want %q", i, g.message, w.message)
 		}
-		if got.msgID != "-" || got.sd != "-" {
-			t.Fatalf("frame %d msgid/sd = %q/%q, want -/-", i, got.msgID, got.sd)
-		}
-		if got.message != wanted.message {
-			t.Fatalf("frame %d message = %q, want %q", i, got.message, wanted.message)
-		}
-		if len(got.timestamp) != len(wanted.timestamp) || !strings.HasSuffix(got.timestamp, "+00:00") {
-			t.Fatalf("frame %d timestamp = %q, want a %d-char +00:00 shape", i, got.timestamp, len(wanted.timestamp))
+		if len(g.timestamp) != len(w.timestamp) || !strings.HasSuffix(g.timestamp, "+00:00") {
+			t.Fatalf("frame %d timestamp = %q, want a %d-char +00:00 shape", i, g.timestamp, len(w.timestamp))
 		}
 	}
+}
+
+// TestHostnamePIDFromExtras proves the _HOSTNAME/_PID lookups ARE reachable:
+// extra_field_values are merged after the underscore stripping, so a sender
+// extra can supply them and its JSON values must interpolate exactly as
+// Python's f-string does.
+func TestHostnamePIDFromExtras(t *testing.T) {
+	cases := []struct {
+		name              string
+		payload           string
+		wantHost, wantPid string
+	}{
+		{"integer pid", `{"MESSAGE":"m","_PID":5}`, "localhost", "5"},
+		{"float pid", `{"MESSAGE":"m","_PID":5.0}`, "localhost", "5.0"},
+		{"bool hostname", `{"MESSAGE":"m","_HOSTNAME":true}`, "True", "localhost"},
+		{"null hostname", `{"MESSAGE":"m","_HOSTNAME":null}`, "None", "localhost"},
+		{"string pid", `{"MESSAGE":"m","_PID":"abc"}`, "localhost", "abc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestSender(t, baseConfig())
+			frame, err := s.formatMsg([]byte(tc.payload))
+			if err != nil {
+				t.Fatalf("formatMsg: %v", err)
+			}
+			parsed := parseContent(t, mustCutPrefix(t, frame))
+			if parsed.hostname != tc.wantHost || parsed.pid != tc.wantPid {
+				t.Fatalf("hostname/pid = %q/%q, want %q/%q", parsed.hostname, parsed.pid, tc.wantHost, tc.wantPid)
+			}
+		})
+	}
+}
+
+// TestTransportFailureRetainsAndRetries is the sanctioned-deviation
+// regression (charter §2): on a transport error Go returns the error so the
+// shared loop RETAINS the batch, RETRIES it, and marks the sender
+// disconnected — Python instead drops the batch and stays green.
+func TestTransportFailureRetainsAndRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		inst, err := New(sender.ConstructorArgs{Name: "logplex-loop", Config: baseConfig()})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		s := inst.Transport.(*Sender)
+		d := &fakeDoer{err: errors.New("dial failed")}
+		s.client = d
+		s.now = func() time.Time { return time.Unix(0, 0) }
+
+		in := make(chan sender.Item, 4)
+		loop := sender.NewLoop(sender.LoopConfig{Name: "logplex-loop"}, inst, in)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			_ = loop.Run(ctx)
+			close(done)
+		}()
+		in <- sender.Item{Payload: []byte(`{"MESSAGE": "m"}`), Cursor: "c0"}
+		time.Sleep(8 * time.Second)
+		synctest.Wait()
+		st := loop.State()
+		cancel()
+		<-done
+		if len(d.calls) < 2 {
+			t.Fatalf("requests = %d, want >= 2 (the batch must be retried)", len(d.calls))
+		}
+		if st.Sent.Count != 0 {
+			t.Fatalf("sent count = %d, want 0 (the batch is retained, not dropped)", st.Sent.Count)
+		}
+		if st.Health.Status != "disconnected" {
+			t.Fatalf("health status = %q, want disconnected", st.Health.Status)
+		}
+		if len(st.Health.Errors) == 0 {
+			t.Fatal("health errors is empty; the transport failure was not recorded")
+		}
+	})
+}
+
+// TestTruncatedBodyIsAnError: a response whose body ends before its declared
+// length must fail the send (requests consumes the body and raises).
+func TestTruncatedBodyIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write([]byte("short"))
+	}))
+	defer srv.Close()
+	s := productionSender(t, srv.URL, 2)
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err == nil {
+		t.Fatal("SendMessages succeeded on a truncated body; want an error")
+	}
+}
+
+// TestStalledBodyTimesOut: a body that stops delivering for longer than the
+// configured timeout must fail the send.
+func TestStalledBodyTimesOut(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write([]byte("par"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+	s := productionSender(t, srv.URL, 0.1)
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err == nil {
+		t.Fatal("SendMessages succeeded on a stalled body; want a timeout error")
+	}
+}
+
+// TestResolvedTimeoutUsesSessionDefault: logplex_request_timeout = 0 (falsy)
+// must become requests' 60 s session default, not "no timeout".
+func TestResolvedTimeoutUsesSessionDefault(t *testing.T) {
+	for _, tc := range []struct {
+		in   float64
+		want time.Duration
+	}{{0, 60 * time.Second}, {-1, 60 * time.Second}, {2, 2 * time.Second}, {0.5, 500 * time.Millisecond}} {
+		if got := resolvedTimeout(tc.in); got != tc.want {
+			t.Fatalf("resolvedTimeout(%v) = %s, want %s", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestSlowResponseWithinTimeout: a server that delays its response less than
+// the timeout still succeeds (inactivity, not a total deadline).
+func TestSlowResponseWithinTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+	s := productionSender(t, srv.URL, 0.5)
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err != nil {
+		t.Fatalf("SendMessages on a slow-but-within-timeout response: %v", err)
+	}
+}
+
+// TestIncrementalDeliveryExceedsTotalTimeout: the response takes LONGER than
+// the timeout in total but never stalls longer than it between chunks, so an
+// inactivity timeout succeeds where a total deadline would fail.
+func TestIncrementalDeliveryExceedsTotalTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		f, _ := w.(http.Flusher)
+		for i := 0; i < 6; i++ {
+			_, _ = w.Write([]byte("x"))
+			if f != nil {
+				f.Flush()
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+	s := productionSender(t, srv.URL, 0.1)
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err != nil {
+		t.Fatalf("SendMessages on an incremental response: %v (total 240ms > 100ms timeout)", err)
+	}
+}
+
+// TestProxyFromEnvironment: the production client honors HTTP_PROXY.
+func TestProxyFromEnvironment(t *testing.T) {
+	var proxied int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&proxied, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("http_proxy", "")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+
+	cfg := baseConfig()
+	cfg["logplex_log_input_url"] = "http://logplex.invalid/input"
+	inst, err := New(sender.ConstructorArgs{Name: "x", Config: cfg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := inst.Transport.(*Sender)
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err != nil {
+		t.Fatalf("SendMessages through the proxy: %v", err)
+	}
+	if atomic.LoadInt32(&proxied) != 1 {
+		t.Fatalf("proxy hits = %d, want 1", proxied)
+	}
+}
+
+// TestNoProxyBypass: NO_PROXY bypasses the proxy for matching hosts.
+func TestNoProxyBypass(t *testing.T) {
+	var proxied, direct int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&proxied, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&direct, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("http_proxy", "")
+	t.Setenv("NO_PROXY", "127.0.0.1")
+	t.Setenv("no_proxy", "")
+
+	s := productionSender(t, target.URL, 2)
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte(`{"MESSAGE":"m"}`)}, "c"); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	if atomic.LoadInt32(&proxied) != 0 {
+		t.Fatalf("proxy hits = %d, want 0 (NO_PROXY bypass)", proxied)
+	}
+	if atomic.LoadInt32(&direct) != 1 {
+		t.Fatalf("direct hits = %d, want 1", direct)
+	}
+}
+
+// productionSender builds a Sender with the production HTTP client pointing
+// at url and the given request timeout (seconds).
+func productionSender(t *testing.T, url string, timeoutSeconds float64) *Sender {
+	t.Helper()
+	cfg := baseConfig()
+	cfg["logplex_log_input_url"] = url
+	cfg["logplex_request_timeout"] = timeoutSeconds
+	inst, err := New(sender.ConstructorArgs{Name: "x", Config: cfg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := inst.Transport.(*Sender)
+	s.now = func() time.Time { return time.Unix(0, 0) }
+	return s
+}
+
+// parseFrames splits a clean logplex body into its length-prefixed frames.
+func parseFrames(t *testing.T, body []byte) []frameFields {
+	t.Helper()
+	var frames []frameFields
+	for len(body) > 0 {
+		sp := strings.IndexByte(string(body), ' ')
+		if sp < 0 {
+			t.Fatalf("body tail %q has no length prefix", body)
+		}
+		n, err := strconv.Atoi(string(body[:sp]))
+		if err != nil {
+			t.Fatalf("length prefix %q: %v", body[:sp], err)
+		}
+		content := body[sp+1 : sp+1+n]
+		frames = append(frames, parseContent(t, string(content)))
+		body = body[sp+1+n:]
+	}
+	return frames
+}
+
+// mustCutPrefix strips a frame's length prefix, returning its content.
+func mustCutPrefix(t *testing.T, frame string) string {
+	t.Helper()
+	_, rest, ok := strings.Cut(frame, " ")
+	if !ok {
+		t.Fatalf("frame %q has no length prefix", frame)
+	}
+	return rest
 }
 
 // basicAuth decodes a Basic Authorization header.
