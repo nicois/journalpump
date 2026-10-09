@@ -263,6 +263,28 @@
     "GET /_aliases polls are time-gated and excluded from the ordered comparison",
     "batch/POST boundaries are timing-dependent: compare concatenated payload streams per index"
   ],
+  "request_sequence": [
+    [
+      "GET",
+      "/"
+    ],
+    [
+      "PUT",
+      "/journalpump-2021-12-27"
+    ],
+    [
+      "POST",
+      "/journalpump-2021-12-27/_bulk"
+    ],
+    [
+      "PUT",
+      "/journalpump-2022-01-05"
+    ],
+    [
+      "POST",
+      "/journalpump-2022-01-05/_bulk"
+    ]
+  ],
   "version_response": {
     "version": {
       "number": "9.0.0"

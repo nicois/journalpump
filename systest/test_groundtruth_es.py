@@ -87,11 +87,10 @@ def test_elasticsearch_wire_bytes(tmp_path: Path) -> None:
             state_path = tmp_path / f"state-{override}.json"
             with gt.groundtruth_pump(_config(state_path, server.base_url, journal_path, override), tmp_path) as process:
                 gt.wait_until(
-                    lambda: sum(
-                        len(_bulk_index_and_payloads(r["body"]))
-                        for r in server.requests_matching("POST", "/_bulk")
-                    )
-                    >= 40,
+                    lambda: (
+                        sum(len(_bulk_index_and_payloads(r["body"])) for r in server.requests_matching("POST", "/_bulk"))
+                        >= 40
+                    ),
                     description="40 captured bulk messages",
                 )
                 process.stop()
@@ -101,9 +100,7 @@ def test_elasticsearch_wire_bytes(tmp_path: Path) -> None:
         # Ordered non-alias request stream: version probe, index create,
         # bulks. Alias polls are time-gated and excluded (module docstring).
         run_ordered = [
-            (r["method"], r["path"])
-            for r in server.requests
-            if not (r["method"] == "GET" and r["path"] == "/_aliases")
+            (r["method"], r["path"]) for r in server.requests if not (r["method"] == "GET" and r["path"] == "/_aliases")
         ]
         assert run_ordered.count(("GET", "/")) == 1, "the sender probes the version exactly once"
         assert run_ordered.count(("PUT", "/journalpump-2021-12-27" if not override else "/journalpump-2022-01-05")) == 1
@@ -121,6 +118,9 @@ def test_elasticsearch_wire_bytes(tmp_path: Path) -> None:
                 payloads_by_index.setdefault(index_name, []).append(payload)
         sent = gt.read_sender_state(state_path, "out")["sent"]
         sent_values.append({"count": sent["count"], "cursor": sent["cursor"]})
+        # The sender sets content-length explicitly from the buffered
+        # size — asserted per run, covering BOTH runs.
+        assert all(int(r["headers"]["content-length"]) == len(r["body"]) for r in server.requests_matching("POST", "/_bulk"))
 
     assert version_get_count == 2
     assert sorted(payloads_by_index) == ["journalpump-2021-12-27", "journalpump-2022-01-05"]
@@ -147,6 +147,12 @@ def test_elasticsearch_wire_bytes(tmp_path: Path) -> None:
                 ],
             },
             "version_response": {"version": {"number": "9.0.0"}},
+            # Ordered non-alias request sequence, deduplicated to the
+            # first-seen order of distinct (method, path) pairs: POST
+            # counts are timing-dependent (see the payload-stream note),
+            # so only the distinct sequence is pinned. Aliases polls are
+            # time-gated and excluded.
+            "request_sequence": list(dict.fromkeys(ordered_non_alias)),
             "indices": {
                 index: {"mapping": mapping_by_index[index], "payloads": payloads_by_index[index]}
                 for index in sorted(mapping_by_index)
@@ -168,8 +174,7 @@ def test_elasticsearch_wire_bytes(tmp_path: Path) -> None:
                 "so the second sender's extra_field_values are ignored: the rollover runs are "
                 "sequential, not concurrent",
                 "GET /_aliases polls are time-gated and excluded from the ordered comparison",
-                "batch/POST boundaries are timing-dependent: compare concatenated payload "
-                "streams per index",
+                "batch/POST boundaries are timing-dependent: compare concatenated payload streams per index",
             ],
         }
         gt.save_fixture(_FIXTURE_NAME, fixture)
@@ -182,8 +187,8 @@ def test_elasticsearch_wire_bytes(tmp_path: Path) -> None:
         assert payloads_by_index[index] == expected_index["payloads"]
         assert len(payloads_by_index[index]) == 40
     assert bulk_headers["content-type"] == fixture["bulk_request"]["headers"]["content-type"]
-    # The sender sets content-length explicitly from the buffered size.
-    assert all(int(r["headers"]["content-length"]) == len(r["body"]) for r in server.requests_matching("POST", "/_bulk"))
+    # JSON round-trips pairs as lists, so normalize the captured tuples.
+    assert [list(pair) for pair in dict.fromkeys(ordered_non_alias)] == fixture["request_sequence"]
     for sent in sent_values:
         assert sent["count"] == fixture["expected"]["count"]
         assert sent["cursor"] == fixture["expected"]["cursor"]

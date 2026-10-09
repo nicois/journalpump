@@ -96,7 +96,9 @@ def test_missing_cursor_replay_replays_from_head(tmp_path: Path) -> None:
             "expected": {
                 "final_sent_count": final_sent["count"],
                 "final_sent_cursor": final_sent["cursor"],
-                "replayed_line_count_matches_first_run": True,
+                # Derived from this capture, not hardcoded: the replay
+                # re-sent exactly as many lines as the first run sent.
+                "replayed_line_count_matches_first_run": len(phase2_lines) == len(phase1_lines),
             },
             "notes": [
                 "Python replays the ENTIRE journal from the head when any sender cursor is "
@@ -116,3 +118,4 @@ def test_missing_cursor_replay_replays_from_head(tmp_path: Path) -> None:
     assert final_sent["count"] == fixture["expected"]["final_sent_count"]
     assert final_sent["cursor"] == fixture["expected"]["final_sent_cursor"]
     assert phase2_lines == phase1_lines[: len(phase2_lines)]
+    assert (len(phase2_lines) == len(phase1_lines)) == fixture["expected"]["replayed_line_count_matches_first_run"]

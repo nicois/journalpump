@@ -238,11 +238,14 @@ LOGPLEX_TIMESTAMP_PLACEHOLDER = b"0000-00-00T00:00:00+00:00"
 def parse_logplex_frames(body: bytes) -> list[bytes]:
     """Split a logplex POST body into its length-prefixed frames.
 
-    Quirk captured from the real binary: LogplexSender.format_msg
-    f-strings the ENCODED packet (``f"{len(pkt)} {pkt}"`` with bytes
-    ``pkt``), so each length prefix is followed by the Python bytes
-    REPR of the packet (``b'...'``) — length + 3 characters on the
-    wire. The fixture pins that shape; Go must reproduce it.
+    Python wire shape; sanctioned deviation — Go sends the clean RFC
+    frame (charter §2/D6). Quirk captured from the real binary:
+    LogplexSender.format_msg f-strings the ENCODED packet
+    (``f"{len(pkt)} {pkt}"`` with bytes ``pkt``), so each length prefix
+    is followed by the Python bytes REPR of the packet (``b'...'``) —
+    length + 3 characters on the wire. The fixture pins that shape as
+    captured Python ground truth only; Go's content parity is asserted
+    via the repr-stripped frame list, not these bytes.
     """
     frames = []
     index = 0

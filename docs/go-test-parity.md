@@ -474,16 +474,23 @@ recorded in each manifest's `notes` and in the module docstring of
 - wall-clock fields are normalized (logplex frame timestamps) or
   dropped (state `health.elapsed`, `start_time`).
 
-Quirk-locks the Go senders must reproduce (captured, not assumed):
+Quirk-locks the Go senders must reproduce (captured, not assumed) —
+except the logplex wire framing, which is a **sanctioned deviation**
+(charter §2/D6, user decision 2026-10-09):
 
-- **logplex frames carry Python bytes reprs**:
-  `LogplexSender.format_msg` f-strings the encoded packet
-  (`f"{len(pkt)} {pkt}"` with bytes `pkt`), so every length prefix on
-  the wire is followed by `b'...'` — the repr — which is `len + 3`
-  characters. The length prefix itself counts only the packet content.
-  Also: `_HOSTNAME`/`_PID` lookups miss (payload keys are stored
-  un-underscored), so hostname and pid are the literal `"localhost"`
-  fallbacks; a 500 response does not trigger retry/disconnect.
+- **logplex frames carry Python bytes reprs — sanctioned deviation,
+  Python ground truth only**: `LogplexSender.format_msg` f-strings the
+  encoded packet (`f"{len(pkt)} {pkt}"` with bytes `pkt`), so the
+  PYTHON wire shape has every length prefix followed by `b'...'` — the
+  repr — which is `len + 3` characters. The length prefix itself
+  counts only the packet content. Go sends the clean RFC frame and
+  does NOT reproduce the repr framing; the fixture pins the
+  repr-stripped frame LIST, and Go's content parity (PRI, timestamp,
+  hostname/pid, message) is asserted against that list. The
+  non-framing quirks ARE quirk-locks: `_HOSTNAME`/`_PID` lookups miss
+  (payload keys are stored un-underscored), so hostname and pid are
+  the literal `"localhost"` fallbacks; a 500 response does not trigger
+  retry/disconnect.
 - **file sender never flushes**: `open(file_output, "ab")` is never
   flushed or closed; a write lands only when a later write would
   overflow `io.DEFAULT_BUFFER_SIZE`, and the daemon sender thread dies
@@ -495,7 +502,10 @@ Quirk-locks the Go senders must reproduce (captured, not assumed):
 - **per-entry JSON cache**: `JournalObjectHandler.json_objects` caches
   the serialized entry by field-filter name, so two senders without a
   field filter on the same reader share the first sender's payload and
-  the second sender's `extra_field_values` are silently ignored.
+  the second sender's `extra_field_values` are silently ignored
+  (captured: `systest/test_groundtruth_json_cache.py` runs two
+  concurrent filterless file senders on one reader and asserts their
+  outputs are byte-identical).
 - **ES/OpenSearch**: version probe (`GET /`) once per sender; index
   name `<prefix>-<timestamp[:10]>` per message (daily rollover);
   mapping from each index's first message; `_bulk` NDJSON of

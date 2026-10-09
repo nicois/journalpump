@@ -70,9 +70,7 @@ def test_go_written_state_file_floats_round_trip():
 
 def test_python_written_state_file_is_present():
     """The Python→Go direction's fixture exists and parses."""
-    state = json.loads(
-        (REPO_ROOT / "internal/state/testdata/state_python_written.json").read_text(encoding="utf-8")
-    )
+    state = json.loads((REPO_ROOT / "internal/state/testdata/state_python_written.json").read_text(encoding="utf-8"))
     assert set(state.keys()) == {"readers", "start_time"}
     assert resume_cursor(state["readers"]["reader_one"]) is None
 
@@ -94,7 +92,5 @@ def test_go_rewrite_of_python_fixture_round_trips(tmp_path):
         capture_output=True,
     )
     rewritten = json.loads(rewrite.read_text(encoding="utf-8"))
-    original = json.loads(
-        (REPO_ROOT / "internal/state/testdata/state_python_written.json").read_text(encoding="utf-8")
-    )
+    original = json.loads((REPO_ROOT / "internal/state/testdata/state_python_written.json").read_text(encoding="utf-8"))
     assert rewritten == original

@@ -208,7 +208,10 @@ Files: `systest-go/groundtruth_*_test.go` + committed fixtures under
 harness with local capture servers, and commit the captured wire bytes as
 golden fixtures that later Go tasks must match:
 - **file sender**: filtered output file bytes for a fixture journal.
-- **logplex**: exact POST body + headers captured by a local HTTP server;
+- **logplex**: POST bodies + headers captured by a local HTTP server
+  (Python's actual bytes-repr wire framing is Python ground truth only —
+  sanctioned deviation, charter §2/D6: Go sends the clean RFC frame and
+  content parity is asserted via the repr-stripped frame list);
   quirk-lock evidence: 500 response does NOT trigger retry/disconnect;
   hostname/pid literal "localhost".
 - **ES/OpenSearch**: fake HTTP server capturing index-create + `_bulk`
@@ -411,10 +414,13 @@ Files: `internal/sender/logplex/`. Fire-and-forget POST, PRI 190 frame,
 format-time timestamp, hostname/pid always literal `"localhost"`
 (underscore-strip quirk — named quirk-lock test), `verify=False`, 2 s
 timeout.
-Tests: httptest asserting exact body/headers **vs the Task 11 logplex
-fixture** and that a 500 response does NOT trigger retry or disconnect
-(parity quirk lock; custom fake per thread B — no maintained wire fake
-exists).
+Tests: httptest asserting headers and the repr-stripped frame LIST
+**vs the Task 11 logplex fixture** — the fixture's bytes-repr wire
+framing is Python ground truth only (sanctioned deviation, charter
+§2/D6: Go sends the clean RFC frame, so body BYTES are not compared,
+content is) — and that a 500 response does NOT trigger retry or
+disconnect (parity quirk lock; custom fake per thread B — no
+maintained wire fake exists).
 Depends on: Tasks 13, 11.
 
 ## Phase 3 — Kafka, ES/OpenSearch, websocket
@@ -552,7 +558,11 @@ render Go-style (60.0 → "60", 1e-05 → "0.00001",
 1e+20 → "100000000000000000000"), and non-ASCII is raw UTF-8 instead of
 ensure_ascii \uXXXX; the resume-cursor quirk is unaffected because
 reading walks the file's key order in both implementations** (user
-decision, 2026-10-09, extending the Task 3 review decision); **sanctioned deviation: runtime tolerance of
+decision, 2026-10-09, extending the Task 3 review decision); **sanctioned deviation: the logplex sender emits the clean RFC frame —
+Python's accidental f-string bytes-repr wire framing (`len b'...'`) is
+NOT reproduced; the Task 11 logplex fixture pins Python's actual wire
+shape and Go's content parity is asserted via the repr-stripped frame
+list** (user decision, 2026-10-09, Task 11 review); **sanctioned deviation: runtime tolerance of
 malformed entry values — values that crash Python mid-run (truthy
 non-string MESSAGE in the secret-filter/apply paths, float/exotic search
 field values, non-numeric PRIORITY, non-string unit) are tolerated: the
