@@ -444,6 +444,30 @@ diff and test output.
   placeholder remains; future review rounds amend these artifacts through
   the same loop.
 
+**Drift controls** (added 2026-10-09 after a sibling project's
+remediation drifted into infrastructure tasks while the user's actual
+objective receded and local approvals became the progress metric):
+
+- **Review-finding taxonomy** (cross-reviewer prompts label each
+  finding; coordinator adjudicates): (1) defect in an accepted
+  requirement, (2) unmet requirement needed for the current milestone,
+  (3) proposed new requirement or threat-model extension, (4) optional
+  robustness improvement. Only 1–2 block the milestone; 3–4 get
+  coordinator scope adjudication — accept, defer to a named task, or
+  reject — rather than automatic fix rounds.
+- **Replan triggers** — pause the task cadence and reassess priorities
+  with the user when: two unsuccessful correction rounds on one task;
+  three scope escalations within one task; scope growth >25% against
+  the plan task's stated deliverables; or five implementation tasks
+  completed without any end-to-end value demonstration (the Go binary
+  actually running).
+- **Ledger metrics** (§6): each task row records its review-round count
+  and minor-finding count (majors already implied by the verdict
+  history), and the ledger keeps a running "last value demonstration"
+  line — the most recent commit where the Go binary demonstrably ran
+  end-to-end (none yet; update when Task 16/18 produces the first
+  run).
+
 ## 6. Progress ledger
 
 The coordinator (or builder, after receiving a review verdict) updates
