@@ -78,14 +78,9 @@ func TestFileSenderEndToEnd(t *testing.T) {
 	// Binary. It is built with the systest tag so the reader's
 	// files-available shim compiles in (the Go analogue of the Python
 	// harness's sitecustomize patch); the production binary never
-	// includes it. The shim activates only via the env var below.
-	bin := filepath.Join(t.TempDir(), "journalpump")
-	build := exec.Command("go", "build", "-tags", "systest", "-o", bin, "./cmd/journalpump")
-	build.Dir = repoRoot
-	build.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
+	// includes it. The shim activates only via the env var below. The
+	// build is shared via TestMain (journalpump_process_test.go).
+	bin := goBinaryPath
 
 	// Stage the fixture journals.
 	logsDir := filepath.Join(t.TempDir(), "logs")

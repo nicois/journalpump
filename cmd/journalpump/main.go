@@ -105,6 +105,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "Journalpump failed to start: %v\n", err)
 		return exitErr
 	}
+	// Install the signal handlers BEFORE the READY=1 notifications so a
+	// supervisor that reacts to readiness (systemd sends SIGHUP on reload)
+	// can never race ahead of handler installation. Python installs its
+	// SIGHUP/SIGTERM handlers in ServiceDaemon.__init__ (daemon.py:52-54)
+	// after the constructor's first RELOADING/READY pair and before main's
+	// final READY=1, so its handlers are live by the time the last READY is
+	// sent. The Go port previously called newSignals() only after both
+	// READYs, leaving a window in which an immediate post-READY SIGHUP was
+	// dropped; installing them here closes that window.
+	signals := newSignals()
+	defer signals.Close()
+
 	// daemon.py:114 + main(): READY=1 twice at startup (parity).
 	for i := 0; i < 2; i++ {
 		if _, err := notifier.Notify(daemon.StateReady); err != nil {
@@ -113,8 +125,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	signals := newSignals()
-	defer signals.Close()
 	if err := pump.Run(signals.Run, signals.Hup); err != nil {
 		// Runtime failures (reader open errors, watchdog notify errors):
 		// Python crashes with a traceback — exit 1.

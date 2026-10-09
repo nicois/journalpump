@@ -47,8 +47,11 @@ import (
 
 // pollInterval mirrors poll_interval_ms (journalpump.py:863): the
 // per-iteration housekeeping cadence and the idle wait when no journal
-// reader exists.
-const pollInterval = time.Second
+// reader exists. It is a var (not a const) so the systest build can
+// honor JOURNALPUMP_POLL_INTERVAL_MS via poll_interval_systest.go —
+// the Go analogue of the Python systest harness setting
+// pump.poll_interval_ms = 100. The production default is unchanged.
+var pollInterval = time.Second
 
 // Logger is the pump's logging seam; the standard library *log.Logger
 // satisfies it (same seam as internal/sender).
