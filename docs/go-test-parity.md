@@ -1317,6 +1317,12 @@ else a WARNING plus `datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
 + "Z"`; appname = the nested
 `SYSLOG_IDENTIFIER → SYSTEMD_UNIT → PROCESS_NAME` default chain; pid =
 the truthiness-then-`str()` rule (falsy → NILVALUE); msg = MESSAGE.
+The journal payload is decoded with `json.Decoder.UseNumber()` so an
+INTEGER field (JSON `100`) keeps its integer identity instead of
+collapsing to float64 and rendering "100.0" — Python's `json.loads` yields
+`int(100)` and `str(100) == "100"`, while a float field keeps its fraction.
+`TestNumericFieldsKeepIntegerIdentity` and the captured
+`numeric_pid_and_fields` wire case pin it.
 
 Error classification and reconnection:
 
@@ -1327,15 +1333,22 @@ Error classification and reconnection:
   `except Exception` path (`mark_disconnected`, `unexpected_exception`
   stats, backoff, re-init). `TestInstanceClassifierRoutesConnErrors`
   proves the classifier is installed and routes both ways.
-- `_init_rsyslog_client` (rsyslog.py:25-70) is ported as `initClient`:
-  on a retriable connect failure it logs the same warning, waits the
-  base.py jittered exponential backoff PLUS the flat 5 s sleep, and
-  retries until the client comes up or the context is cancelled; a
-  non-retriable failure (e.g. a missing `rsyslog_server`) returns
-  immediately for the unexpected-exception path. The wait is a
-  cancelable seam so shutdown never hangs.
-  `TestInitLoopRetriesRetriableConnectErrors` (2 failures → 2 sleeps,
-  each ≥ 5 s), `TestInitLoopCancelledDuringBackoff`,
+- Connection transitions and backoff are owned by the shared Task 13
+  loop, not the sender. On a retriable connect failure the sender logs
+  rsyslog.py:62-66's warning, waits the flat 5 s sleep (rsyslog.py:70),
+  and RETURNS the error; the loop then does the `mark_disconnected`
+  transition (populating the health error ring), the jittered exponential
+  backoff on ONE shared counter (so a send-failure backoff and a
+  subsequent reconnect-failure backoff continue the same exponent rather
+  than restarting), and the reset on the next successful batch. The
+  sender keeps no private backoff state. A non-retriable failure (e.g. a
+  missing `rsyslog_server`) returns immediately for the
+  unexpected-exception path; the 5 s wait is a cancelable seam so
+  shutdown never hangs.
+  `TestSendFailureRefusedReconnectThenSuccess` (send failure → refused
+  reconnect → successful reconnect, with the flat 5 s sleep and a
+  retriable classification),
+  `TestInitRetriableFailureCancelledDuringSleep` and
   `TestInitLoopNonRetriableReturnsImmediately` pin it.
 - On any send failure the client is dropped so the next attempt
   reconnects (Python's `close()` + `= None`); the shared loop owns the
@@ -1346,12 +1359,13 @@ Ground truth:
 - `test/test_rsyslog_sender_groundtruth.py` drives the REAL Python
   `RsyslogSender` against an in-process recording TCP server and commits
   the wire bytes to
-  `internal/sender/rsyslog/testdata/wire_groundtruth.json` (7 cases:
+  `internal/sender/rsyslog/testdata/wire_groundtruth.json` (8 cases:
   priorities, non-transparent/octet-counted/escape-newlines multiline,
-  oversize octet-counted truncation, custom logline, facility-list +
-  structured-data). Regenerate with `GROUNDTRUTH_UPDATE=1 pytest
-  test/test_rsyslog_sender_groundtruth.py`; the default run re-captures
-  and fails on drift. Every case carries an explicit timestamp so the
+  oversize octet-counted truncation, custom logline, numeric-PID/fields,
+  facility-list + structured-data). Regenerate with `GROUNDTRUTH_UPDATE=1
+  pytest test/test_rsyslog_sender_groundtruth.py`; the default run
+  re-captures and fails on drift. Every case carries an explicit timestamp
+  so the
   capture is deterministic (the fallback is wall-clock).
 - `internal/sender/rsyslog/wire_groundtruth_test.go` replays the same
   fixture through the Go sender (config + payloads → a byte-exact wire
@@ -1373,22 +1387,33 @@ black-box suite. The Python in-process helpers (`journalpump_initialized`,
 manual `request_stop`) are replaced by the harness's READY=1 wait and
 SIGTERM.
 
-**Divergence flagged for adjudication — READY=1 precedes reader open in
-Go.** The harness treats READY=1 as "ready for input". Python's
-`JournalPump.__init__` opens the journal (JournalReader.__init__ →
-get_reader performs the initial seek) before its first READY=1
-(daemon.py:113-114), but the Go daemon notifies READY=1 in `main` BEFORE
-`Pump.Run` starts the reader goroutines that call `reopener.Ensure()`. With
-`initial_position: "tail"` the seek pins the tail at open time, so any
-journal line written between READY=1 and the Go reader attaching is
-skipped — verified directly: a line injected ~0.2 s after start is lost,
-one injected ~1 s after is delivered. This is a real startup-window
-divergence (Go's reader-open window extends past READY, Python's does
-not), not a sender bug; it belongs to the daemon/reader startup ordering
-(not Task 20's file scope) and is flagged rather than silently fixed.
-The ported driver keeps the wire assertions deterministic meanwhile via a
-bounded readiness probe (`_wait_for_reader_ready`): it re-sends a
-throwaway journal entry until one reaches the wire (tail pin taken)
-before injecting the real batch; the probe text never matches an
-assertion pattern. If a daemon-side fix moves reader-open before READY,
-the probe becomes a no-op.
+**Startup-delivery fix — first poll is immediate (no open-before-READY
+change).** An earlier draft of this note claimed Python opens the journal
+before its first READY=1; that is FALSE. Python's `JournalReader.__init__`
+leaves `journald_reader` None (journalpump.py:204) and `update_status`
+opens it inside `run`, after BOTH READY=1 notifications (daemon.py:113-114;
+journalpump.py:1143-1179). READY=1 therefore precedes reader-open in both
+implementations, and with `initial_position: "tail"` a line injected
+before the reader attaches is skipped by both.
+
+The real Go divergence the ported driver exposed was an EXTRA delay: the Go
+reader slept a full `pollInterval` before its first open (the
+`journaldReader == nil` branch), while Python's run loop starts with
+`poll_timeout_ms = 0.0` (journalpump.py:1104) and opens the reader on the
+immediate first poll. Combating that by moving reader-open before READY
+would NOT reproduce Python and would be a separate lifecycle improvement
+requiring adjudication; it was not done. Instead the daemon's first loop
+iteration now polls immediately (`ReaderRuntime.run`), matching Python.
+Verified directly before the fix: a line injected ~0.2 s after start was
+lost, one at ~1 s delivered; after the fix the reader attaches on the first
+iteration. The regression guard is
+`TestRunLoopOpensReaderWithoutInitialPollDelay`, which fails (ensureCalls
+stays 0 after `synctest.Wait()`) if the initial delay returns — independent
+of the systest driver.
+
+The ported driver still waits for reader attachment with a bounded probe
+(`_wait_for_reader_ready`): like the original driver's
+`journalpump_initialized()`, the tail-positioned reader must be attached
+before the real batch, in EITHER implementation. The probe would also mask
+a returning initial delay, so it does not stand alone — the daemon
+regression guard above is the authoritative check.
