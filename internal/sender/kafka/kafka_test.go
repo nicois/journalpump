@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"syscall"
 	"testing"
@@ -177,6 +178,75 @@ func TestClientConfigSSLDerivedFromSSLFlag(t *testing.T) {
 	}
 	if cfg.securityProtocol != "SSL" {
 		t.Errorf("securityProtocol = %q, want SSL", cfg.securityProtocol)
+	}
+}
+
+// TestClientConfigSSLTruthiness: Python derives SSL from the truthiness
+// of the ssl setting, so values like 1, "true" and "yes" must enable SSL
+// rather than silently falling back to PLAINTEXT (review item B4).
+func TestClientConfigSSLTruthiness(t *testing.T) {
+	for _, ssl := range []any{true, 1, int64(1), "true", "yes", "1", "0", json.Number("1")} {
+		raw := baseConfig()
+		raw["ssl"] = ssl
+		cfg, err := resolveClientConfig(raw)
+		if err != nil {
+			t.Fatalf("ssl=%v: resolveClientConfig: %v", ssl, err)
+		}
+		if cfg.securityProtocol != "SSL" {
+			t.Errorf("ssl=%v: securityProtocol = %q, want SSL", ssl, cfg.securityProtocol)
+		}
+	}
+	for _, ssl := range []any{false, 0, "", nil} {
+		raw := baseConfig()
+		raw["ssl"] = ssl
+		cfg, err := resolveClientConfig(raw)
+		if err != nil {
+			t.Fatalf("ssl=%v: resolveClientConfig: %v", ssl, err)
+		}
+		if cfg.securityProtocol != "PLAINTEXT" {
+			t.Errorf("ssl=%v: securityProtocol = %q, want PLAINTEXT", ssl, cfg.securityProtocol)
+		}
+	}
+}
+
+// TestClientConfigRejectsMalformedSSLValues: a non-string ca/certfile/
+// keyfile or SASL credential must be an error, never a silent downgrade
+// (review item B4).
+func TestClientConfigRejectsMalformedSSLValues(t *testing.T) {
+	for _, tc := range []struct {
+		key string
+		val any
+	}{
+		{"ca", 123},
+		{"ca", map[string]any{"path": "x"}},
+		{"certfile", 5},
+		{"keyfile", []any{"x"}},
+	} {
+		raw := baseConfig()
+		raw["security_protocol"] = "SSL"
+		raw[tc.key] = tc.val
+		if _, err := resolveClientConfig(raw); err == nil {
+			t.Errorf("%s=%v: want error, got nil", tc.key, tc.val)
+		}
+	}
+	// A malformed CA under SASL_SSL is also rejected.
+	raw := baseConfig()
+	raw["security_protocol"] = "SASL_SSL"
+	raw["sasl_plain_username"] = "user"
+	raw["sasl_plain_password"] = "password"
+	raw["ca"] = 123
+	if _, err := resolveClientConfig(raw); err == nil {
+		t.Error("ca=123 under SASL_SSL: want error, got nil")
+	}
+}
+
+func TestClientConfigRejectsMalformedSASLCredentials(t *testing.T) {
+	raw := baseConfig()
+	raw["security_protocol"] = "SASL_PLAINTEXT"
+	raw["sasl_plain_username"] = 42
+	raw["sasl_plain_password"] = "password"
+	if _, err := resolveClientConfig(raw); err == nil {
+		t.Error("numeric sasl_plain_username: want error, got nil")
 	}
 }
 
@@ -463,6 +533,14 @@ func TestRetriableClassification(t *testing.T) {
 		{"producer error wraps permanent", &sarama.ProducerError{Err: sarama.ErrInvalidMessage}, false},
 		{"connection refused", syscall.ECONNREFUSED, true},
 		{"invalid message is permanent", sarama.ErrInvalidMessage, false},
+		// ProducerErrors (the slice returned by SyncProducer.SendMessages)
+		// has no Unwrap, so it is inspected element by element (A2).
+		{"batch all retriable", sarama.ProducerErrors{{Err: sarama.ErrNotLeaderForPartition}, {Err: sarama.ErrRequestTimedOut}}, true},
+		{"batch all retriable network", sarama.ProducerErrors{{Err: sarama.ErrOutOfBrokers}, {Err: sarama.ErrNetworkException}}, true},
+		{"batch mixed is permanent", sarama.ProducerErrors{{Err: sarama.ErrNotLeaderForPartition}, {Err: sarama.ErrInvalidMessage}}, false},
+		{"batch single permanent", sarama.ProducerErrors{{Err: sarama.ErrInvalidMessage}}, false},
+		{"empty batch", sarama.ProducerErrors{}, false},
+		{"batch wrapped", fmt.Errorf("send failed: %w", sarama.ProducerErrors{{Err: sarama.ErrLeaderNotAvailable}}), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -476,6 +554,80 @@ func TestRetriableClassification(t *testing.T) {
 func TestRetriableTimeout(t *testing.T) {
 	if !Retriable(context.DeadlineExceeded) {
 		t.Error("Retriable(context.DeadlineExceeded) = false, want true")
+	}
+}
+
+// TestRetriableKErrorMapping pins the protocol-error table against
+// kafka-python 2.3.2's retriable=True classes (review item A3). Certain
+// codes that look transient (BrokerNotAvailable, RebalanceInProgress) are
+// deliberately NOT retriable because kafka-python does not mark them so,
+// and newer codes are included even though sarama lacks named constants.
+func TestRetriableKErrorMapping(t *testing.T) {
+	retriable := map[sarama.KError]string{
+		sarama.ErrUnknown:                         "UnknownError (-1)",
+		sarama.ErrUnknownTopicOrPartition:         "3",
+		sarama.ErrLeaderNotAvailable:              "5",
+		sarama.ErrNotLeaderForPartition:           "6",
+		sarama.ErrRequestTimedOut:                 "7",
+		sarama.ErrReplicaNotAvailable:             "9",
+		sarama.ErrNetworkException:                "13",
+		sarama.ErrOffsetsLoadInProgress:           "14",
+		sarama.ErrConsumerCoordinatorNotAvailable: "15",
+		sarama.ErrNotCoordinatorForConsumer:       "16",
+		sarama.ErrNotEnoughReplicas:               "19",
+		sarama.ErrNotEnoughReplicasAfterAppend:    "20",
+		sarama.ErrNotController:                   "41",
+		sarama.ErrConcurrentTransactions:          "51",
+		sarama.ErrKafkaStorageError:               "56",
+		sarama.ErrFetchSessionIDNotFound:          "70",
+		sarama.ErrInvalidFetchSessionEpoch:        "71",
+		sarama.ErrListenerNotFound:                "72",
+		sarama.ErrFencedLeaderEpoch:               "74",
+		sarama.ErrUnknownLeaderEpoch:              "75",
+		sarama.ErrOffsetNotAvailable:              "78",
+		sarama.ErrPreferredLeaderNotAvailable:     "80",
+		sarama.ErrEligibleLeadersNotAvailable:     "83",
+		sarama.ErrElectionNotNeeded:               "84",
+		sarama.ErrUnstableOffsetCommit:            "88",
+		sarama.ErrThrottlingQuotaExceeded:         "89",
+		sarama.KError(100):                        "100 UnknownTopicId",
+		sarama.KError(103):                        "103 InconsistentTopicId",
+		sarama.KError(106):                        "106 FetchSessionTopicId",
+		sarama.KError(122):                        "122 ShareSessionNotFound",
+		sarama.KError(123):                        "123 InvalidShareSessionEpoch",
+	}
+	for code, label := range retriable {
+		if !Retriable(code) {
+			t.Errorf("Retriable(%s) = false, want true", label)
+		}
+	}
+	permanent := map[sarama.KError]string{
+		sarama.ErrBrokerNotAvailable:       "8 BrokerNotAvailable (kafka-python: not retriable)",
+		sarama.ErrRebalanceInProgress:      "27 RebalanceInProgress (kafka-python: not retriable)",
+		sarama.ErrInvalidMessage:           "2 CorruptRecord",
+		sarama.ErrTopicAlreadyExists:       "36 TopicAlreadyExists",
+		sarama.ErrTopicAuthorizationFailed: "29 TopicAuthorizationFailed",
+		sarama.ErrMessageSizeTooLarge:      "10 MessageSizeTooLarge",
+	}
+	for code, label := range permanent {
+		if Retriable(code) {
+			t.Errorf("Retriable(%s) = true, want false", label)
+		}
+	}
+}
+
+// TestRetriableClientErrors covers the sarama client-side errors mapped
+// onto kafka-python's retriable client exceptions.
+func TestRetriableClientErrors(t *testing.T) {
+	for _, err := range []error{
+		sarama.ErrNotConnected,
+		sarama.ErrControllerNotAvailable,
+		sarama.ErrIncompleteResponse,
+		sarama.ErrInsufficientData,
+	} {
+		if !Retriable(err) {
+			t.Errorf("Retriable(%v) = false, want true", err)
+		}
 	}
 }
 

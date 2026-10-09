@@ -150,6 +150,9 @@ type producerConfig struct {
 	lingerMS    int
 	compression string
 	socks5Proxy string
+	// keyed reports whether a fixed kafka_msg_key is configured; it picks
+	// the partitioner's consistency requirement (see murmur2Partitioner).
+	keyed bool
 }
 
 // New is the wiring-map constructor for output_type "kafka"
@@ -213,6 +216,7 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 // credential requirements.
 func resolveClientConfig(raw map[string]any) (clientConfig, error) {
 	cfg := clientConfig{}
+	var err error
 	if v, present := raw["kafka_api_version"]; present && v != nil {
 		s, ok := v.(string)
 		if !ok {
@@ -238,18 +242,29 @@ func resolveClientConfig(raw map[string]any) (clientConfig, error) {
 			return cfg, fmt.Errorf("Invalid security_protocol value: %v", v) //nolint:staticcheck // ValueError text parity with kafka_sender.py:67
 		}
 		cfg.securityProtocol = s
-	} else if isTrue(raw["ssl"]) {
+	} else if truthy(raw["ssl"]) {
+		// Python uses `elif self.config.get("ssl"):` — truthiness, not an
+		// exact-boolean check. Treating only `true` as SSL would silently
+		// downgrade 1/"true"/"yes" to PLAINTEXT (review item B4).
 		cfg.securityProtocol = "SSL"
 	} else {
 		cfg.securityProtocol = "PLAINTEXT"
 	}
-	// SSL settings for SSL and SASL_SSL.
+	// SSL settings for SSL and SASL_SSL. A malformed value is rejected
+	// rather than silently discarded, so transport security is never
+	// downgraded without an operator-visible error (item B4).
 	if cfg.securityProtocol == "SSL" || cfg.securityProtocol == "SASL_SSL" {
-		cfg.caFile = configString(raw, "ca")
+		if cfg.caFile, err = configString(raw, "ca"); err != nil {
+			return cfg, err
+		}
 	}
 	if cfg.securityProtocol == "SSL" {
-		cfg.certFile = configString(raw, "certfile")
-		cfg.keyFile = configString(raw, "keyfile")
+		if cfg.certFile, err = configString(raw, "certfile"); err != nil {
+			return cfg, err
+		}
+		if cfg.keyFile, err = configString(raw, "keyfile"); err != nil {
+			return cfg, err
+		}
 	}
 	// SASL settings for SASL_PLAINTEXT and SASL_SSL.
 	if cfg.securityProtocol == "SASL_PLAINTEXT" || cfg.securityProtocol == "SASL_SSL" {
@@ -261,8 +276,12 @@ func resolveClientConfig(raw map[string]any) (clientConfig, error) {
 			}
 			cfg.saslMechanism = s
 		}
-		cfg.saslUsername = configString(raw, "sasl_plain_username")
-		cfg.saslPassword = configString(raw, "sasl_plain_password")
+		if cfg.saslUsername, err = configString(raw, "sasl_plain_username"); err != nil {
+			return cfg, err
+		}
+		if cfg.saslPassword, err = configString(raw, "sasl_plain_password"); err != nil {
+			return cfg, err
+		}
 		if cfg.saslUsername == "" || cfg.saslPassword == "" {
 			return cfg, errors.New("SASL username and password must be provided for SASL authentication")
 		}
@@ -291,6 +310,9 @@ func resolveProducerConfig(raw map[string]any) (producerConfig, error) {
 			return p, fmt.Errorf("socks5_proxy: %v is not a string", v)
 		}
 		p.socks5Proxy = s
+	}
+	if v, present := raw["kafka_msg_key"]; present && truthy(v) {
+		p.keyed = true
 	}
 	return p, nil
 }
@@ -343,11 +365,14 @@ func (pc producerConfig) saramaConfig() (*sarama.Config, error) {
 	cfg.Producer.RequiredAcks = sarama.WaitForLocal
 	cfg.Producer.Flush.Frequency = time.Duration(pc.lingerMS) * time.Millisecond
 	cfg.Producer.Compression = sarama.CompressionSnappy
-	// kafka-python's default partitioner is murmur2(key) % num_partitions
-	// (kafka_sender.py keying behavior pinned by the Task 12 fixture);
-	// sarama's reference hash partitioner implements the same
-	// Java-compatible murmur2, unlike its default FNV partitioner.
-	cfg.Producer.Partitioner = sarama.NewReferenceHashPartitioner
+	// kafka-python's default partitioner is murmur2(key) % num_partitions.
+	// sarama's own hash partitioners use FNV-1a, NOT murmur2, so the sender
+	// installs the kafka-python-compatible partitioner (review item A1) to
+	// keep keyed records on the same partitions as the Python sender.
+	keyed := pc.keyed
+	cfg.Producer.Partitioner = func(topic string) sarama.Partitioner {
+		return &murmur2Partitioner{topic: topic, consistency: keyed}
+	}
 	return cfg, nil
 }
 
@@ -589,6 +614,25 @@ func Retriable(err error) bool {
 	if err == nil {
 		return false
 	}
+	// sarama's SyncProducer.SendMessages returns a ProducerErrors slice,
+	// which has an Error method but no Unwrap, so errors.As cannot see
+	// the per-message causes through it. Inspect each cause explicitly:
+	// the batch is retriable only when every failed message failed for a
+	// retriable reason (a permanent cause makes the whole batch
+	// unexpected, matching Python treating the unclassified error as an
+	// unexpected exception). Review item A2.
+	var batch sarama.ProducerErrors
+	if errors.As(err, &batch) {
+		if len(batch) == 0 {
+			return false
+		}
+		for _, pe := range batch {
+			if !Retriable(pe.Err) {
+				return false
+			}
+		}
+		return true
+	}
 	// Network-level failures (Python socket.timeout, TimeoutError, and
 	// the retriable kafka-python errors).
 	var netErr net.Error
@@ -607,6 +651,17 @@ func Retriable(err error) bool {
 	if errors.Is(err, sarama.ErrOutOfBrokers) {
 		return true
 	}
+	// sarama client-side errors that stand in for kafka-python's retriable
+	// client errors (NoBrokersAvailable/MetadataEmptyBrokerList/StaleMetadata
+	// → ErrOutOfBrokers above; NodeNotReadyError → ErrNotConnected;
+	// KafkaProtocolError/InvalidReceiveError/CorrelationIdError → truncated
+	// or incomplete responses; UnknownError handled by retriableKError).
+	if errors.Is(err, sarama.ErrNotConnected) ||
+		errors.Is(err, sarama.ErrControllerNotAvailable) ||
+		errors.Is(err, sarama.ErrIncompleteResponse) ||
+		errors.Is(err, sarama.ErrInsufficientData) {
+		return true
+	}
 	var kerr sarama.KError
 	if errors.As(err, &kerr) {
 		return retriableKError(kerr)
@@ -614,21 +669,51 @@ func Retriable(err error) bool {
 	return false
 }
 
-// retriableKError is the subset of sarama KErrors kafka-python marks
-// retriable (the transient metadata/broker conditions).
+// retriableKError is exactly the set of Kafka protocol error codes that
+// kafka-python 2.3.2 marks retriable=True (plus UnknownError, which
+// journalpump adds explicitly to KAFKA_CONN_ERRORS), mapped onto sarama's
+// KError constants. Deriving the set from the Python source is what keeps
+// the health/backoff classification in parity: BrokerNotAvailable (8) and
+// RebalanceInProgress (27) are NOT retriable in kafka-python, while
+// ReplicaNotAvailable (9), NotController (41), ListenerNotFound (72) and
+// ThrottlingQuotaExceeded (89) among others ARE (review item A3).
 func retriableKError(err sarama.KError) bool {
 	switch err {
-	case sarama.ErrUnknown,
-		sarama.ErrUnknownTopicOrPartition,
-		sarama.ErrLeaderNotAvailable,
-		sarama.ErrNotLeaderForPartition,
-		sarama.ErrRequestTimedOut,
-		sarama.ErrBrokerNotAvailable,
-		sarama.ErrNetworkException,
-		sarama.ErrNotEnoughReplicas,
-		sarama.ErrNotEnoughReplicasAfterAppend,
-		sarama.ErrRebalanceInProgress,
-		sarama.ErrKafkaStorageError:
+	case sarama.ErrUnknown, // -1, UnknownError (journalpump's explicit addition)
+		sarama.ErrUnknownTopicOrPartition,         // 3
+		sarama.ErrLeaderNotAvailable,              // 5
+		sarama.ErrNotLeaderForPartition,           // 6
+		sarama.ErrRequestTimedOut,                 // 7
+		sarama.ErrReplicaNotAvailable,             // 9
+		sarama.ErrNetworkException,                // 13
+		sarama.ErrOffsetsLoadInProgress,           // 14
+		sarama.ErrConsumerCoordinatorNotAvailable, // 15
+		sarama.ErrNotCoordinatorForConsumer,       // 16
+		sarama.ErrNotEnoughReplicas,               // 19
+		sarama.ErrNotEnoughReplicasAfterAppend,    // 20
+		sarama.ErrNotController,                   // 41
+		sarama.ErrConcurrentTransactions,          // 51
+		sarama.ErrKafkaStorageError,               // 56
+		sarama.ErrFetchSessionIDNotFound,          // 70
+		sarama.ErrInvalidFetchSessionEpoch,        // 71
+		sarama.ErrListenerNotFound,                // 72
+		sarama.ErrFencedLeaderEpoch,               // 74
+		sarama.ErrUnknownLeaderEpoch,              // 75
+		sarama.ErrOffsetNotAvailable,              // 78
+		sarama.ErrPreferredLeaderNotAvailable,     // 80
+		sarama.ErrEligibleLeadersNotAvailable,     // 83
+		sarama.ErrElectionNotNeeded,               // 84
+		sarama.ErrUnstableOffsetCommit,            // 88
+		sarama.ErrThrottlingQuotaExceeded,         // 89
+		// Codes kafka-python marks retriable but sarama has no named
+		// constant for (UnknownTopicId, InconsistentTopicId,
+		// FetchSessionTopicId, ShareSessionNotFound,
+		// InvalidShareSessionEpoch).
+		sarama.KError(100),
+		sarama.KError(103),
+		sarama.KError(106),
+		sarama.KError(122),
+		sarama.KError(123):
 		return true
 	default:
 		return false
@@ -677,14 +762,20 @@ func splitBrokers(address string) []string {
 	return out
 }
 
-// configString returns a config string value or "" when absent/null.
-func configString(raw map[string]any, key string) string {
-	if v, present := raw[key]; present && v != nil {
-		if s, ok := v.(string); ok {
-			return s
-		}
+// configString returns a config string value or "" when absent/null. A
+// present non-string value is rejected instead of being silently dropped
+// — for the SSL/SASL material the old lenient behavior could downgrade
+// transport security with no operator-visible error (review item B4).
+func configString(raw map[string]any, key string) (string, error) {
+	v, present := raw[key]
+	if !present || v == nil {
+		return "", nil
 	}
-	return ""
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("%s: %v is not a string", key, v)
+	}
+	return s, nil
 }
 
 // configInt renders a config value as an int32 with Python int()
@@ -723,12 +814,6 @@ func configInt(v any) (int32, bool) {
 	default:
 		return 0, false
 	}
-}
-
-// isTrue reports Python's `value is True`.
-func isTrue(v any) bool {
-	b, ok := v.(bool)
-	return ok && b
 }
 
 // truthy mirrors Python truthiness for decoded config values.
