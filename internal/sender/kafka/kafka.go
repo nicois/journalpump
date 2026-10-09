@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -313,6 +314,11 @@ func resolveClientConfig(raw map[string]any) (clientConfig, error) {
 func resolveProducerConfig(raw map[string]any) (producerConfig, error) {
 	cc, err := resolveClientConfig(raw)
 	if err != nil {
+		return producerConfig{}, err
+	}
+	// Validate kafka_topic_config now so a malformed value fails the connect
+	// instead of surfacing only after the producer is up (review item E13).
+	if _, _, _, err := topicConfig(raw); err != nil {
 		return producerConfig{}, err
 	}
 	p := producerConfig{
@@ -652,7 +658,10 @@ func (s *Sender) ensureProducer(ctx context.Context) (producer, error) {
 // TopicAlreadyExists is tolerated; any other error is returned. Both the
 // admin dial and the create call are cancellation-aware (item C7).
 func (s *Sender) maybeCreateTopic(ctx context.Context, pc producerConfig) error {
-	numPartitions, repFactor, ok := topicConfig(s.rawConfig)
+	numPartitions, repFactor, ok, err := topicConfig(s.rawConfig)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return nil
 	}
@@ -899,21 +908,37 @@ func retriableKError(err sarama.KError) bool {
 // topicConfig extracts kafka_topic_config's num_partitions and
 // replication_factor. ok is true only when BOTH are present and non-null
 // (kafka_sender.py:143-146 — the admin create runs only then).
-func topicConfig(raw map[string]any) (numPartitions int32, replicationFactor int16, ok bool) {
+//
+// A present but invalid value is an error, never a silent skip: kafka-python
+// hands the values straight to the CreateTopics request encoding, where the
+// Int32/Int16 fields reject a float, a string or an out-of-range integer.
+// Silently skipping the create (or truncating a float, accepting a numeric
+// string prefix, or narrowing an overflowing int) would leave the operator
+// with a broken topic and no error (review item E13).
+func topicConfig(raw map[string]any) (numPartitions int32, replicationFactor int16, ok bool, err error) {
 	tc, present := raw["kafka_topic_config"]
 	if !present || tc == nil {
-		return 0, 0, false
+		return 0, 0, false, nil
 	}
 	m, isMap := tc.(map[string]any)
 	if !isMap {
-		return 0, 0, false
+		return 0, 0, false, fmt.Errorf("kafka_topic_config: %v is not a mapping", tc)
 	}
-	np, npOK := configInt(m["num_partitions"])
-	rf, rfOK := configInt(m["replication_factor"])
-	if !npOK || !rfOK {
-		return 0, 0, false
+	npv, npPresent := m["num_partitions"]
+	rfv, rfPresent := m["replication_factor"]
+	if !npPresent || npv == nil || !rfPresent || rfv == nil {
+		// Python only creates the topic when both are non-None.
+		return 0, 0, false, nil
 	}
-	return np, int16(rf), true
+	np, err := configInt("kafka_topic_config.num_partitions", npv, math.MaxInt32, math.MinInt32)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	rf, err := configInt("kafka_topic_config.replication_factor", rfv, math.MaxInt16, math.MinInt16)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return int32(np), int16(rf), true, nil
 }
 
 // validSecurityProtocol reports whether name is one of
@@ -1070,42 +1095,41 @@ func configString(raw map[string]any, key string) (string, error) {
 	return s, nil
 }
 
-// configInt renders a config value as an int32 with Python int()
-// semantics (int, float truncation, numeric string, bool).
-func configInt(v any) (int32, bool) {
+// configInt renders a config value as an int within [min,max], matching the
+// integer semantics of kafka-python's protocol encoding: a JSON integer, a
+// Go int, or a Python bool (an int subclass) are accepted; a float, a
+// fractional JSON number, a numeric string or any out-of-range value is
+// rejected rather than truncated or narrowed (review item E13).
+func configInt(key string, v any, maxVal, minVal int64) (int64, error) {
+	var n int64
 	switch t := v.(type) {
 	case int:
-		return int32(t), true
+		n = int64(t)
 	case int32:
-		return t, true
+		n = int64(t)
 	case int64:
-		return int32(t), true
-	case float64:
-		return int32(t), true
+		n = t
+	case json.Number:
+		// Int64 rejects a fractional or exponent form ("2.5", "2e3"),
+		// which Python's json would parse as a float and the encoder would
+		// then reject.
+		parsed, err := t.Int64()
+		if err != nil {
+			return 0, fmt.Errorf("%s: %v is not an integer", key, v)
+		}
+		n = parsed
 	case bool:
 		// Python bool is an int subclass: replication_factor=True is 1.
 		if t {
-			return 1, true
+			n = 1
 		}
-		return 0, true
-	case json.Number:
-		if n, err := t.Int64(); err == nil {
-			return int32(n), true
-		}
-		f, err := t.Float64()
-		if err != nil {
-			return 0, false
-		}
-		return int32(f), true
-	case string:
-		var n int
-		if _, err := fmt.Sscanf(strings.TrimSpace(t), "%d", &n); err != nil {
-			return 0, false
-		}
-		return int32(n), true
 	default:
-		return 0, false
+		return 0, fmt.Errorf("%s: %v is not an integer", key, v)
 	}
+	if n > maxVal || n < minVal {
+		return 0, fmt.Errorf("%s: %d is out of range [%d, %d]", key, n, minVal, maxVal)
+	}
+	return n, nil
 }
 
 // truthy mirrors Python truthiness for decoded config values.

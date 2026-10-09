@@ -1075,6 +1075,93 @@ func TestMaybeCreateTopicPartialConfigSkips(t *testing.T) {
 	}
 }
 
+// TestTopicConfigRejectsInvalidValues: kafka-python encodes
+// num_partitions as Int32 and replication_factor as Int16, so a float, a
+// numeric string, a fractional JSON number or an out-of-range value fails
+// the request encoding. Silently skipping the create (or truncating) would
+// hide a broken config; the values must be rejected instead (review item
+// E13).
+func TestTopicConfigRejectsInvalidValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  map[string]any
+	}{
+		{"float num_partitions", map[string]any{"num_partitions": 2.0, "replication_factor": 1}},
+		{"fractional num_partitions", map[string]any{"num_partitions": 2.5, "replication_factor": 1}},
+		{"numeric string num_partitions", map[string]any{"num_partitions": "2", "replication_factor": 1}},
+		{"trailing-garbage string", map[string]any{"num_partitions": "2abc", "replication_factor": 1}},
+		{"fractional json number", map[string]any{"num_partitions": json.Number("2.5"), "replication_factor": json.Number("1")}},
+		{"float replication_factor", map[string]any{"num_partitions": 2, "replication_factor": 1.5}},
+		{"string replication_factor", map[string]any{"num_partitions": 2, "replication_factor": "1"}},
+		{"num_partitions overflow", map[string]any{"num_partitions": int64(1) << 40, "replication_factor": 1}},
+		{"replication_factor overflow", map[string]any{"num_partitions": 2, "replication_factor": int64(70000)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := baseConfig()
+			raw["kafka_topic_config"] = tc.cfg
+			if _, err := resolveProducerConfig(raw); err == nil {
+				t.Fatal("resolveProducerConfig: want error for invalid kafka_topic_config, got nil")
+			}
+			s := newSender(t, raw)
+			pc, _ := resolveProducerConfig(baseConfig())
+			fa := &fakeAdmin{}
+			s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
+			if err := s.maybeCreateTopic(context.Background(), pc); err == nil {
+				t.Fatal("maybeCreateTopic: want error, got nil")
+			}
+			if len(fa.created) != 0 {
+				t.Errorf("created = %v, want none", fa.created)
+			}
+		})
+	}
+}
+
+// TestTopicConfigRejectsNonMapValue: a present kafka_topic_config that is
+// not a mapping is a config error, not a silent skip.
+func TestTopicConfigRejectsNonMapValue(t *testing.T) {
+	raw := baseConfig()
+	raw["kafka_topic_config"] = "2"
+	if _, err := resolveProducerConfig(raw); err == nil {
+		t.Fatal("want error for a non-map kafka_topic_config, got nil")
+	}
+}
+
+// TestTopicConfigAcceptsIntegers pins the accepted forms: Go ints, integer
+// json.Number, and Python's bool-as-int.
+func TestTopicConfigAcceptsIntegers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  map[string]any
+		want struct {
+			np int32
+			rf int16
+		}
+	}{
+		{"ints", map[string]any{"num_partitions": 3, "replication_factor": 2}, struct {
+			np int32
+			rf int16
+		}{3, 2}},
+		{"json numbers", map[string]any{"num_partitions": json.Number("5"), "replication_factor": json.Number("1")}, struct {
+			np int32
+			rf int16
+		}{5, 1}},
+		{"bools", map[string]any{"num_partitions": true, "replication_factor": true}, struct {
+			np int32
+			rf int16
+		}{1, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			np, rf, ok, err := topicConfig(map[string]any{"kafka_topic_config": tc.cfg})
+			if err != nil {
+				t.Fatalf("topicConfig: %v", err)
+			}
+			if !ok || np != tc.want.np || rf != tc.want.rf {
+				t.Fatalf("topicConfig = (%d, %d, %v), want (%d, %d, true)", np, rf, ok, tc.want.np, tc.want.rf)
+			}
+		})
+	}
+}
+
 // --- connection reporting ---
 
 func TestEnsureProducerReportsConnected(t *testing.T) {
