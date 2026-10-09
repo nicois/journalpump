@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // NilValue is Python's NILVALUE ("-").
@@ -56,14 +57,38 @@ func RFC5424(f Fields) []byte {
 	b.WriteByte(' ')
 	b.WriteString(f.Msg)
 	b.WriteByte('\n')
-	return []byte(b.String())
+	return encodeUTF8Replace(b.String())
 }
 
 // RFC3164 formats f as an RFC 3164 syslog message (rsyslog.py:37-50).
 func RFC3164(f Fields) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<%d>%s %s %s[%s]: %s\n", f.Pri, f.RFC3164Date, f.Hostname, f.AppID, f.ProcID, f.Msg)
-	return []byte(b.String())
+	return encodeUTF8Replace(b.String())
+}
+
+// encodeUTF8Replace ports Python's s.encode("utf-8", "replace") over the
+// string parts journalpump builds. Python decodes journal field bytes with
+// surrogateescape, so a byte that is not valid UTF-8 is a lone surrogate
+// that re-encodes to '?' — one '?' per invalid byte. Go strings carry raw
+// bytes, so each invalid byte must become its own '?'. Valid U+FFFD in the
+// input (EF BF BD) is a real character and passes through.
+func encodeUTF8Replace(s string) []byte {
+	if utf8.ValidString(s) {
+		return []byte(s)
+	}
+	out := make([]byte, 0, len(s)+1)
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			out = append(out, '?')
+			i++
+			continue
+		}
+		out = append(out, s[i:i+size]...)
+		i += size
+	}
+	return out
 }
 
 // GenerateFormat ports _generate_format (rsyslog.py:72-96): the simple
@@ -133,7 +158,7 @@ func FormatCustom(template string, f Fields) ([]byte, error) {
 		"proc_id":     f.ProcID,
 		"msg_id":      f.MsgID,
 		"msg":         f.Msg,
-		"sd":          derefOr(f.SD, ""),
+		"sd":          customSD(f.SD),
 	}
 	var b strings.Builder
 	for i := 0; i < len(template); {
@@ -168,14 +193,17 @@ func FormatCustom(template string, f Fields) ([]byte, error) {
 			i++
 		}
 	}
-	return []byte(b.String()), nil
+	return encodeUTF8Replace(b.String()), nil
 }
 
-func derefOr(p *string, def string) string {
-	if p == nil {
-		return def
+// customSD mirrors what Python's str.format renders for the sd keyword:
+// sd=None formats as the four characters "None", while a present value
+// (including "") formats as itself (rsyslog.py:53-54, 246-257).
+func customSD(sd *string) string {
+	if sd == nil {
+		return "None"
 	}
-	return *p
+	return *sd
 }
 
 // Format is the RFC selector used by the client (rsyslog.py:123-132):

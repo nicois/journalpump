@@ -6,6 +6,7 @@
 package syslogframing
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -27,13 +28,21 @@ type Conn interface {
 	Close() error
 }
 
+// writeDeadliner is the optional deadline seam used to unblock a stalled
+// write when the caller's context is canceled. net.Conn and *tls.Conn
+// implement it; a plain stub may not, in which case cancellation can only
+// be observed between writes.
+type writeDeadliner interface {
+	SetWriteDeadline(t time.Time) error
+}
+
 // Config carries the SyslogTcpClient constructor arguments
 // (rsyslog.py:100-141).
 type Config struct {
 	Server              string
 	Port                int
 	RFC                 string // "RFC5424" | "RFC3164" | "CUSTOM"
-	MaxMsg              int    // <= 0 means DefaultMaxMsg
+	MaxMsg              int    // 0 means DefaultMaxMsg; negatives preserved
 	Protocol            string // "" == "PLAINTEXT"
 	CACerts             string
 	KeyFile             string
@@ -43,14 +52,18 @@ type Config struct {
 	EscapeNewlines      bool
 
 	// Dial is a test/transport seam: when set it replaces the network
-	// dial and the TLS wrapping, returning an already-connected Conn
-	// (Python's tests patch _connect and assign .socket).
-	Dial func() (Conn, error)
-	// TLSConfig, when non-nil, wraps the dialed connection for the real
-	// path (SNI uses Server). Mutually exclusive with Dial.
+	// dial, returning an already-connected Conn (Python's tests patch
+	// _connect and assign .socket). It receives the caller's context so a
+	// custom dial can honor cancellation; TLS wrapping (when TLSConfig is
+	// set) still applies to the returned Conn.
+	Dial func(ctx context.Context) (Conn, error)
+	// TLSConfig, when non-nil, wraps the dialed connection and its
+	// handshake is completed during construction (Python's
+	// SSLSocket.connect completes the handshake inside _connect). SNI
+	// uses Server when TLSConfig.ServerName is empty.
 	TLSConfig *tls.Config
-	// Now is the clock seam for socket deadline paths synctest cannot
-	// drive (plan Task 19); defaults to time.Now.
+	// Now is the clock seam for socket deadlines synctest cannot drive
+	// (plan Task 19); defaults to time.Now.
 	Now func() time.Time
 }
 
@@ -63,9 +76,10 @@ type Client struct {
 	conn    Conn
 }
 
-// NewClient builds the formatter, TLS context and initial connection,
-// mirroring SyslogTcpClient.__init__ (including its error cases).
-func NewClient(cfg Config) (*Client, error) {
+// NewClient builds the formatter, TLS context and initial (fully
+// handshaked) connection, mirroring SyslogTcpClient.__init__. The context
+// bounds the dial and the TLS handshake.
+func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	format, err := Format(cfg.RFC, cfg.LogFormat)
 	if err != nil {
 		return nil, err
@@ -80,6 +94,10 @@ func NewClient(cfg Config) (*Client, error) {
 		}
 		cfg.TLSConfig = tlsCfg
 	}
+	if cfg.TLSConfig != nil && cfg.TLSConfig.ServerName == "" {
+		cfg.TLSConfig = cfg.TLSConfig.Clone()
+		cfg.TLSConfig.ServerName = cfg.Server
+	}
 	now := cfg.Now
 	if now == nil {
 		now = time.Now
@@ -90,7 +108,7 @@ func NewClient(cfg Config) (*Client, error) {
 		framing: NewFraming(cfg.MaxMsg, cfg.OctetCountedFraming),
 		now:     now,
 	}
-	if err := c.connect(); err != nil {
+	if err := c.connect(ctx); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -125,31 +143,46 @@ func buildTLSConfig(cfg Config) (*tls.Config, error) {
 	return tlsCfg, nil
 }
 
-// connect ports _connect (rsyslog.py:143-165).
-func (c *Client) connect() error {
+// connect ports _connect (rsyslog.py:143-165), extended to complete the
+// TLS handshake inside the connection step (Python's
+// ssl.wrap_socket + socket.connect does so) and to honor ctx.
+func (c *Client) connect(ctx context.Context) error {
+	var raw Conn
+	var err error
 	if c.cfg.Dial != nil {
-		conn, err := c.cfg.Dial()
+		raw, err = c.cfg.Dial(ctx)
+	} else {
+		addr := net.JoinHostPort(c.cfg.Server, strconv.Itoa(c.cfg.Port))
+		var d net.Dialer
+		var netConn net.Conn
+		netConn, err = d.DialContext(ctx, "tcp", addr)
 		if err != nil {
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) {
+				return fmt.Errorf("Invalid address %s:%d", c.cfg.Server, c.cfg.Port) //nolint:staticcheck // error-text parity with rsyslog.py:161
+			}
 			return err
 		}
-		c.conn = conn
-		return nil
+		raw = netConn
 	}
-	addr := net.JoinHostPort(c.cfg.Server, strconv.Itoa(c.cfg.Port))
-	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) {
-			return fmt.Errorf("Invalid address %s:%d", c.cfg.Server, c.cfg.Port) //nolint:staticcheck // error-text parity with rsyslog.py:161
-		}
 		return err
 	}
 	if c.cfg.TLSConfig != nil {
-		// Passing ServerName enables SNI so the server can pick the right
-		// certificate (rsyslog.py:151-153).
-		conn = tls.Client(conn, c.cfg.TLSConfig)
+		netConn, ok := raw.(net.Conn)
+		if !ok {
+			_ = raw.Close()
+			return fmt.Errorf("TLS requires a net.Conn, got %T", raw)
+		}
+		tlsConn := tls.Client(netConn, c.cfg.TLSConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = tlsConn.Close()
+			return err
+		}
+		c.conn = tlsConn
+		return nil
 	}
-	c.conn = conn
+	c.conn = raw
 	return nil
 }
 
@@ -166,11 +199,17 @@ func (c *Client) close() {
 func (c *Client) Close() { c.close() }
 
 // Send ports SyslogTcpClient.send (rsyslog.py:177-209): frame the message
-// and write it, retrying exactly once when the failure is retriable.
-func (c *Client) Send(message []byte) error {
+// and write it, retrying exactly once when the failure is retriable. A
+// canceled ctx aborts before the write and unblocks a stalled write via a
+// write deadline.
+func (c *Client) Send(ctx context.Context, message []byte) error {
 	for retry := true; ; retry = false {
+		if err := ctx.Err(); err != nil {
+			c.close()
+			return err
+		}
 		if c.conn == nil {
-			if err := c.connect(); err != nil {
+			if err := c.connect(ctx); err != nil {
 				c.close()
 				if !retry || !shouldRetry(err) {
 					return err
@@ -179,10 +218,13 @@ func (c *Client) Send(message []byte) error {
 			}
 		}
 		frame := c.framing.Frame(message)
-		if err := writeAll(c.conn, frame); err == nil {
+		if err := writeWithContext(ctx, c.conn, frame, c.now); err == nil {
 			return nil
 		} else { //nolint:revive // retry decision below needs err in scope
 			c.close()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			if !retry || !shouldRetry(err) {
 				return err
 			}
@@ -190,9 +232,19 @@ func (c *Client) Send(message []byte) error {
 	}
 }
 
-// writeAll gives Conn sendall semantics.
-func writeAll(conn Conn, p []byte) error {
+// writeWithContext gives Conn sendall semantics and unblocks a stalled
+// write when ctx is canceled by forcing the write deadline into the past.
+func writeWithContext(ctx context.Context, conn Conn, p []byte, now func() time.Time) error {
+	stop := context.AfterFunc(ctx, func() {
+		if d, ok := conn.(writeDeadliner); ok {
+			_ = d.SetWriteDeadline(now())
+		}
+	})
+	defer stop()
 	for len(p) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		n, err := conn.Write(p)
 		if err != nil {
 			return err
@@ -205,15 +257,13 @@ func writeAll(conn Conn, p []byte) error {
 	return nil
 }
 
-// shouldRetry ports _should_retry (rsyslog.py:211-216): EPIPE / ECONNRESET
-// / ETIMEDOUT, or the TLS unexpected-EOF (Python's ssl.SSLEOFError).
+// shouldRetry ports _should_retry (rsyslog.py:211-216) EXACTLY: the
+// isinstance(ex, OSError) branch returns first, so only EPIPE /
+// ECONNRESET / ETIMEDOUT are retried. An ssl.SSLEOFError is an OSError
+// subclass and therefore takes that branch — its errno is not one of the
+// three, so Python does NOT retry it and neither does this port.
 func shouldRetry(err error) bool {
-	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ETIMEDOUT) {
-		return true
-	}
-	// ssl.SSLEOFError ("EOF occurred in violation of protocol") surfaces
-	// from crypto/tls as an unexpected EOF.
-	return errors.Is(err, io.ErrUnexpectedEOF)
+	return errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ETIMEDOUT)
 }
 
 // LogInput are the SyslogTcpClient.log keyword arguments
@@ -233,7 +283,7 @@ type LogInput struct {
 
 // Log ports SyslogTcpClient.log (rsyslog.py:218-258): defaults, optional
 // newline escaping, RFC3164 timestamp reformatting, formatting, send.
-func (c *Client) Log(in LogInput) error {
+func (c *Client) Log(ctx context.Context, in LogInput) error {
 	appID := defaultStr(in.Program)
 	hostname := defaultStr(in.Hostname)
 	procID := defaultPID(in.PID)
@@ -261,7 +311,7 @@ func (c *Client) Log(in LogInput) error {
 	if err != nil {
 		return err
 	}
-	return c.Send(body)
+	return c.Send(ctx, body)
 }
 
 // defaultStr is Python's `v if v else NILVALUE` for an Optional[str].

@@ -6,6 +6,7 @@
 package syslogframing
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -45,8 +46,8 @@ func makeClientCFG(t *testing.T, cfg Config) (*Client, *stubConn) {
 	if cfg.RFC == "" {
 		cfg.RFC = "RFC5424"
 	}
-	cfg.Dial = func() (Conn, error) { return sock, nil }
-	c, err := NewClient(cfg)
+	cfg.Dial = func(context.Context) (Conn, error) { return sock, nil }
+	c, err := NewClient(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestNonTransparentFraming(t *testing.T) {
 
 	t.Run("small_body_sent_verbatim", func(t *testing.T) {
 		c, sock := makeClient(t, len(small)+10, false, false)
-		if err := c.Send(small); err != nil {
+		if err := c.Send(context.Background(), small); err != nil {
 			t.Fatal(err)
 		}
 		if string(sock.sent) != string(small) {
@@ -101,7 +102,7 @@ func TestNonTransparentFraming(t *testing.T) {
 	})
 	t.Run("small_body_no_extra_newline", func(t *testing.T) {
 		c, sock := makeClient(t, len(small)+10, false, false)
-		if err := c.Send(small); err != nil {
+		if err := c.Send(context.Background(), small); err != nil {
 			t.Fatal(err)
 		}
 		if got := strings.Count(string(sock.sent), "\n"); got != 1 {
@@ -111,7 +112,7 @@ func TestNonTransparentFraming(t *testing.T) {
 	t.Run("oversize_truncated_and_newline_appended", func(t *testing.T) {
 		body := append([]byte(strings.Repeat("A", 200)), '\n')
 		c, sock := makeClient(t, 50, false, false)
-		if err := c.Send(body); err != nil {
+		if err := c.Send(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 		want := append(append([]byte(nil), body[:49]...), '\n')
@@ -122,7 +123,7 @@ func TestNonTransparentFraming(t *testing.T) {
 	t.Run("body_exactly_max_msg_triggers_truncation", func(t *testing.T) {
 		body := []byte(strings.Repeat("B", 50))
 		c, sock := makeClient(t, 50, false, false)
-		if err := c.Send(body); err != nil {
+		if err := c.Send(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 		want := append(append([]byte(nil), body[:49]...), '\n')
@@ -137,7 +138,7 @@ func TestOctetCountedFraming(t *testing.T) {
 	t.Run("small_multiline_body_framed_correctly", func(t *testing.T) {
 		body := []byte("<13>1 2024-01-01T00:00:00Z host app - - line1\nline2\nline3\n")
 		c, sock := makeClient(t, len(body)+50, true, false)
-		if err := c.Send(body); err != nil {
+		if err := c.Send(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 		wire := sock.sent
@@ -153,7 +154,7 @@ func TestOctetCountedFraming(t *testing.T) {
 	t.Run("small_body_no_trailing_newline_outside_frame", func(t *testing.T) {
 		body := []byte("<13>1 2024-01-01T00:00:00Z host app - - msg\n")
 		c, sock := makeClient(t, len(body)+50, true, false)
-		if err := c.Send(body); err != nil {
+		if err := c.Send(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 		wire := sock.sent
@@ -166,7 +167,7 @@ func TestOctetCountedFraming(t *testing.T) {
 	t.Run("oversize_truncated_and_prefix_matches", func(t *testing.T) {
 		body := []byte(strings.Repeat("X", 300))
 		c, sock := makeClient(t, 100, true, false)
-		if err := c.Send(body); err != nil {
+		if err := c.Send(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 		wire := sock.sent
@@ -187,10 +188,10 @@ func TestOctetCountedFraming(t *testing.T) {
 		body1 := append([]byte("<13>1 2024-01-01T00:00:00Z h a - - "), append([]byte(strings.Repeat("M", 300)), '\n')...)
 		body2 := []byte("<14>1 2024-01-01T00:00:01Z h b - - short\n")
 		c, sock := makeClient(t, 60, true, false)
-		if err := c.Send(body1); err != nil {
+		if err := c.Send(context.Background(), body1); err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Send(body2); err != nil {
+		if err := c.Send(context.Background(), body2); err != nil {
 			t.Fatal(err)
 		}
 		frames := parseOctetCountedFrames(t, sock.sent)
@@ -204,7 +205,7 @@ func TestOctetCountedFraming(t *testing.T) {
 	t.Run("very_small_max_msg_produces_self_consistent_frame", func(t *testing.T) {
 		body := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ\n")
 		c, sock := makeClient(t, 8, true, false)
-		if err := c.Send(body); err != nil {
+		if err := c.Send(context.Background(), body); err != nil {
 			t.Fatal(err)
 		}
 		frames := parseOctetCountedFrames(t, sock.sent)
@@ -217,7 +218,7 @@ func TestOctetCountedFraming(t *testing.T) {
 			t.Run(strconv.Itoa(maxMsg), func(t *testing.T) {
 				body := []byte(strings.Repeat("Hello, multi\nline\nbody\n", 5))
 				c, sock := makeClient(t, maxMsg, true, false)
-				if err := c.Send(body); err != nil {
+				if err := c.Send(context.Background(), body); err != nil {
 					t.Fatal(err)
 				}
 				frames := parseOctetCountedFrames(t, sock.sent)
@@ -236,7 +237,7 @@ func TestEscapeNewlines(t *testing.T) {
 		c, sock := makeClient(t, 4096, false, escape)
 		host, program := "host", "app"
 		msg := "line1\nline2\r\nline3"
-		if err := c.Log(LogInput{
+		if err := c.Log(context.Background(), LogInput{
 			Facility: 1, Severity: 6,
 			Timestamp: "2024-01-01T00:00:00.000000Z",
 			Hostname:  &host, Program: &program, Msg: &msg,
@@ -320,7 +321,7 @@ func TestLogMatchesPythonGroundtruth(t *testing.T) {
 			if tc.PID != nil {
 				pid = *tc.PID
 			}
-			if err := c.Log(LogInput{
+			if err := c.Log(context.Background(), LogInput{
 				Facility:  tc.Facility,
 				Severity:  tc.Severity,
 				Timestamp: tc.Timestamp,

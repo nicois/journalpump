@@ -21,10 +21,10 @@ func FuzzFramingSelfConsistent(f *testing.F) {
 	f.Add([]byte("<13>1 2024-01-01T00:00:00Z h a - - m\n"), 4096, false)
 	f.Add([]byte(""), 1, true)
 	f.Add(bytes.Repeat([]byte("x"), 300), 50, false)
+	f.Add([]byte("abcdef"), -1, true)
+	f.Add([]byte("abcdef"), -3, false)
+	f.Add([]byte("abcdef"), 0, true)
 	f.Fuzz(func(t *testing.T, body []byte, maxMsg int, octet bool) {
-		if maxMsg < 1 {
-			maxMsg = 1
-		}
 		fr := NewFraming(maxMsg, octet)
 		wire := fr.Frame(body)
 
@@ -41,20 +41,18 @@ func FuzzFramingSelfConsistent(f *testing.F) {
 			if n != len(sent) {
 				t.Fatalf("advertised %d != sent %d (stream desync)", n, len(sent))
 			}
-			want := body
-			if len(want) > maxMsg {
-				want = want[:maxMsg]
-			}
+			want := pySliceEnd(body, fr.MaxMsg)
 			if !bytes.Equal(sent, want) {
 				t.Fatalf("octet body = %q, want %q", sent, want)
 			}
 			return
 		}
 
-		// Non-transparent: verbatim when it fits, else truncated + newline.
-		want := body
-		if len(want) >= maxMsg {
-			want = append(append([]byte(nil), body[:maxMsg-1]...), '\n')
+		// Non-transparent: Python message[:max_msg-1], plus an explicit
+		// newline when len(message) >= max_msg.
+		want := pySliceEnd(body, fr.MaxMsg-1)
+		if len(body) >= fr.MaxMsg {
+			want = append(append([]byte(nil), want...), '\n')
 		}
 		if !bytes.Equal(wire, want) {
 			t.Fatalf("non-transparent wire = %q, want %q", wire, want)
