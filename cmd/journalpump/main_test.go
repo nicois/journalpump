@@ -8,11 +8,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Aiven-Open/journalpump/internal/daemon"
+	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 )
 
 // runInTempDir invokes run and captures its stdout/stderr output for
@@ -110,6 +115,75 @@ func TestRunExitCodes(t *testing.T) {
 			t.Errorf("exit code = %d, want 0", code)
 		}
 	})
+}
+
+// TestNewLoggerSelectsSink locks the stdout-vs-journald choice
+// (daemon.py:58-70): a non-tty *os.File selects the journald writer, and
+// a non-file writer (the test seam) is used as-is.
+func TestNewLoggerSelectsSink(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
+
+	if _, ok := newLogger(w).Writer().(journaldlog.Writer); !ok {
+		t.Errorf("non-tty file did not select the journald writer: %T", newLogger(w).Writer())
+	}
+	buf := &bytes.Buffer{}
+	if newLogger(buf).Writer() != io.Writer(buf) {
+		t.Error("non-file writer was not used as-is")
+	}
+}
+
+// TestRunLogsToJournaldWhenStdoutNotTTY locks the daemon's journald log
+// path end to end: with a non-tty *os.File stdout, the "Loading
+// configuration" line is delivered as a journal datagram carrying
+// SYSLOG_IDENTIFIER=journalpump.
+func TestRunLogsToJournaldWhenStdoutNotTTY(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journalpump.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(t.TempDir(), "journal.sock")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sock, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	previous := journaldlog.DefaultSocket
+	journaldlog.DefaultSocket = sock
+	defer func() { journaldlog.DefaultSocket = previous }()
+
+	restore := overrideSignals(t, preCancelledSignals())
+	defer restore()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
+
+	if code := run([]string{path}, w, w); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	n, _, err := conn.ReadFromUnix(buf)
+	if err != nil {
+		t.Fatalf("journal datagram not received: %v", err)
+	}
+	got := string(buf[:n])
+	if !strings.Contains(got, "MESSAGE=Loading configuration\n") {
+		t.Errorf("datagram = %q, want the loading log line", got)
+	}
+	if !strings.Contains(got, "SYSLOG_IDENTIFIER=journalpump\n") {
+		t.Errorf("datagram = %q, want SYSLOG_IDENTIFIER=journalpump", got)
+	}
 }
 
 // preCancelledSignals builds a Signals whose run context is already

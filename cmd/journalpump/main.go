@@ -16,6 +16,7 @@ import (
 
 	"github.com/Aiven-Open/journalpump/internal/config"
 	"github.com/Aiven-Open/journalpump/internal/daemon"
+	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 	"github.com/Aiven-Open/journalpump/internal/sender/file"
 )
@@ -37,6 +38,20 @@ func main() {
 // Tests replace it with a pre-cancelled Signals to drive a clean
 // immediate exit through the same path.
 var newSignals = daemon.ListenSignals
+
+// newLogger selects the log sink (daemon.py:configure_logging, 58-70):
+// when stdout is a terminal the daemon logs to it with a timestamp
+// prefix; otherwise it logs to the systemd journal through the native
+// datagram socket, where journald supplies the timestamp (Python's
+// journal formatter carries no asctime either). A non-*os.File stdout
+// (the test seam) is used as-is so tests stay deterministic without a
+// live journald.
+var newLogger = func(stdout io.Writer) *log.Logger {
+	if f, ok := stdout.(*os.File); ok && !journaldlog.IsTerminal(f) {
+		return log.New(journaldlog.NewWriter(), "", 0)
+	}
+	return log.New(stdout, "", log.LstdFlags)
+}
 
 // run mirrors journalpump/daemon.py:ServiceDaemon.main:
 //
@@ -81,11 +96,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitErr
 	}
 	// Python logs "Loading configuration" (daemon.py:107) through the
-	// logging module — stdout in Task 16 (journald logging is Task 17).
-	logger := log.New(os.Stdout, "", log.LstdFlags)
+	// logging module: stdout on a tty, the systemd journal otherwise
+	// (daemon.py:58-70).
+	logger := newLogger(stdout)
 	logger.Printf("Loading configuration")
 	registerSenders()
-	pump, err := daemon.NewPump(cfg, daemon.PumpDeps{Log: logger})
+	pump, err := daemon.NewPump(cfg, daemon.PumpDeps{Log: logger, ConfigPath: configPath})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "Journalpump failed to start: %v\n", err)
 		return exitErr

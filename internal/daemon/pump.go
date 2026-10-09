@@ -70,6 +70,16 @@ type PumpDeps struct {
 	Now func() time.Time
 	// ReadState replaces state.Read (tests); nil = state.Read.
 	ReadState func(path string) (*state.State, error)
+	// ConfigPath is the config file the SIGHUP reload handler re-stats and
+	// re-reads (daemon.py's config_path). Empty disables reload.
+	ConfigPath string
+	// LoadConfig re-reads the config file on reload (tests); nil =
+	// config.Load. Every reload re-parses, so key/order-insensitive
+	// comparisons stay in one place (config.ReadersChanged).
+	LoadConfig func(path string) (*config.Config, error)
+	// StatConfig reads the config file's ctime for the reload guard
+	// (tests); nil = configCTime (st_ctime, daemon.py:105).
+	StatConfig func(path string) (time.Time, error)
 }
 
 // senderEntry is one live sender the pump supervises: its loop, the
@@ -81,6 +91,9 @@ type senderEntry struct {
 	inst   sender.Instance
 	cancel context.CancelFunc
 	grace  time.Duration // inst.MaxSendInterval, captured for the D9 window
+	// done closes when the sender's loop goroutine returns; a reload
+	// retires a reader's senders by cancelling and joining them here.
+	done chan struct{}
 }
 
 // ReaderSource is the reader-opening seam (ensure/invalidate) —
@@ -98,6 +111,23 @@ type Pump struct {
 	notifier  Notifier
 	now       func() time.Time
 	readState func(path string) (*state.State, error)
+
+	// reload wiring (daemon.py:reload_config).
+	configPath     string
+	loadConfig     func(path string) (*config.Config, error)
+	statConfig     func(path string) (time.Time, error)
+	configCTime    time.Time
+	configCTimeSet bool
+	// readersActiveBlob is the currently-applied parsed `readers` value
+	// (Python: readers_active_config); the reload diff compares against it.
+	readersActiveBlob map[string]any
+
+	// Reader goroutine lifecycle, set by Run. The base context and group
+	// are shared so a reader failure cancels every reader (errgroup.WithCancel
+	// semantics) while a reload can cancel and add INDIVIDUAL readers.
+	readerGroup    *errgroup.Group
+	readerGroupCtx context.Context
+	readerErrCh    chan error
 
 	cfg           *config.Config
 	stats         *statsd.Client
@@ -169,6 +199,14 @@ func NewPump(cfg *config.Config, deps PumpDeps) (*Pump, error) {
 	if readState == nil {
 		readState = state.Read
 	}
+	loadConfig := deps.LoadConfig
+	if loadConfig == nil {
+		loadConfig = config.Load
+	}
+	statConfig := deps.StatConfig
+	if statConfig == nil {
+		statConfig = configCTime
+	}
 
 	// Python handle_new_config: the stats client and the base tags.
 	stats := statsd.New(cfg.Statsd.Host, cfg.Statsd.Port, cfg.Statsd.Tags, cfg.Statsd.TagOrder, cfg.Statsd.Prefix, log)
@@ -177,6 +215,9 @@ func NewPump(cfg *config.Config, deps PumpDeps) (*Pump, error) {
 		notifier:      notifier,
 		now:           now,
 		readState:     readState,
+		configPath:    deps.ConfigPath,
+		loadConfig:    loadConfig,
+		statConfig:    statConfig,
 		cfg:           cfg,
 		stats:         stats,
 		tags:          tagged.New(cfg.Tags),
@@ -186,6 +227,16 @@ func NewPump(cfg *config.Config, deps PumpDeps) (*Pump, error) {
 		statePath:     cfg.JSONStateFilePath,
 		startTimeStr:  startTimeString(now()),
 		lastStateSave: now(),
+	}
+
+	// The initial load records the config file's ctime (Python's
+	// reload_config at construction) so the first SIGHUP with an unchanged
+	// file is a no-op.
+	if pump.configPath != "" {
+		if ctime, err := statConfig(pump.configPath); err == nil {
+			pump.configCTime = ctime
+			pump.configCTimeSet = true
+		}
 	}
 
 	// Python loads geoip AFTER the stats client; a failure crashes the
@@ -244,6 +295,15 @@ func NewPump(cfg *config.Config, deps PumpDeps) (*Pump, error) {
 		}
 		pump.readers = append(pump.readers, rt)
 	}
+
+	// Record the active readers blob so a subsequent reload with identical
+	// readers is a no-op (Python: readers_active_config set at the end of
+	// configure_readers).
+	pump.readersActiveBlob = cfg.ReadersBlob()
+
+	// The initial handle_new_config tail: write_running_config
+	// (journalpump.py:970). A write failure is logged, never fatal.
+	pump.writeRunningConfig(cfg)
 
 	// One report slot per configured sender: a sender goroutine returns
 	// at most once, so the fail-fast channel never drops a report.
@@ -310,6 +370,16 @@ type ReaderRuntime struct {
 	cfg  config.ReaderConfig
 	tags *tagged.Tagged // reader-level base tags (Python reader.make_tags())
 
+	// pumpStats/pumpTags/pumpMatchKey/pumpMatchValue capture the pump-level
+	// values this reader was built with. Python readers hold the same
+	// captured references (self.stats/self.check_match reads self.config at
+	// handler construction), and capturing them keeps a reload from racing a
+	// running reader goroutine when it rebuilds the pump-level fields.
+	pumpStats      *statsd.Client
+	pumpTags       *tagged.Tagged
+	pumpMatchKey   string
+	pumpMatchValue any
+
 	stats *reader.Stats
 
 	searcher *filter.Searcher
@@ -350,6 +420,11 @@ type ReaderRuntime struct {
 	journaldReader reader.Reader
 	pending        reader.Event
 	readyFlag      bool // Python _is_ready
+
+	// goroutine lifecycle, set by startReader: cancelRun cancels this
+	// reader's context (a reload retire) and done closes when run returns.
+	cancelRun context.CancelFunc
+	done      chan struct{}
 
 	muCursor sync.Mutex
 	cursor   string // "" = Python None
@@ -413,6 +488,10 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 		log:                 log,
 		cfg:                 cfg,
 		tags:                taggedReader,
+		pumpStats:           p.stats,
+		pumpTags:            p.tags,
+		pumpMatchKey:        p.cfg.MatchKey,
+		pumpMatchValue:      p.cfg.MatchValue,
 		searcher:            searcher,
 		secretFilters:       secretFilters,
 		secretFilterMetrics: cfg.SecretFilterMetrics,
@@ -487,7 +566,7 @@ func (p *Pump) newReaderRuntime(name string, cfg config.ReaderConfig, st *state.
 	// OpenConfig closure carries the CURRENT cursor (recreations resume
 	// from the last seen entry) and the once-only initial position
 	// (journalpump.py:478).
-	rt.reopener = reader.NewReopener(func() reader.OpenConfig {
+	rt.reopener = newReopener(func() reader.OpenConfig {
 		return reader.OpenConfig{
 			Flags:        rt.openFlags,
 			Path:         cfg.JournalPath,
@@ -681,7 +760,7 @@ func (rt *ReaderRuntime) initSenders() {
 		args := sender.ConstructorArgs{
 			Name:             resolved.name,
 			Config:           resolved.config,
-			Stats:            rt.pump.stats,
+			Stats:            rt.pumpStats,
 			Tags:             rt.tags, // reader-level Tagged (base + reader=name)
 			FieldFilter:      resolved.fieldFilter,
 			UnitLogLevels:    resolved.unitLogLevels,
@@ -697,7 +776,7 @@ func (rt *ReaderRuntime) initSenders() {
 		buf := buffer.NewSenderBuffer(resolved.name, rt.msgBufferMaxLength)
 		loop := sender.NewLoop(sender.LoopConfig{
 			Name:  resolved.name,
-			Stats: rt.pump.stats,
+			Stats: rt.pumpStats,
 			Tags:  rt.senderTags(resolved.name),
 			Log:   rt.pump.log,
 		}, inst, buf.Chan())
@@ -708,11 +787,12 @@ func (rt *ReaderRuntime) initSenders() {
 			loop.MarkConnected()
 		}
 		sctx, cancel := context.WithCancel(rt.pump.senderRoot)
-		entry := &senderEntry{name: resolved.name, loop: loop, buffer: buf, inst: inst, cancel: cancel, grace: inst.MaxSendInterval}
+		entry := &senderEntry{name: resolved.name, loop: loop, buffer: buf, inst: inst, cancel: cancel, grace: inst.MaxSendInterval, done: make(chan struct{})}
 		rt.pump.senderMu.Lock()
 		rt.pump.senders[rt.name] = append(rt.pump.senders[rt.name], entry)
 		rt.pump.senderMu.Unlock()
 		rt.pump.senderGroup.Go(func() error {
+			defer close(entry.done)
 			err := runSenderLoop(entry.loop, sctx)
 			rt.pump.reportSenderError(err)
 			return err
@@ -976,8 +1056,8 @@ func (rt *ReaderRuntime) readSingleMessage(ctx context.Context) (hasMore bool, b
 // a 0.5 s sleep, and (has_more=False, bytes_read=None).
 func (rt *ReaderRuntime) broadHandler(err error) {
 	rt.log.Printf("Unexpected exception while handling entry for %s: %v", rt.name, err)
-	if rt.pump.stats != nil {
-		rt.pump.stats.UnexpectedException(err, "mainloop", rt.pump.tags.MakeTags(map[string]string{"app": "journalpump"}))
+	if rt.pumpStats != nil {
+		rt.pumpStats.UnexpectedException(err, "mainloop", rt.pumpTags.MakeTags(map[string]string{"app": "journalpump"}))
 	}
 	time.Sleep(500 * time.Millisecond)
 }
@@ -1031,10 +1111,10 @@ func (rt *ReaderRuntime) process(ctx context.Context, entry journal.Entry) (bool
 		ReaderMatchValue:      rt.matchValue,
 		SecretFilters:         rt.secretFilters,
 		SecretFilterMetrics:   rt.secretFilterMetrics,
-		PumpMatchKey:          rt.pump.cfg.MatchKey,
-		PumpMatchValue:        rt.pump.cfg.MatchValue,
-		Stats:                 rt.pump.stats,
-		PumpTags:              rt.pump.tags,
+		PumpMatchKey:          rt.pumpMatchKey,
+		PumpMatchValue:        rt.pumpMatchValue,
+		Stats:                 rt.pumpStats,
+		PumpTags:              rt.pumpTags,
 		IncLineStats:          rt.stats.IncLineStats,
 		NoteSecretFilterMatch: func() { rt.secretFilterMatches++ },
 		Log:                   rt.log,
@@ -1065,10 +1145,10 @@ func (rt *ReaderRuntime) reportSecretFilterMetrics() {
 	if rt.secretFilterMatches == 0 {
 		return
 	}
-	if rt.pump.stats == nil {
+	if rt.pumpStats == nil {
 		return
 	}
-	rt.pump.stats.Increase("journal.secret_filter_match", rt.secretFilterMatches, rt.tags.MakeTags(nil))
+	rt.pumpStats.Increase("journal.secret_filter_match", rt.secretFilterMatches, rt.tags.MakeTags(nil))
 	rt.secretFilterMatches = 0
 }
 
@@ -1079,6 +1159,14 @@ var (
 	signalNotify = signal.Notify
 	signalStop   = signal.Stop
 )
+
+// newReopener builds a reader's ensure/invalidate source. It is a
+// package seam so tests can substitute a fake (the production factory
+// opens libsystemd, which unit tests must not require); a reload builds
+// the new readers through the same factory.
+var newReopener = func(cfg func() reader.OpenConfig, log Logger) ReaderSource {
+	return reader.NewReopener(cfg, log)
+}
 
 // runSenderLoop is a seam around (*sender.Loop).Run. Loop.Run always
 // returns nil in production (cancellation is the normal exit path) and
@@ -1114,17 +1202,15 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 	defer cancelReaders()
 	group, groupCtx := errgroup.WithContext(readerCtx)
 	readerErr := make(chan error, len(p.readers))
+	// The reader lifecycle state lives on the Pump so a reload can retire
+	// and add individual readers (startReader/retireReader); the base
+	// context and errgroup are shared so a reader failure still cancels
+	// every reader.
+	p.readerGroup = group
+	p.readerGroupCtx = groupCtx
+	p.readerErrCh = readerErr
 	for _, rt := range p.readers {
-		group.Go(func() error {
-			err := rt.run(groupCtx)
-			if err != nil {
-				select {
-				case readerErr <- err:
-				default:
-				}
-			}
-			return err
-		})
+		p.startReader(rt)
 	}
 	// waitReaders joins the reader errgroup exactly once; both the
 	// supervisor loop and the shutdown sequence may need the join.
@@ -1187,9 +1273,13 @@ func (p *Pump) Run(ctx context.Context, hup <-chan os.Signal) error {
 				return err
 			}
 		case <-hup:
-			// SIGHUP is a reload EVENT (daemon.py:72-74); reload is
-			// Task 17 — consumed and logged only.
+			// SIGHUP is a reload EVENT (daemon.py:72-74): log, then run
+			// the ctime-guarded reload. A failure is logged and the run
+			// loop continues (reload_if_requested's catch).
 			p.log.Printf("Received SIGHUP")
+			if err := p.reloadConfig(); err != nil {
+				p.log.Printf("Reloading configuration failed: %v", err)
+			}
 		}
 	}
 }
