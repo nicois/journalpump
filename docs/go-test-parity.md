@@ -972,7 +972,10 @@ Parity-critical behavior reproduced exactly:
   (`:1102-1108 self.stats`, ported as `PersistentGauges.RefreshNonZeroTo`).
   A statsd-only reload with an unchanged readers blob therefore keeps the
   reader-owned metrics on the old endpoint and moves the gauge refresh to
-  the new one.
+  the new one; the parity test emits BOTH a lazily-initialized sender's
+  construction metric and secret-filter matches AFTER the reload (old
+  endpoint) and asserts the live-client gauge refresh lands on the new
+  endpoint, so the captured client is proven to survive the reload.
 - `statePath` is re-read from the parsed config on reload
   (`get_state_file_path()` parity), with both unchanged and replaced
   readers.
@@ -1006,7 +1009,20 @@ Parity-critical behavior reproduced exactly:
 - A reload whose reader retirement fails to restore an output's
   complete-line boundary (a failed CloseDiscarding) is ABORTED before
   starting the replacement reader, so no replacement writer can append
-  replay onto a corrupt prefix.
+  replay onto a corrupt prefix. The failed sender entries are RETAINED in
+  the pump's registry — the persistent cleanup-failure state for that
+  output — so a later reload retries the cleanup and, until one attempt
+  succeeds, refuses again rather than treating the output as retired
+  (the earlier "delete then clean up" ordering let a second changed-ctime
+  reload find nothing to retire and start a replacement writer on the
+  unrepaired partial line). On the file side, a failed discard leaves the
+  output handle OPEN so the retried CloseDiscarding can actually truncate
+  the partial line; a successful retry releases the handle and the reload
+  proceeds.
+- The reader's "Bad message" arm (`CorruptedEntry`,
+  `journalpump.py:392-397`) logs at WARNING, not INFO: it routes through
+  the level-aware Warningf so the line survives a WARNING threshold
+  (a plain Printf emitted at INFO and vanished).
 - The readerErr channel carries at least one buffer slot regardless of
   the initial reader count, so the first reader failure always reaches
   `Run` (Python's reader threads surface via the errgroup-equivalent).

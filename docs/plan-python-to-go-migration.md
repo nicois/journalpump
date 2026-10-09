@@ -421,6 +421,22 @@ Round-2 additions (2026-10-10, second changes-required verdict):
   constructed multi_threaded=True); the thread-name VALUE is adjudicated
   in the parity doc (Go emits "MainThread").
 
+Round-3 additions (2026-10-10, third changes-required verdict — closing):
+- The failed retirement is a PERSISTENT cleanup-failure state: the failed
+  sender entries stay registered so a later changed-ctime reload retries
+  the cleanup and still refuses (previously the entries were removed
+  before cleanup succeeded, so the next reload found nothing to retire
+  and started a replacement writer on the unrepaired partial line). A
+  successful retry releases the entries and lets the reload proceed; the
+  file sender keeps its handle open across a failed discard so the retry
+  can truncate.
+- The stats-split parity test exercises BOTH captured-client paths AFTER
+  the statsd-only reload (lazy sender init + secret-filter matches on the
+  old endpoint; live gauge refresh on the new one).
+- `CorruptedEntry` (the reader's "Bad message" arm) routes through
+  Warningf, so it survives a WARNING threshold instead of emitting at
+  INFO and vanishing.
+
 ### Task 18. Core systest suites (Milestone A)
 Files: `systest-go/`. Rotation suite as a **Go-native test** (thread C3:
 `systest/test_rotation.py` is in-process/monkeypatched in Python — port
