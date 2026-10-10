@@ -1730,13 +1730,20 @@ Config mapping (config validation outcomes identical to Python;
   `ApiVersionsRequest` is fire-and-forget and leaves the default 2.1.0
   version in place (item D11). `TestNormalizeKafkaVersion`,
   `TestInferKafkaVersion`, `TestBuildSaramaConfigDetectsVersion` pin it.
-- Retry/timeout defaults (item D12): `Metadata.Retry.Backoff` is the 1 s
-  `reconnect_backoff_ms` and a `BackoffFunc` gives the exponential growth
-  capped at the 10 s `reconnect_backoff_max_ms`; `Producer.Timeout` is
-  the 120 s `delivery_timeout_ms`, `Producer.Retry.Backoff` the 100 ms
-  `retry_backoff_ms`, `Producer.Retry.Max` effectively unlimited, and
-  `Net.Read/WriteTimeout` the 30 s `request_timeout_ms`
-  (`TestSaramaConfigRetryTimeouts`).
+- Retry/timeout defaults: `Metadata.Retry.Backoff` is the 100 ms
+  `retry_backoff_ms` — sarama's metadata retry is NOT the reconnect
+  backoff, which is a separate per-broker connection-layer delay (see the
+  C7 bullet); collapsing the two would double the reconnect delay.
+  `Producer.Timeout` is the 30 s `request_timeout_ms`: sarama transmits it
+  in Produce requests as the broker-side ack timeout, and `Net.Read`/
+  `WriteTimeout` does not correct that wire value, so it does NOT encode
+  the 120 s `delivery_timeout_ms`. The delivery deadline is enforced
+  client-side in `sendBatch` (see the C7 bullet). `Producer.Retry.Backoff`
+  is the 100 ms `retry_backoff_ms`. `Producer.Retry.Max` is BOUNDED
+  (`producerRetryMax`), not kafka-python's effectively-unlimited default:
+  sarama allocates `Retry.Max+1` `partitionRetryState` entries per
+  partition on the first message to it. Pinned by
+  `TestSaramaConfigRetryTimeouts` and `TestProducerRetryMaxIsBounded`.
 - Producer config adds `linger_ms = 500` and the compression choice.
   The deployment pins snappy (python-snappy present, zstandard absent —
   Task 12 fixture notes): `sarama.CompressionSnappy`. Python prefers
@@ -1799,21 +1806,28 @@ Send path (thread A7):
   writing the shared global races other clients (item C9).
   `TestNewDoesNotMutateSaramaLogger` and `TestConcurrentConstruction`
   pin it.
-- The connect/topic-create/send paths are cancellation-aware
-  (`runCancellable`, review items C7/3): a stalled broker or SOCKS dial
-  cannot hold shutdown/reload past the grace window. When the context wins
-  the race the underlying network op is aborted (the late producer/admin is
-  closed) and the worker is JOINED before the call returns, so no retired
-  worker or client outlives the caller.
+- The connect/topic-create/send paths are cancellation-aware end to end
+  (`runCancellable` plus a context-aware construction chain):
+  - Construction (version probes, metadata, DNS, SOCKS) receives the
+    caller's context. The tracking dialer records every connection and is
+    force-closed the moment the context ends, so a stalled handshake is
+    TERMINATED rather than waiting out each inner timeout.
+    `TestConnectProducerCancellationTerminatesMetadata` cancels a blocked
+    metadata handshake against a silent broker WITHOUT releasing it by hand.
+  - A send is bounded by the client-side delivery deadline; on deadline or
+    cancellation the in-flight produce and its retries are terminated
+    (connections closed) BEFORE the worker is joined, then the producer is
+    closed. Tested against a REAL sarama SyncProducer pointed at a broker
+    that answers metadata but stalls Produce
+    (`TestSendDeliveryDeadlineAbortsRealStalledProduce`,
+    `TestSendCancellationAbortsRealStalledProduce`); a fake whose Close
+    releases the send would not exercise the abortive path.
+  - `Close` aborts the producer's outstanding network operations and JOINS
+    the producer and client goroutines before returning; there is no timer
+    (`TestCloseAbortsAndJoinsWithoutTimer`).
   `TestEnsureProducerRespectsCancellation` and
-  `TestMaybeCreateTopicRespectsCancellation` release a blocked dial after
-  cancelling and assert the late client is closed BEFORE the call returns
-  (the join guarantee); `TestSendCancellationAbortsInFlightProduce` cancels
-  a produce already in flight (only the cancellation can end it), asserting
-  the prompt `context.Canceled`, the producer close, and the join;
+  `TestMaybeCreateTopicRespectsCancellation` cover the late-client cleanup;
   `TestSendMessagesCancelledContext` covers the pre-dial short-circuit.
-  `Close` is bounded by `closeTimeout` (5 s) so a stalled broker cannot hold
-  shutdown past the grace window.
 - Connect runs inside `SendMessages` (Python's `_init_kafka`), reports
   the connected transition through the `sender.ConnectionReporter` seam
   so the loop resets the shared backoff exponent, and a failure returns
@@ -1913,11 +1927,10 @@ all fixed:
   `TestProducerRetryMaxIsBounded`.
 - (2): `Producer.Timeout` is the BROKER-side acks timeout and bounds neither
   the client retry loop nor `SendMessages`, so `delivery_timeout_ms` parity
-  is now enforced client-side in `sendBatch`
-  (`context.WithTimeout(…, 120 s)` + abort-by-close),
-  independent of the 30 s request timeout.
-  `TestSendDeliveryDeadlineAbortsStalledProduce` pins it against a produce
-  that never returns.
+  is enforced client-side in `sendBatch`. (The round-2 test used a fake
+  whose Close released the send, which did not exercise the abortive path;
+  round 3 replaces it with a real-producer stalled-broker test — see the
+  round-3 section.)
 - (3): in-flight cancellation now aborts the underlying network op and the
   worker is joined (see the C7 bullet).
 - (4): SASL bootstrap order fixed. sarama authenticates BEFORE the explicit
@@ -1939,10 +1952,11 @@ all fixed:
   reconnect backoff (it only paced metadata retries). A connection-layer
   `backoffDialer` now implements kafka-python's
   `reconnect_backoff_ms`/`reconnect_backoff_max_ms` contract per broker
-  address: exponential growth 1 s → 10 s with uniform ±20 % jitter, reset on
-  a successful dial, tracked independently per address. Pinned by
+  address: exponential growth 1 s → 10 s with uniform ±20 % jitter, tracked
+  independently per address. (The round-2 "reset on a successful dial" and
+  "sleep the full interval" semantics were still wrong; round 3 corrects
+  them — see the round-3 section.) Pinned by
   `TestBackoffDialerGrowsCapsAndJitters`,
-  `TestBackoffDialerResetsOnSuccess`,
   `TestBackoffDialerTracksAddressesIndependently` and `TestJitterBounds`.
 - (7): a failed batch no longer returns raw `sarama.ProducerErrors` (whose
   `Error()` is only "Failed to deliver N messages"). It is wrapped in a
@@ -1959,6 +1973,66 @@ all fixed:
   `TestSocks5ResolutionSharesDeadline` plus the stalled-handshake cases.
 - (9, minor): loop tests strengthened (see the `loop_test.go` paragraph).
 - (10, minor): docs/provisioning corrected (see "Execution status" above).
+
+Review round 3 (verdict changes-required: 4 majors + 2 minors; theme: the
+cancellation/deadline machinery must be genuinely ABORTIVE, not graceful),
+all addressed:
+
+- (1, major): cancellation/deadline no longer calls a graceful sarama
+  Close before joining. `sendBatch` now runs the synchronous
+  `SendMessages` under the delivery deadline; on deadline/cancellation it
+  calls `abort()` on the tracking dialer — closing every connection, which
+  makes the stalled ack and any pending retry fail at once — and only then
+  JOINS the worker and closes the producer (`runCancellable`). The clients
+  expose `abort()`, and `sendBatch` reaches it through the `aborter`
+  interface. Pinned against a REAL sarama SyncProducer whose broker
+  answers metadata but never Produce:
+  `TestSendDeliveryDeadlineAbortsRealStalledProduce` and
+  `TestSendCancellationAbortsRealStalledProduce`.
+- (2, major): the caller's context is propagated through construction.
+  The producer/admin factories now take `context.Context`; the tracking
+  dialer (installed over the persistent backoff dialer) records every
+  connection and is force-closed when the context ends, so version probes,
+  metadata retries, DNS and SOCKS are all terminable. The version probe
+  (`detectBrokerVersion`) takes the context and probes through the same
+  tracking dialer. Pinned by
+  `TestConnectProducerCancellationTerminatesMetadata` (cancels a blocked
+  metadata handshake WITHOUT manually releasing the broker) and
+  `TestEnsureProducerRespectsCancellation` /
+  `TestMaybeCreateTopicRespectsCancellation`.
+- (3, major): `Close` no longer returns on a timer. The old
+  `closeWait`/`closeTimeout` (5 s) timer and its abandoned closing
+  goroutine are gone; `Close` aborts the producer's outstanding work and
+  joins the owned producer and client goroutines before returning. The
+  live clients own their `sarama.Client` (built via `NewClient` +
+  `NewSyncProducerFromClient`/`NewClusterAdminFromClient`) and close it
+  after the producer/admin, so no retired client is left alive. Pinned by
+  `TestCloseAbortsAndJoinsWithoutTimer`.
+- (4, major): reconnect timing now matches kafka-python. The per-address
+  state stores the instant the next dial is allowed, so a later attempt
+  waits only the REMAINING interval (elapsed time counts); the history
+  resets ONLY after a complete connection succeeds
+  (`markConnected`, after `NewClient` — TCP/TLS/SASL/metadata), a TCP-only
+  success does not reset it, and a post-connect failure is recorded with
+  `markFailed`. The double-backoff `Metadata.Retry.BackoffFunc` is removed
+  and `Metadata.Retry.Backoff` is the 100 ms `retry_backoff_ms`. Pinned by
+  `TestBackoffDialerWaitsOnlyRemaining`,
+  `TestBackoffDialerTCPSuccessDoesNotReset`,
+  `TestBackoffDialerMarkConnectedResetsAndMarkFailedGrows`,
+  `TestBackoffDialerGrowsCapsAndJitters` and
+  `TestBackoffDialerTracksAddressesIndependently`.
+- (5, minor): `Producer.Timeout` is now `requestTimeout` (30 s), the
+  value sarama transmits in Produce requests, not the 120 s
+  `deliveryTimeout`; the delivery deadline is a separate client-side
+  value. `TestSaramaConfigRetryTimeouts` asserts the two independently and
+  `TestDeliveryDeadlineIsClientSideAndDistinct` pins the distinction.
+- (6, minor, evidence accuracy): the original contract description in
+  this document was corrected (metadata backoff vs reconnect backoff,
+  `Producer.Timeout` vs the delivery deadline, `Producer.Retry.Max`
+  bounded) and the unsupported "cancellation is fixed" claims were
+  removed/replaced by the production-path regression tests above. The
+  round-2 "reset on a successful dial" and "5 s bounded Close" statements
+  were wrong and are corrected here.
 
 Recorded divergences / open items for adjudication:
 
