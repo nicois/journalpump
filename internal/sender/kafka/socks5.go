@@ -15,20 +15,22 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// proxyDialTimeout bounds the proxy TCP connect plus the SOCKS handshake.
-// sarama dials through the proxy with a context-less Dial, so a deadline
-// must live in the dialer; without it a black-holed proxy or a stalled
-// SOCKS negotiation hangs the connect forever (review item C8).
+// proxyDialTimeout bounds the WHOLE proxy connect: the local broker-name
+// lookup (socks5), the TCP connect to the proxy and the SOCKS negotiation.
+// sarama dials through the proxy with a context-less Dial, so the deadline
+// must live in the dialer; without it a black-holed proxy, a stalled
+// resolver or a stalled SOCKS handshake hangs the connect forever (review
+// items C8, 8).
 const proxyDialTimeout = 10 * time.Second
 
-// socks5Dialer builds the SOCKS5 dialer for kafka_sender.py's
-// socks5_proxy (the Aiven kafka-python fork's option; sarama surfaces it
-// as Net.Proxy.Dialer). socks5-kafka is a hard requirement.
+// socks5Dialer builds the SOCKS5 dialer for kafka_sender.py's socks5_proxy
+// (the Aiven kafka-python fork's option; sarama surfaces it as
+// Net.Proxy.Dialer). socks5-kafka is a hard requirement.
 //
-// Scheme semantics match kafka-python: socks5 resolves the broker
-// hostname locally and hands the proxy an IP, while socks5h defers the
-// name to the proxy. x/net resolves names remotely in both cases, so a
-// local resolver is layered in for socks5 (review item C8).
+// Scheme semantics match kafka-python: socks5 resolves the broker hostname
+// locally and hands the proxy an IP, while socks5h defers the name to the
+// proxy. x/net resolves names remotely in both cases, so a local resolver is
+// layered in for socks5 (review item C8).
 func socks5Dialer(address string) (proxy.Dialer, error) {
 	u, err := url.Parse(address)
 	if err != nil {
@@ -41,36 +43,69 @@ func socks5Dialer(address string) (proxy.Dialer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("socks5_proxy: %w", err)
 	}
-	var dialer proxy.Dialer = &timeoutDialer{inner: inner, timeout: proxyDialTimeout}
+	d := &socks5ProxyDialer{inner: inner, timeout: proxyDialTimeout}
 	if u.Scheme == "socks5" {
-		dialer = &localResolverDialer{inner: dialer}
+		d.resolve = lookupHost
 	}
-	return dialer, nil
+	return d, nil
 }
 
-// timeoutDialer bounds a context-less Dial by dialing with a deadline: the
-// returned context is honoured by x/net's SOCKS dialer, which sets the
-// connection deadline for the handshake.
-type timeoutDialer struct {
+// socks5ProxyDialer dials through a SOCKS5 proxy under ONE cancellable
+// deadline that covers local resolution, the TCP connect and the
+// negotiation (review item 8).
+type socks5ProxyDialer struct {
 	inner   proxy.Dialer
 	timeout time.Duration
+	// resolve, when non-nil, resolves the target host locally before dialing
+	// the proxy (the socks5, not socks5h, behavior).
+	resolve func(ctx context.Context, host string) (string, error)
 }
 
-func (d *timeoutDialer) Dial(network, addr string) (net.Conn, error) {
+// lookupHost is the production local resolver.
+func lookupHost(ctx context.Context, host string) (string, error) {
+	ips, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	if len(ips) == 0 {
+		return "", fmt.Errorf("socks5_proxy: no addresses for %s", host)
+	}
+	return ips[0], nil
+}
+
+func (d *socks5ProxyDialer) Dial(network, addr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
 	defer cancel()
-	if cd, ok := d.inner.(proxy.ContextDialer); ok {
+	if d.resolve != nil {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if net.ParseIP(host) == nil {
+			ip, err := d.resolve(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			addr = net.JoinHostPort(ip, port)
+		}
+	}
+	return dialWithContext(ctx, d.inner, network, addr)
+}
+
+// dialWithContext dials under ctx, using the inner dialer's DialContext when
+// available (x/net's SOCKS dialer honors the deadline for its handshake) and
+// otherwise racing the dial against the deadline, closing a late connection.
+func dialWithContext(ctx context.Context, inner proxy.Dialer, network, addr string) (net.Conn, error) {
+	if cd, ok := inner.(proxy.ContextDialer); ok {
 		return cd.DialContext(ctx, network, addr)
 	}
-	// Fallback for a dialer without DialContext: race the dial against the
-	// deadline, closing a late connection.
 	type result struct {
 		conn net.Conn
 		err  error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		conn, err := d.inner.Dial(network, addr)
+		conn, err := inner.Dial(network, addr)
 		ch <- result{conn, err}
 	}()
 	select {
@@ -85,28 +120,4 @@ func (d *timeoutDialer) Dial(network, addr string) (net.Conn, error) {
 	case r := <-ch:
 		return r.conn, r.err
 	}
-}
-
-// localResolverDialer resolves the target hostname locally before dialing
-// the proxy, reproducing kafka-python's socks5 (not socks5h) behavior.
-type localResolverDialer struct {
-	inner proxy.Dialer
-}
-
-func (d *localResolverDialer) Dial(network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
-	if net.ParseIP(host) == nil {
-		ips, err := net.DefaultResolver.LookupHost(context.Background(), host)
-		if err != nil {
-			return nil, err
-		}
-		if len(ips) == 0 {
-			return nil, fmt.Errorf("socks5_proxy: no addresses for %s", host)
-		}
-		addr = net.JoinHostPort(ips[0], port)
-	}
-	return d.inner.Dial(network, addr)
 }

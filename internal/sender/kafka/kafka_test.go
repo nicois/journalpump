@@ -708,8 +708,15 @@ func TestProducerConfigWithoutSocks5Proxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("saramaConfig: %v", err)
 	}
-	if sc.Net.Proxy.Enable {
-		t.Error("sarama proxy enabled without socks5_proxy")
+	// The dialer chain is installed unconditionally (sarama only consults
+	// Net.Proxy.Dialer when Enable is set) to carry the per-broker reconnect
+	// backoff; without socks5_proxy the chain is a direct dialer wrapped by
+	// the backoff dialer (review item 6).
+	if !sc.Net.Proxy.Enable {
+		t.Error("dialer chain not installed: sarama would ignore the per-broker backoff dialer")
+	}
+	if _, ok := sc.Net.Proxy.Dialer.(*backoffDialer); !ok {
+		t.Errorf("dialer = %T, want *backoffDialer", sc.Net.Proxy.Dialer)
 	}
 }
 
@@ -1236,9 +1243,12 @@ func TestEnsureProducerRespectsCancellation(t *testing.T) {
 		_, err := s.ensureProducer(ctx)
 		done <- err
 	}()
-	// Cancel only once the dial is in flight, so the runCtx drain path runs.
+	// Cancel once the dial is in flight, then let the (bounded) dial return as
+	// a real Net.DialTimeout would; the call must JOIN the worker and clean up
+	// the late producer BEFORE returning (review item 3).
 	<-entered
 	cancel()
+	close(release)
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
@@ -1247,12 +1257,11 @@ func TestEnsureProducerRespectsCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ensureProducer did not return after cancellation")
 	}
-
-	close(release)
+	// The join guarantee: cleanup already ran before the call returned.
 	select {
 	case <-late.closed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("abandoned producer was not closed")
+	default:
+		t.Fatal("late producer was not closed before ensureProducer returned (no join)")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1272,16 +1281,20 @@ func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 		t.Fatalf("resolveProducerConfig: %v", err)
 	}
 	release := make(chan struct{})
+	entered := make(chan struct{})
 	late := &signalledAdmin{closed: make(chan struct{})}
 	s.newAdmin = func(producerConfig) (admin, error) {
+		close(entered)
 		<-release
 		return late, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
 	done := make(chan error, 1)
 	go func() { done <- s.maybeCreateTopic(ctx, pc) }()
+	<-entered
+	cancel()
+	close(release) // the bounded dial returns
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
@@ -1290,12 +1303,10 @@ func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("maybeCreateTopic did not return after cancellation")
 	}
-
-	close(release)
 	select {
 	case <-late.closed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("abandoned admin was not closed")
+	default:
+		t.Fatal("late admin was not closed before maybeCreateTopic returned (no join)")
 	}
 }
 

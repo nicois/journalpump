@@ -76,12 +76,25 @@ const (
 // with retry_backoff_ms=100. metadataRetryMax is how many metadata retries
 // sarama performs within one connect (kafka-python retries until its
 // backoff cap; the shared sender loop owns the unbounded outer retry).
+//
+// producerRetryMax is BOUNDED. sarama allocates a per-partition
+// []partitionRetryState of Producer.Retry.Max+1 entries on the first
+// message to a partition (async_producer.go:612), so kafka-python's
+// effectively-unlimited default (2^31-1) would reserve ~64 GiB per
+// partition on amd64 and exhaust memory before any delivery (review item
+// BLOCKER 1). The unbounded-retry behavior is instead provided by the
+// shared sender loop (outer retry) plus the client-side delivery deadline
+// below (review item 2), which sarama's broker-side Producer.Timeout does
+// NOT provide.
 const (
 	deliveryTimeout  = 120 * time.Second
 	requestTimeout   = 30 * time.Second
 	retryBackoff     = 100 * time.Millisecond
 	metadataRetryMax = 10
-	producerRetryMax = 2147483647
+	producerRetryMax = 100
+	// closeTimeout bounds Sender.Close so a stalled broker cannot hold
+	// shutdown/reload past the grace window (review item 3).
+	closeTimeout = 5 * time.Second
 )
 
 // compressionName is the codec the deployment pins (snappy).
@@ -128,6 +141,12 @@ type Sender struct {
 	// detectVersion probes the broker for its version when api_version is
 	// unset, reproducing kafka-python's check_version (review item D11).
 	detectVersion func(brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error)
+	// deliveryDeadline is the client-side delivery deadline enforced across
+	// a SendMessages call (its internal retries included). It defaults to
+	// deliveryTimeout and is a field for tests (review item 2).
+	deliveryDeadline time.Duration
+	// closeWait bounds Close (field for tests; review item 3).
+	closeWait time.Duration
 
 	mu sync.Mutex
 	// prod is the live producer; pc is the resolved producer config
@@ -219,6 +238,8 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	s.newProducer = s.connectProducer
 	s.newAdmin = s.connectAdmin
 	s.detectVersion = detectBrokerVersion
+	s.deliveryDeadline = deliveryTimeout
+	s.closeWait = closeTimeout
 	return sender.Instance{
 		Transport:       s,
 		MaxSendInterval: time.Duration(seconds * float64(time.Second)),
@@ -404,14 +425,16 @@ func (pc producerConfig) saramaConfig() (*sarama.Config, error) {
 			cfg.Net.SASL.SCRAMClientGeneratorFunc = scramClientGenerator(scram.SHA512)
 		}
 	}
-	if pc.socks5Proxy != "" {
-		dialer, err := socks5Dialer(pc.socks5Proxy)
-		if err != nil {
-			return nil, err
-		}
-		cfg.Net.Proxy.Enable = true
-		cfg.Net.Proxy.Dialer = dialer
+	// The dialer chain carries the per-broker reconnect backoff (item 6) and,
+	// when configured, the SOCKS5 routing (item C8). sarama only consults
+	// Net.Proxy.Dialer when Net.Proxy.Enable is set, so the chain is installed
+	// unconditionally.
+	dialer, err := dialerFor(pc)
+	if err != nil {
+		return nil, err
 	}
+	cfg.Net.Proxy.Enable = true
+	cfg.Net.Proxy.Dialer = dialer
 	// Synthesis of the producer config.
 	cfg.Producer.Return.Successes = true
 	// Python kafka-python's default acks is 1 (leader ack) — sarama's
@@ -504,35 +527,140 @@ func (s *Sender) buildSaramaConfig(pc producerConfig) (*sarama.Config, error) {
 		}
 		cfg.Version = ver
 	}
+	// A detected (or configured) pre-1.0 version cannot use SASLHandshake v1:
+	// sarama would reject the handshake locally as ErrUnsupportedVersion.
+	// Fall back to v0 for those brokers (review item 4).
+	if cfg.Net.SASL.Enable && !cfg.Version.IsAtLeast(sarama.V1_0_0_0) {
+		cfg.Net.SASL.Version = sarama.SASLHandshakeV0
+	}
 	return cfg, nil
 }
 
-// detectBrokerVersion opens each bootstrap broker with the oldest protocol
-// that supports ApiVersions (0.10) and infers the broker release from the
-// advertised API versions. It is the default detectVersion seam.
+// probeConfig builds the version-probe config: a shallow copy at the oldest
+// ApiVersions-capable protocol, with SASL DISABLED. ApiVersions (and the
+// legacy pre-0.10 probes) are pre-authentication requests, and opening a
+// probe broker with SASL enabled at Version 0.10 makes sarama reject its own
+// SASLHandshake v1 locally (ErrUnsupportedVersion, v1 needs Version >= 1.0),
+// so PLAIN and both SCRAM would fail whenever kafka_api_version is unset
+// (review item 4). TLS is transport-level and stays enabled.
+func probeConfig(cfg *sarama.Config) *sarama.Config {
+	probe := *cfg
+	probe.Version = sarama.V0_10_0_0
+	probe.ApiVersionsRequest = false
+	probe.Net.SASL.Enable = false
+	probe.Net.SASL.Handshake = false
+	probe.Net.SASL.SCRAMClientGeneratorFunc = nil
+	return &probe
+}
+
+// detectBrokerVersion opens each bootstrap broker and determines its release,
+// porting kafka-python's check_version: an ApiVersions probe first, then the
+// legacy pre-0.10 probes (ListGroups/FindCoordinator/OffsetFetch/Metadata) so
+// a 0.8/0.9 deployment still connects (review item D11, item 5). It is the
+// default detectVersion seam.
 func detectBrokerVersion(brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error) {
-	probeCfg := *cfg
-	probeCfg.Version = sarama.V0_10_0_0
+	probe := probeConfig(cfg)
 	var lastErr error
 	for _, addr := range brokers {
-		b := sarama.NewBroker(addr)
-		if err := b.Open(&probeCfg); err != nil {
-			lastErr = err
-			_ = b.Close()
-			continue
+		ver, err := probeOneBroker(addr, probe)
+		if err == nil {
+			return ver, nil
 		}
-		resp, err := b.ApiVersions(&sarama.ApiVersionsRequest{Version: 0})
-		_ = b.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return inferKafkaVersion(resp), nil
+		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no bootstrap brokers to probe")
 	}
 	return sarama.V0_10_0_0, fmt.Errorf("kafka_api_version auto-detection failed: %w", lastErr)
+}
+
+// probeOneBroker determines one broker's version. The ApiVersions attempt and
+// the legacy fallback each use their own connection, because a failed probe on
+// an old broker may have left the socket unusable.
+func probeOneBroker(addr string, probe *sarama.Config) (sarama.KafkaVersion, error) {
+	if ver, err := probeViaAPIVersions(addr, probe); err == nil {
+		return ver, nil
+	}
+	return probeLegacy(addr, probe)
+}
+
+// probeViaAPIVersions sends ApiVersions v0 and infers the release from the
+// advertised API ranges. An ApiVersions response carrying an error (e.g.
+// UnsupportedVersion from a pre-0.10 broker) is NOT inferred from (review
+// item 5).
+func probeViaAPIVersions(addr string, probe *sarama.Config) (sarama.KafkaVersion, error) {
+	b := sarama.NewBroker(addr)
+	if err := b.Open(probe); err != nil {
+		_ = b.Close()
+		return sarama.KafkaVersion{}, err
+	}
+	defer func() { _ = b.Close() }()
+	resp, err := b.ApiVersions(&sarama.ApiVersionsRequest{Version: 0})
+	if err != nil {
+		return sarama.KafkaVersion{}, err
+	}
+	// An error carrying response (e.g. UnsupportedVersion from a pre-0.10
+	// broker) must NOT be inferred from; fall through to the legacy probes.
+	if resp.ErrorCode != int16(sarama.ErrNoError) {
+		return sarama.KafkaVersion{}, sarama.KError(resp.ErrorCode)
+	}
+	return inferKafkaVersion(resp), nil
+}
+
+// probeLegacy ports kafka-python's pre-0.10 VERSION_CHECKS: the first request
+// the broker answers (in newest-first order) identifies the release. sarama
+// has no constants below 0.8.2, so the 0.8.1/0.8.0 probes map onto the
+// closest available version.
+func probeLegacy(addr string, probe *sarama.Config) (sarama.KafkaVersion, error) {
+	type legacyCase struct {
+		version sarama.KafkaVersion
+		probe   func(*sarama.Broker) error
+	}
+	// (broker version, request) newest first, mirroring VERSION_CHECKS.
+	cases := []legacyCase{
+		{sarama.V0_9_0_0, func(b *sarama.Broker) error {
+			_, err := b.ListGroups(&sarama.ListGroupsRequest{Version: 0})
+			return err
+		}},
+		{sarama.V0_8_2_0, func(b *sarama.Broker) error {
+			_, err := b.FindCoordinator(&sarama.FindCoordinatorRequest{
+				Version:         0,
+				CoordinatorKey:  "kafka-python-default-group",
+				CoordinatorType: sarama.CoordinatorGroup,
+			})
+			return err
+		}},
+		{sarama.V0_8_2_0, func(b *sarama.Broker) error {
+			_, err := b.FetchOffset(&sarama.OffsetFetchRequest{
+				Version:       0,
+				ConsumerGroup: "kafka-python-default-group",
+			})
+			return err
+		}},
+		{sarama.V0_8_2_0, func(b *sarama.Broker) error {
+			_, err := b.GetMetadata(&sarama.MetadataRequest{Version: 0})
+			return err
+		}},
+	}
+	var lastErr error
+	for _, c := range cases {
+		b := sarama.NewBroker(addr)
+		if err := b.Open(probe); err != nil {
+			_ = b.Close()
+			lastErr = err
+			break // the broker is unreachable; no legacy probe will help
+		}
+		err := c.probe(b)
+		_ = b.Close()
+		if err == nil {
+			return c.version, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no legacy probe succeeded")
+	}
+	return sarama.KafkaVersion{}, lastErr
 }
 
 // inferKafkaVersion ports kafka-python's
@@ -624,11 +752,7 @@ func (s *Sender) ensureProducer(ctx context.Context) (producer, error) {
 	// negotiation must not hold shutdown/reload past the grace window
 	// (review item C7). If the context wins the race the late producer is
 	// closed by a drain goroutine so nothing leaks.
-	p, err := runCtx(ctx, func() (producer, error) { return s.newProducer(*pc) }, func(p producer) {
-		if p != nil {
-			_ = p.Close()
-		}
-	})
+	p, err := runCancellable(ctx, func() (producer, error) { return s.newProducer(*pc) }, nil, closeProducerValue)
 	if err != nil {
 		return nil, err
 	}
@@ -665,21 +789,19 @@ func (s *Sender) maybeCreateTopic(ctx context.Context, pc producerConfig) error 
 	if !ok {
 		return nil
 	}
-	a, err := runCtx(ctx, func() (admin, error) { return s.newAdmin(pc) }, func(a admin) {
-		if a != nil {
-			_ = a.Close()
-		}
-	})
+	a, err := runCancellable(ctx, func() (admin, error) { return s.newAdmin(pc) }, nil, closeAdminValue)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = a.Close() }()
-	_, err = runCtx(ctx, func() (struct{}, error) {
+	// Abort the in-flight CreateTopic by closing the admin client, then JOIN
+	// the worker so a cancelled create cannot leave a goroutine behind.
+	_, err = runCancellable(ctx, func() (struct{}, error) {
 		return struct{}{}, a.CreateTopic(s.topic, &sarama.TopicDetail{
 			NumPartitions:     numPartitions,
 			ReplicationFactor: repFactor,
 		}, false)
-	}, nil)
+	}, func() { _ = a.Close() }, nil)
 	if err != nil {
 		if errors.Is(err, sarama.ErrTopicAlreadyExists) {
 			s.logf("Kafka topic %r already exists for %s", s.topic, s.name())
@@ -691,11 +813,14 @@ func (s *Sender) maybeCreateTopic(ctx context.Context, pc producerConfig) error 
 	return nil
 }
 
-// runCtx runs fn and returns its result, but gives up as soon as ctx is
-// done. If ctx wins the race, a drain goroutine waits for fn to finish so
-// the abandoned value can be cleaned up (a client that was still dialing)
-// without leaking the goroutine or the client (review item C7).
-func runCtx[T any](ctx context.Context, fn func() (T, error), cleanup func(T)) (T, error) {
+// runCancellable runs fn in a worker goroutine. If ctx wins the race it
+// first calls abort — to cancel the underlying network operation (closing a
+// half-open client) — then JOINS the worker before returning, so no
+// goroutine and no retired client outlives the caller (shutdown/reload must
+// not leak workers) and a late value is still cleaned up (review items C7,
+// 3). A nil abort is allowed for operations already bounded by a dial
+// timeout.
+func runCancellable[T any](ctx context.Context, fn func() (T, error), abort func(), cleanup func(T)) (T, error) {
 	type result struct {
 		v   T
 		err error
@@ -706,17 +831,32 @@ func runCtx[T any](ctx context.Context, fn func() (T, error), cleanup func(T)) (
 		ch <- result{v, err}
 	}()
 	select {
-	case <-ctx.Done():
-		go func() {
-			r := <-ch
-			if cleanup != nil {
-				cleanup(r.v)
-			}
-		}()
-		var zero T
-		return zero, ctx.Err()
 	case r := <-ch:
 		return r.v, r.err
+	case <-ctx.Done():
+		if abort != nil {
+			abort()
+		}
+		r := <-ch // join the worker: no leak, no retired client left behind
+		if cleanup != nil {
+			cleanup(r.v)
+		}
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+// closeProducerValue is the runCancellable cleanup for a late producer.
+func closeProducerValue(p producer) {
+	if p != nil {
+		_ = p.Close()
+	}
+}
+
+// closeAdminValue is the runCancellable cleanup for a late admin client.
+func closeAdminValue(a admin) {
+	if a != nil {
+		_ = a.Close()
 	}
 }
 
@@ -741,20 +881,118 @@ func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) err
 			Value: sarama.ByteEncoder(body),
 		}
 	}
-	if err := p.SendMessages(msgs); err != nil {
+	if err := s.sendBatch(ctx, p, msgs); err != nil {
 		s.dropProducer()
 		return err
 	}
 	return nil
 }
 
+// sendBatch sends one batch under a client-side delivery deadline and is
+// cancellation-aware. sarama's Producer.Timeout is the BROKER-side ack
+// timeout and bounds neither the client's retry loop nor SendMessages, so
+// the delivery_timeout_ms parity is enforced here: the call is abandoned
+// (and the producer closed, aborting the in-flight request) once ctx is
+// done or the deadline elapses, and the worker is joined before returning
+// (review items 2 and 3).
+func (s *Sender) sendBatch(ctx context.Context, p producer, msgs []*sarama.ProducerMessage) error {
+	deadline := s.deliveryDeadline
+	if deadline <= 0 {
+		deadline = deliveryTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	_, err := runCancellable(ctx, func() (struct{}, error) {
+		return struct{}{}, p.SendMessages(msgs)
+	}, func() {
+		// Abort the in-flight produce: detach first so the outer dropProducer
+		// does not close the same producer twice, then close to cancel the
+		// underlying network request.
+		s.detachProducer(p)
+		_ = p.Close()
+	}, nil)
+	return wrapProducerErrors(err)
+}
+
+// sendErrors aggregates the individual per-message causes of a sarama
+// ProducerErrors batch. sarama's ProducerErrors only implements Error()
+// ("Failed to deliver N messages"), so the causes were invisible to
+// errors.As and to the loop's health ring; this aggregate unwraps to every
+// cause and renders them in the text (review item 7).
+type sendErrors struct {
+	causes []error
+}
+
+func (e *sendErrors) Error() string {
+	parts := make([]string, 0, len(e.causes))
+	for _, c := range e.causes {
+		if c != nil {
+			parts = append(parts, c.Error())
+		}
+	}
+	return fmt.Sprintf("failed to deliver %d messages: %s", len(e.causes), strings.Join(parts, "; "))
+}
+
+// Unwrap exposes the individual causes to errors.Is/As.
+func (e *sendErrors) Unwrap() []error { return e.causes }
+
+// retriable reports whether every cause is retriable (the batch-level
+// classification kafka_sender applies to a failed flush).
+func (e *sendErrors) retriable() bool {
+	if len(e.causes) == 0 {
+		return false
+	}
+	for _, c := range e.causes {
+		if !Retriable(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// wrapProducerErrors turns sarama's batch error into a sendErrors so the
+// individual causes survive to the loop's classification and health ring.
+func wrapProducerErrors(err error) error {
+	var pes sarama.ProducerErrors
+	if !errors.As(err, &pes) {
+		return err
+	}
+	causes := make([]error, 0, len(pes))
+	for _, pe := range pes {
+		if pe != nil {
+			causes = append(causes, pe.Err)
+		}
+	}
+	return &sendErrors{causes: causes}
+}
+
 // MaintenanceOperations implements sender.Sender; kafka has none.
 func (s *Sender) MaintenanceOperations(context.Context) error { return nil }
 
-// Close releases the producer (io.Closer, called by the supervisor).
+// Close releases the producer (io.Closer, called by the supervisor). The
+// close is bounded so a stalled broker cannot hold shutdown/reload past the
+// grace window; the closing goroutine still finishes and releases the client
+// (review item 3).
 func (s *Sender) Close() error {
-	s.dropProducer()
-	return nil
+	s.mu.Lock()
+	p := s.prod
+	s.prod = nil
+	s.mu.Unlock()
+	if p == nil {
+		return nil
+	}
+	wait := s.closeWait
+	if wait <= 0 {
+		wait = closeTimeout
+	}
+	done := make(chan error, 1)
+	go func() { done <- p.Close() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(wait):
+		return fmt.Errorf("kafka producer close exceeded %s; releasing", wait)
+	}
 }
 
 // SetConnectionObserver implements sender.ConnectionReporter.
@@ -782,6 +1020,16 @@ func (s *Sender) dropProducer() {
 	}
 }
 
+// detachProducer clears s.prod when it is still p, without closing it, so
+// the caller can close it exactly once (the send-abort path).
+func (s *Sender) detachProducer(p producer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prod == p {
+		s.prod = nil
+	}
+}
+
 func (s *Sender) name() string { return s.senderName }
 
 func (s *Sender) logf(format string, args ...any) {
@@ -798,6 +1046,18 @@ func (s *Sender) logf(format string, args ...any) {
 func Retriable(err error) bool {
 	if err == nil {
 		return false
+	}
+	// The sendErrors aggregate (item 7) wraps the same per-cause
+	// classification.
+	var agg *sendErrors
+	if errors.As(err, &agg) {
+		return agg.retriable()
+	}
+	// A cancelled or deadline-exceeded send (shutdown/reload or the client
+	// delivery deadline) is transient: retriable, so the loop does not file
+	// it as an unexpected exception.
+	if errors.Is(err, context.Canceled) {
+		return true
 	}
 	// sarama's SyncProducer.SendMessages returns a ProducerErrors slice,
 	// which has an Error method but no Unwrap, so errors.As cannot see

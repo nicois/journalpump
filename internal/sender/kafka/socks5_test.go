@@ -137,12 +137,30 @@ func (d *blockingDialer) Dial(string, string) (net.Conn, error) {
 	return nil, context.DeadlineExceeded
 }
 
-// TestTimeoutDialerBoundsHandshake: a dialer that never completes must be
-// abandoned once the timeout elapses (review item C8).
-func TestTimeoutDialerBoundsHandshake(t *testing.T) {
+// ctxBlockingDialer is a proxy.ContextDialer that never completes; it models
+// a stalled SOCKS negotiation honouring no deadline of its own.
+type ctxBlockingDialer struct{ release chan struct{} }
+
+func (d *ctxBlockingDialer) Dial(string, string) (net.Conn, error) {
+	<-d.release
+	return nil, context.DeadlineExceeded
+}
+
+func (d *ctxBlockingDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	select {
+	case <-d.release:
+		return nil, context.DeadlineExceeded
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestSocks5BoundsStalledHandshake: a dialer that never completes must be
+// abandoned once the deadline elapses (review items C8, 8).
+func TestSocks5BoundsStalledHandshake(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
-	d := &timeoutDialer{inner: &blockingDialer{release: release}, timeout: 100 * time.Millisecond}
+	d := &socks5ProxyDialer{inner: &blockingDialer{release: release}, timeout: 100 * time.Millisecond}
 	start := time.Now()
 	if _, err := d.Dial("tcp", "broker:9092"); err == nil {
 		t.Fatal("Dial: want timeout error, got nil")
@@ -152,15 +170,74 @@ func TestTimeoutDialerBoundsHandshake(t *testing.T) {
 	}
 }
 
-// TestSocks5DialerHasTimeout asserts the production proxy dialer is
-// wrapped with the handshake bound.
+// TestSocks5BoundsStalledContextDialer covers the context-aware inner dialer
+// path (the production x/net SOCKS dialer).
+func TestSocks5BoundsStalledContextDialer(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	d := &socks5ProxyDialer{inner: &ctxBlockingDialer{release: release}, timeout: 100 * time.Millisecond}
+	start := time.Now()
+	if _, err := d.Dial("tcp", "broker:9092"); err == nil {
+		t.Fatal("Dial: want timeout error, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Dial took %v, want bounded near 100ms", elapsed)
+	}
+}
+
+// TestSocks5ResolutionSharesDeadline: a stalled local resolver must be
+// bounded by the SAME deadline as the connect, not run outside it (review
+// item 8).
+func TestSocks5ResolutionSharesDeadline(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	resolving := make(chan struct{})
+	d := &socks5ProxyDialer{
+		inner:   &blockingDialer{release: release},
+		timeout: 100 * time.Millisecond,
+		resolve: func(ctx context.Context, _ string) (string, error) {
+			close(resolving)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+	start := time.Now()
+	if _, err := d.Dial("tcp", "broker.example.invalid:9092"); err == nil {
+		t.Fatal("Dial: want timeout error, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Dial took %v, want bounded near 100ms (resolver included)", elapsed)
+	}
+	select {
+	case <-resolving:
+	default:
+		t.Fatal("resolver was not invoked")
+	}
+}
+
+// TestSocks5DialerHasTimeout asserts the production proxy dialer carries the
+// handshake bound and, for socks5, the local resolver.
 func TestSocks5DialerHasTimeout(t *testing.T) {
 	proxyAddr, _ := startSocksServer(t)
 	dialer, err := socks5Dialer("socks5h://" + proxyAddr)
 	if err != nil {
 		t.Fatalf("socks5Dialer: %v", err)
 	}
-	if _, ok := dialer.(*timeoutDialer); !ok {
-		t.Fatalf("dialer = %T, want *timeoutDialer", dialer)
+	d, ok := dialer.(*socks5ProxyDialer)
+	if !ok {
+		t.Fatalf("dialer = %T, want *socks5ProxyDialer", dialer)
+	}
+	if d.timeout != proxyDialTimeout {
+		t.Errorf("timeout = %s, want %s", d.timeout, proxyDialTimeout)
+	}
+	if d.resolve != nil {
+		t.Error("socks5h must not resolve locally")
+	}
+	local, err := socks5Dialer("socks5://" + proxyAddr)
+	if err != nil {
+		t.Fatalf("socks5Dialer: %v", err)
+	}
+	if local.(*socks5ProxyDialer).resolve == nil {
+		t.Error("socks5 must resolve locally")
 	}
 }
