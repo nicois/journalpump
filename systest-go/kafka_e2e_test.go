@@ -64,9 +64,12 @@ type kafkaFixture struct {
 //
 // Opt-in: a real broker is required, so the test SKIPS unless
 // JOURNALPUMP_KAFKA_BROKER points at one (the Go analogue of the Python
-// harness's JOURNALPUMP_KAFKA_BROKER override; CI sets it to a
-// docker.io/apache/kafka:4.0.0 KRaft service). The default systest gate
-// therefore stays broker-free.
+// harness's JOURNALPUMP_KAFKA_BROKER override). Provision one
+// reproducibly with scripts/kafka-e2e-go (make systest-go-kafka), which
+// starts a throwaway docker.io/apache/kafka:4.0.0 KRaft broker on podman.
+// CI does NOT run this yet (the .github/workflows/build-go.yml job is
+// lint + unit only); a mandatory broker gate is plan Task 30. The default
+// systest gate therefore stays broker-free.
 func TestKafkaSenderEndToEnd(t *testing.T) {
 	broker := os.Getenv("JOURNALPUMP_KAFKA_BROKER")
 	if broker == "" {

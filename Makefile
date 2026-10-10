@@ -63,6 +63,14 @@ unittest-go:
 systest-go:
 	$(GO) test -race -tags systest ./systest-go/...
 
+# Provisions a throwaway Kafka 4.0 KRaft broker on podman, points
+# JOURNALPUMP_KAFKA_BROKER at it, and runs the systest suite UNCACHED so the
+# opt-in kafka e2e/interop tests execute against a real broker instead of
+# skipping. See scripts/kafka-e2e-go for the overrides.
+.PHONY: systest-go-kafka
+systest-go-kafka:
+	./scripts/kafka-e2e-go
+
 # Lint per decision D10 (golangci-lint incl. gocyclo, ineffassign, revive,
 # staticcheck, errcheck, govet, gocritic); the golangci config is checked
 # in with the CI workflow (plan Task 2).

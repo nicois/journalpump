@@ -1,0 +1,76 @@
+#!/bin/bash
+# Provision a throwaway Kafka 4.0 KRaft broker on podman and run the Go
+# systest suite (including the opt-in kafka e2e/interop tests) against it.
+#
+# JOURNALPUMP_KAFKA_BROKER is exported for the child test process, so the
+# kafka e2e tests that would otherwise SKIP run for real. This is the
+# reproducible provisioning path the docs point at; the CI gate that calls it
+# is a separate workflow change (plan Task 30).
+#
+# Environment overrides:
+#   KAFKA_E2E_IMAGE      broker image (default docker.io/apache/kafka:4.0.0)
+#   KAFKA_E2E_PORT       broker port (default 19092)
+#   KAFKA_E2E_CTRL_PORT  controller port (default 19093)
+#   KAFKA_E2E_CONTAINER  podman container name (default journalpump-kafka-e2e)
+#   KAFKA_E2E_KEEP=1     leave the container running after the run
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+container=${KAFKA_E2E_CONTAINER:-journalpump-kafka-e2e}
+image=${KAFKA_E2E_IMAGE:-docker.io/apache/kafka:4.0.0}
+port=${KAFKA_E2E_PORT:-19092}
+controllerPort=${KAFKA_E2E_CTRL_PORT:-19093}
+keep=${KAFKA_E2E_KEEP:-0}
+
+if ! command -v podman >/dev/null; then
+    echo "podman is required to provision the kafka broker" >&2
+    exit 1
+fi
+
+cleanup() {
+    if [[ "$keep" != "1" ]]; then
+        podman rm --force "$container" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+podman rm --force "$container" >/dev/null 2>&1 || true
+
+# Single-node KRaft on the host network namespace: the broker binds the host
+# ports directly, so the advertised listener resolves both inside the
+# container (for the readiness probe) and from the test process.
+podman run --detach --name "$container" \
+    --network host \
+    --env KAFKA_NODE_ID=1 \
+    --env KAFKA_PROCESS_ROLES=broker,controller \
+    --env KAFKA_LISTENERS="PLAINTEXT://:${port},CONTROLLER://:${controllerPort}" \
+    --env KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://localhost:${port}" \
+    --env KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+    --env KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+    --env KAFKA_CONTROLLER_QUORUM_VOTERS="1@localhost:${controllerPort}" \
+    --env KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+    --env KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+    --env KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+    --env KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+    "$image" >/dev/null
+
+# Readiness: a bounded kafka-topics request from inside the container (a
+# hanging exec must not stall the loop).
+ready=0
+for _ in $(seq 60); do
+    if timeout 10 podman exec "$container" /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server "localhost:${port}" --list >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [[ "$ready" != "1" ]]; then
+    echo "kafka broker did not become ready; container logs follow" >&2
+    podman logs "$container" >&2 || true
+    exit 1
+fi
+
+JOURNALPUMP_KAFKA_BROKER="localhost:${port}" \
+    go test -race -count=1 -tags systest -v ./systest-go/...
