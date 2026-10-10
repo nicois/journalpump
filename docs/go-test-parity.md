@@ -1800,11 +1800,20 @@ Send path (thread A7):
   `TestNewDoesNotMutateSaramaLogger` and `TestConcurrentConstruction`
   pin it.
 - The connect/topic-create/send paths are cancellation-aware
-  (`runCtx`): a stalled broker or SOCKS dial cannot hold shutdown/reload
-  past the grace window, and the abandoned client is closed by a drain
-  goroutine (no leak) (item C7). `TestEnsureProducerRespectsCancellation`,
-  `TestMaybeCreateTopicRespectsCancellation` and
-  `TestSendMessagesCancelledContext` pin it.
+  (`runCancellable`, review items C7/3): a stalled broker or SOCKS dial
+  cannot hold shutdown/reload past the grace window. When the context wins
+  the race the underlying network op is aborted (the late producer/admin is
+  closed) and the worker is JOINED before the call returns, so no retired
+  worker or client outlives the caller.
+  `TestEnsureProducerRespectsCancellation` and
+  `TestMaybeCreateTopicRespectsCancellation` release a blocked dial after
+  cancelling and assert the late client is closed BEFORE the call returns
+  (the join guarantee); `TestSendCancellationAbortsInFlightProduce` cancels
+  a produce already in flight (only the cancellation can end it), asserting
+  the prompt `context.Canceled`, the producer close, and the join;
+  `TestSendMessagesCancelledContext` covers the pre-dial short-circuit.
+  `Close` is bounded by `closeTimeout` (5 s) so a stalled broker cannot hold
+  shutdown past the grace window.
 - Connect runs inside `SendMessages` (Python's `_init_kafka`), reports
   the connected transition through the `sender.ConnectionReporter` seam
   so the loop resets the shared backoff exponent, and a failure returns
@@ -1839,7 +1848,16 @@ case, `TestSendMessagesFailureDropsProducer` the teardown, and
 recording producer: exact ordered payload bytes/key/topic, a delayed ack,
 a retriable `ProducerErrors` batch (teardown + resend + cursor advances
 only on success) and a mixed-cause batch (permanent path, whole-batch
-resend, `TopicAlreadyExists` re-init tolerated) (review item E14).
+resend, `TopicAlreadyExists` re-init tolerated) (review item E14). The
+fake holds acknowledgements on an explicit gate so the tests inspect the
+loop state WHILE an ack is pending and DURING failure/retry, not only
+after recovery: the delayed-ack test asserts `sent.count == 0` and a nil
+sent cursor with the ack outstanding; the retry test parks the retry's
+reconnect and asserts the failed batch's cause is in the health ring and
+the status is `disconnected` mid-retry (items 7/9). The mixed-cause test
+requires exactly two admin initialization attempts (initial connect +
+reconnect), not merely `> 0`, so a skipped topic-create re-init cannot
+pass by accident (item 9).
 
 systest: `systest-go/kafka_e2e_test.go` drives the real binary against a
 real Kafka 4.0 KRaft broker and asserts the Task 12 fixture ground truth
@@ -1849,15 +1867,98 @@ the admin-create/keyed scenarios, consuming with a sarama consumer.
 regression: it produces the keyed scenario and reads it back with the
 DEPLOYED kafka-python client (the committed
 `systest-go/kafka_python_consumer.py`), asserting the fixture payload
-bytes byte-for-byte, the key and the partition. Both are OPT-IN — they
-skip unless `JOURNALPUMP_KAFKA_BROKER` points at a broker (the Go
-analogue of the Python harness's override), so the default broker-free
-systest gate stays green; CI runs them against the same
-`docker.io/apache/kafka:4.0.0` KRaft service the Python capture used. The
+bytes byte-for-byte, the key and the partition. The
 e2e additionally bounds shutdown (SIGTERM + 30 s deadline, failing on a
 non-zero exit), fails on any race-detector output from the -race child,
 and requires the topic's partition count to equal the fixture's exactly
 (review item E15).
+
+Execution status of the broker-backed tests (review item 10):
+
+- These tests are OPT-IN: each `t.Skip`s unless `JOURNALPUMP_KAFKA_BROKER`
+  points at a real broker. The default `make systest-go` run is therefore
+  broker-free and shows them as SKIPS, which is execution evidence for the
+  broker-free suite only — NOT evidence that the interop ran. A green
+  `make systest-go` must not be read as "the interop passed".
+- Reproducible provisioning is provided by `scripts/kafka-e2e-go`
+  (`make systest-go-kafka`): it starts a throwaway single-node
+  `docker.io/apache/kafka:4.0.0` KRaft broker on podman (host networking,
+  so the advertised listener resolves both inside the container for the
+  readiness probe and from the test process), waits for readiness with a
+  BOUNDED exec, exports `JOURNALPUMP_KAFKA_BROKER`, and runs the systest
+  suite UNCACHED (`-race -count=1 -tags systest -v`) so the interop tests
+  execute for real. The `-v` output is what distinguishes an executed
+  interop (`--- PASS`) from an opt-in skip (`--- SKIP`). Recorded run: the
+  whole `systest-go` suite passed (`ok … 155s`) with
+  `TestKafkaSenderEndToEnd` (`auto-create` + `manual-create-keyed`) and
+  `TestKafkaPythonConsumerInterop` PASS against the provisioned broker —
+  actual execution, not a skip.
+- CI does NOT yet run the broker-backed tests: `.github/workflows/build-go.yml`
+  is lint + unit tests only. A mandatory broker gate (a systest job that
+  provisions the broker and fails the build on a skip) is scheduled for
+  plan Task 30 (the systest job + `scripts/systest-go-on-podman`), not part
+  of Task 22. Until then, the broker-backed evidence is the recorded
+  `make systest-go-kafka` run, not a CI badge.
+
+Review round 2 (verdict changes-required: 1 blocker + 7 majors + 2 minors),
+all fixed:
+
+- BLOCKER (1): `Producer.Retry.Max` is now bounded (`producerRetryMax`,
+  =100). sarama's async producer allocates `Retry.Max+1`
+  `partitionRetryState` entries per partition on the first message to it, so
+  the previous `2147483647` (mirroring kafka-python's effectively-unlimited
+  retries) would have allocated ~2^31 entries — tens of GiB per partition —
+  before any delivery. The unbounded behavior is instead provided by the
+  shared loop's outer retry plus the client-side deadline below. Guarded by
+  `TestProducerRetryMaxIsBounded`.
+- (2): `Producer.Timeout` is the BROKER-side acks timeout and bounds neither
+  the client retry loop nor `SendMessages`, so `delivery_timeout_ms` parity
+  is now enforced client-side in `sendBatch`
+  (`context.WithTimeout(…, 120 s)` + abort-by-close),
+  independent of the 30 s request timeout.
+  `TestSendDeliveryDeadlineAbortsStalledProduce` pins it against a produce
+  that never returns.
+- (3): in-flight cancellation now aborts the underlying network op and the
+  worker is joined (see the C7 bullet).
+- (4): SASL bootstrap order fixed. sarama authenticates BEFORE the explicit
+  ApiVersions call, and at Version 0.10 a SASLHandshake v1 request is
+  rejected LOCALLY as `ErrUnsupportedVersion`, so PLAIN and both SCRAM
+  failed whenever `kafka_api_version` was unset. The version probe now runs
+  with SASL disabled (`probeConfig`), and a detected/configured pre-1.0
+  version falls back to SASLHandshake v0. Pinned by
+  `TestProbeConfigAvoidsLocalSASLRejection` and
+  `TestSASLHandshakeVersionFollowsBrokerVersion` (every mechanism ×
+  pre-1.0/post-1.0).
+- (5): auto-detection now implements kafka-python's pre-0.10 fallback
+  probes (ListGroups v0 → 0.9, then FindCoordinator/OffsetFetch/Metadata)
+  after ApiVersions, and an ApiVersions response carrying an error is NOT
+  inferred from. Pinned by `TestProbeViaApiVersionsRejectsErrorResponse`,
+  `TestProbeViaApiVersionsInfersVersion` and
+  `TestDetectVersionFallsBackToLegacyProbe`.
+- (6): the exponential `Metadata.Retry.BackoffFunc` was not a per-broker
+  reconnect backoff (it only paced metadata retries). A connection-layer
+  `backoffDialer` now implements kafka-python's
+  `reconnect_backoff_ms`/`reconnect_backoff_max_ms` contract per broker
+  address: exponential growth 1 s → 10 s with uniform ±20 % jitter, reset on
+  a successful dial, tracked independently per address. Pinned by
+  `TestBackoffDialerGrowsCapsAndJitters`,
+  `TestBackoffDialerResetsOnSuccess`,
+  `TestBackoffDialerTracksAddressesIndependently` and `TestJitterBounds`.
+- (7): a failed batch no longer returns raw `sarama.ProducerErrors` (whose
+  `Error()` is only "Failed to deliver N messages"). It is wrapped in a
+  `sendErrors` aggregate that renders every individual cause and unwraps to
+  them for `errors.Is/As`, so auth/timeout/diagnostic causes reach the
+  loop's health ring. Pinned by `TestWrapProducerErrorsExposesCauses`,
+  `TestSendErrorsAllRetriable`,
+  `TestWrapProducerErrorsPassesOtherErrorsThrough`, and the loop-level
+  mid-retry health assertions.
+- (8, minor): the SOCKS5 local DNS resolution ran on `context.Background()`
+  outside the dial timeout, so the advertised 10 s bound excluded the
+  broker-name lookup and could not be interrupted. One cancellable deadline
+  now spans local resolution + proxy connect + negotiation. Pinned by
+  `TestSocks5ResolutionSharesDeadline` plus the stalled-handshake cases.
+- (9, minor): loop tests strengthened (see the `loop_test.go` paragraph).
+- (10, minor): docs/provisioning corrected (see "Execution status" above).
 
 Recorded divergences / open items for adjudication:
 
