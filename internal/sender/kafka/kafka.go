@@ -91,14 +91,19 @@ const (
 	requestTimeout   = 30 * time.Second
 	retryBackoff     = 100 * time.Millisecond
 	metadataRetryMax = 10
-	producerRetryMax = 100
-	// closeTimeout bounds Sender.Close so a stalled broker cannot hold
-	// shutdown/reload past the grace window (review item 3).
-	closeTimeout = 5 * time.Second
+	producerRetryMax = 20
 )
 
 // compressionName is the codec the deployment pins (snappy).
 const compressionName = "snappy"
+
+// aborter is implemented by the live clients: it TERMINATES their network
+// operations (closes every tracked connection) so a stalled broker cannot
+// keep an in-flight call running past its deadline, before the worker is
+// joined (review round-3 items 1 and 3). Test fakes may implement it too.
+type aborter interface {
+	abort()
+}
 
 // producer is the producer-side seam onto sarama (thread B: the
 // maintained sarama mock tooling — github.com/IBM/sarama/mocks — is the
@@ -116,11 +121,14 @@ type admin interface {
 }
 
 // producerFactory and adminFactory build the live clients from a
-// resolved producerConfig. They are seams so tests inject sarama mocks
-// or recording fakes.
+// resolved producerConfig and the caller's context. The context aborts
+// construction (dials, version probes, metadata, TLS/SASL) when it ends, so
+// cancellation does not have to wait for each inner timeout to accumulate
+// (review round-3 item 2). They are seams so tests inject sarama mocks or
+// recording fakes.
 type (
-	producerFactory func(pc producerConfig) (producer, error)
-	adminFactory    func(pc producerConfig) (admin, error)
+	producerFactory func(ctx context.Context, pc producerConfig) (producer, error)
+	adminFactory    func(ctx context.Context, pc producerConfig) (admin, error)
 )
 
 // Sender is the Kafka transport (kafka_sender.py KafkaSender). The
@@ -139,14 +147,19 @@ type Sender struct {
 	newProducer producerFactory
 	newAdmin    adminFactory
 	// detectVersion probes the broker for its version when api_version is
-	// unset, reproducing kafka-python's check_version (review item D11).
-	detectVersion func(brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error)
+	// unset, reproducing kafka-python's check_version (review item D11). The
+	// context cancels the probe's dials and requests (review round-3 item 2).
+	detectVersion func(ctx context.Context, brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error)
 	// deliveryDeadline is the client-side delivery deadline enforced across
 	// a SendMessages call (its internal retries included). It defaults to
 	// deliveryTimeout and is a field for tests (review item 2).
 	deliveryDeadline time.Duration
-	// closeWait bounds Close (field for tests; review item 3).
-	closeWait time.Duration
+
+	// dialMu guards backoff; the per-address reconnect state must survive
+	// across connect attempts so a later attempt only waits the REMAINING
+	// interval (review round-3 item 4).
+	dialMu  sync.Mutex
+	backoff *backoffDialer
 
 	mu sync.Mutex
 	// prod is the live producer; pc is the resolved producer config
@@ -239,7 +252,6 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	s.newAdmin = s.connectAdmin
 	s.detectVersion = detectBrokerVersion
 	s.deliveryDeadline = deliveryTimeout
-	s.closeWait = closeTimeout
 	return sender.Instance{
 		Transport:       s,
 		MaxSendInterval: time.Duration(seconds * float64(time.Second)),
@@ -371,28 +383,19 @@ func (pc producerConfig) saramaConfig() (*sarama.Config, error) {
 	if pc.apiVersion != nil {
 		cfg.Version = *pc.apiVersion
 	}
-	// reconnect_backoff_ms=1000 / reconnect_backoff_max_ms=10000
-	// (kafka_sender.py:59-60). sarama's metadata retry backoff is the
-	// equivalent reconnect knob; BackoffFunc supplies the exponential
-	// growth with the 10 s cap that the fixed Backoff alone cannot express
-	// (review item D12).
+	// Metadata retries use the 100 ms retry_backoff_ms, NOT the reconnect
+	// backoff: kafka-python keeps the two separate (retry_backoff_ms vs
+	// reconnect_backoff_ms), so collapsing them here would double the delay
+	// on top of the per-broker reconnect backoff the dialer already applies
+	// (review round-3 item 4). The reconnect backoff lives in the dialer.
 	cfg.Metadata.Retry.Max = metadataRetryMax
-	cfg.Metadata.Retry.Backoff = reconnectBackoffMS * time.Millisecond
-	maxBackoff := time.Duration(reconnectBackoffMaxMS) * time.Millisecond
-	cfg.Metadata.Retry.BackoffFunc = func(retries, _ int) time.Duration {
-		d := time.Duration(reconnectBackoffMS) * time.Millisecond
-		for i := 0; i < retries; i++ {
-			d *= 2
-			if d >= maxBackoff {
-				return maxBackoff
-			}
-		}
-		return d
-	}
-	// Producer defaults: kafka-python retries (effectively unlimited) are
-	// bounded by delivery_timeout_ms=120000 and request_timeout_ms=30000,
-	// with retry_backoff_ms=100 (review item D12).
-	cfg.Producer.Timeout = deliveryTimeout
+	cfg.Metadata.Retry.Backoff = retryBackoff
+	// Producer.Timeout is the BROKER-side ack timeout sarama transmits in
+	// Produce requests, so it maps to request_timeout_ms (30000), not
+	// delivery_timeout_ms. The 120 s delivery_timeout_ms is enforced
+	// client-side by the sender (sendBatch); Net.ReadTimeout does not
+	// correct the timeout transmitted on the wire (review round-3 item 5).
+	cfg.Producer.Timeout = requestTimeout
 	cfg.Producer.Retry.Max = producerRetryMax
 	cfg.Producer.Retry.Backoff = retryBackoff
 	cfg.Net.ReadTimeout = requestTimeout
@@ -425,16 +428,10 @@ func (pc producerConfig) saramaConfig() (*sarama.Config, error) {
 			cfg.Net.SASL.SCRAMClientGeneratorFunc = scramClientGenerator(scram.SHA512)
 		}
 	}
-	// The dialer chain carries the per-broker reconnect backoff (item 6) and,
-	// when configured, the SOCKS5 routing (item C8). sarama only consults
-	// Net.Proxy.Dialer when Net.Proxy.Enable is set, so the chain is installed
-	// unconditionally.
-	dialer, err := dialerFor(pc)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Net.Proxy.Enable = true
-	cfg.Net.Proxy.Dialer = dialer
+	// The dialer chain (per-broker reconnect backoff + SOCKS5 routing) is
+	// installed by buildSaramaConfig, which also wraps it in the
+	// cancellation-tracking dialer; it is not part of the pure projection
+	// (review round-3 items 2 and 4).
 	// Synthesis of the producer config.
 	cfg.Producer.Return.Successes = true
 	// Python kafka-python's default acks is 1 (leader ack) — sarama's
@@ -492,38 +489,215 @@ func saslMechanism(name string) (sarama.SASLMechanism, error) {
 	}
 }
 
-// connectProducer builds a live sarama SyncProducer.
-func (s *Sender) connectProducer(pc producerConfig) (producer, error) {
-	cfg, err := s.buildSaramaConfig(pc)
-	if err != nil {
-		return nil, err
-	}
-	return sarama.NewSyncProducer(pc.brokers, cfg)
-}
-
-// connectAdmin builds a live sarama ClusterAdmin.
-func (s *Sender) connectAdmin(pc producerConfig) (admin, error) {
-	cfg, err := s.buildSaramaConfig(pc)
-	if err != nil {
-		return nil, err
-	}
-	return sarama.NewClusterAdmin(pc.brokers, cfg)
-}
-
-// buildSaramaConfig projects the resolved config and, when api_version is
-// unset, detects the broker version first — sarama's ApiVersionsRequest is
-// fire-and-forget and does not adjust the configured version, so an
-// explicit probe is required to match kafka-python's auto-detection
-// (review item D11).
-func (s *Sender) buildSaramaConfig(pc producerConfig) (*sarama.Config, error) {
-	cfg, err := pc.saramaConfig()
-	if err != nil {
-		return nil, err
-	}
-	if pc.apiVersion == nil {
-		ver, err := s.detectVersion(pc.brokers, cfg)
+// backoffDialerFor returns the sender's persistent per-broker backoff
+// dialer, creating it on first use from the resolved config. Persisting it
+// is what makes the reconnect backoff track the REMAINING interval across
+// attempts rather than restarting at the initial value (review round-3
+// item 4).
+func (s *Sender) backoffDialerFor(pc producerConfig) (*backoffDialer, error) {
+	s.dialMu.Lock()
+	defer s.dialMu.Unlock()
+	if s.backoff == nil {
+		d, err := dialerFor(pc)
 		if err != nil {
 			return nil, err
+		}
+		s.backoff = d
+	}
+	return s.backoff, nil
+}
+
+// markConnectSuccess resets the reconnect history for the configured
+// brokers after a COMPLETE connection (TCP + TLS + SASL + metadata) has
+// succeeded.
+func (s *Sender) markConnectSuccess(pc producerConfig) {
+	if s.backoff != nil {
+		s.backoff.markConnected(pc.brokers...)
+	}
+}
+
+// markConnectFailure records a failed connection attempt — including a
+// post-connect failure where the TCP dial itself succeeded — so the next
+// attempt is delayed by the growing per-broker backoff (review round-3
+// item 4).
+func (s *Sender) markConnectFailure(pc producerConfig) {
+	if s.backoff != nil {
+		s.backoff.markFailed(pc.brokers...)
+	}
+}
+
+// watchCancel aborts the tracking dialer (closing every tracked
+// connection, so any in-flight dial, TLS/SASL handshake or metadata
+// request fails at once) when ctx ends. The returned stop function ends
+// the watch so a later context cancellation cannot kill a live client.
+func watchCancel(ctx context.Context, td *trackingDialer) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			td.closeAll()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+// connectProducer builds a live sarama SyncProducer from a client it owns.
+// The context aborts construction: the tracking dialer's connections are
+// terminated the moment ctx ends, so version probes, metadata retries, DNS
+// and SOCKS cannot accumulate past the caller's deadline (review round-3
+// item 2).
+func (s *Sender) connectProducer(ctx context.Context, pc producerConfig) (producer, error) {
+	cfg, td, err := s.buildSaramaConfig(ctx, pc)
+	if err != nil {
+		return nil, err
+	}
+	stop := watchCancel(ctx, td)
+	client, err := sarama.NewClient(pc.brokers, cfg)
+	if err != nil {
+		stop()
+		td.closeAll()
+		s.markConnectFailure(pc)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	s.markConnectSuccess(pc)
+	p, err := sarama.NewSyncProducerFromClient(client)
+	if err != nil {
+		stop()
+		td.closeAll()
+		_ = client.Close()
+		return nil, err
+	}
+	return &liveProducer{sp: p, client: client, td: td, stop: stop}, nil
+}
+
+// connectAdmin builds a live sarama ClusterAdmin from a client it owns.
+func (s *Sender) connectAdmin(ctx context.Context, pc producerConfig) (admin, error) {
+	cfg, td, err := s.buildSaramaConfig(ctx, pc)
+	if err != nil {
+		return nil, err
+	}
+	stop := watchCancel(ctx, td)
+	client, err := sarama.NewClient(pc.brokers, cfg)
+	if err != nil {
+		stop()
+		td.closeAll()
+		s.markConnectFailure(pc)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	s.markConnectSuccess(pc)
+	a, err := sarama.NewClusterAdminFromClient(client)
+	if err != nil {
+		stop()
+		td.closeAll()
+		_ = client.Close()
+		return nil, err
+	}
+	return &liveAdmin{ca: a, client: client, td: td, stop: stop}, nil
+}
+
+// liveProducer wraps a sarama SyncProducer together with the client it
+// owns and the tracking dialer of its connections. abort TERMINATES the
+// in-flight network operations; Close aborts, then JOINS the producer and
+// client goroutines (no timer, no abandoned closer) (review round-3 items
+// 1 and 3).
+type liveProducer struct {
+	sp     sarama.SyncProducer
+	client sarama.Client
+	td     *trackingDialer
+	stop   func()
+	once   sync.Once
+}
+
+func (p *liveProducer) SendMessages(msgs []*sarama.ProducerMessage) error {
+	return p.sp.SendMessages(msgs)
+}
+
+// abort terminates every connection so a stalled broker's in-flight
+// produce/retry fails immediately (review round-3 item 1).
+func (p *liveProducer) abort() { p.td.closeAll() }
+
+func (p *liveProducer) Close() error {
+	p.once.Do(func() {
+		p.stop()
+		p.td.closeAll()
+		_ = p.sp.Close()
+		_ = p.client.Close()
+	})
+	return nil
+}
+
+// liveAdmin wraps a sarama ClusterAdmin with the client it owns and its
+// tracking dialer, with the same abort-then-join Close contract.
+type liveAdmin struct {
+	ca     sarama.ClusterAdmin
+	client sarama.Client
+	td     *trackingDialer
+	stop   func()
+	once   sync.Once
+}
+
+func (a *liveAdmin) CreateTopic(topic string, detail *sarama.TopicDetail, validateOnly bool) error {
+	return a.ca.CreateTopic(topic, detail, validateOnly)
+}
+
+func (a *liveAdmin) abort() { a.td.closeAll() }
+
+func (a *liveAdmin) Close() error {
+	a.once.Do(func() {
+		a.stop()
+		a.td.closeAll()
+		_ = a.ca.Close()
+		_ = a.client.Close()
+	})
+	return nil
+}
+
+// abortFn returns v's abort method when v implements aborter, else nil.
+func abortFn(v any) func() {
+	if a, ok := v.(aborter); ok {
+		return a.abort
+	}
+	return nil
+}
+
+// buildSaramaConfig projects the resolved config, installs the
+// cancellation-tracking dialer chain and, when api_version is unset,
+// detects the broker version first — sarama's ApiVersionsRequest is
+// fire-and-forget and does not adjust the configured version, so an
+// explicit probe is required to match kafka-python's auto-detection
+// (review item D11). It returns the tracking dialer so the caller can
+// terminate the client's connections on shutdown.
+func (s *Sender) buildSaramaConfig(ctx context.Context, pc producerConfig) (*sarama.Config, *trackingDialer, error) {
+	cfg, err := pc.saramaConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	backoff, err := s.backoffDialerFor(pc)
+	if err != nil {
+		return nil, nil, err
+	}
+	td := newTrackingDialer(ctx, backoff)
+	// sarama only consults Net.Proxy.Dialer when Net.Proxy.Enable is set, so
+	// the chain is installed unconditionally.
+	cfg.Net.Proxy.Enable = true
+	cfg.Net.Proxy.Dialer = td
+	if pc.apiVersion == nil {
+		// The probe dials and requests run under the construction context;
+		// watchCancel closes the tracked connections the moment ctx ends so a
+		// stalled probe cannot hold construction past the caller's deadline
+		// (review round-3 item 2).
+		stop := watchCancel(ctx, td)
+		ver, err := s.detectVersion(ctx, pc.brokers, cfg)
+		stop()
+		if err != nil {
+			return nil, nil, err
 		}
 		cfg.Version = ver
 	}
@@ -533,7 +707,7 @@ func (s *Sender) buildSaramaConfig(pc producerConfig) (*sarama.Config, error) {
 	if cfg.Net.SASL.Enable && !cfg.Version.IsAtLeast(sarama.V1_0_0_0) {
 		cfg.Net.SASL.Version = sarama.SASLHandshakeV0
 	}
-	return cfg, nil
+	return cfg, td, nil
 }
 
 // probeConfig builds the version-probe config: a shallow copy at the oldest
@@ -558,11 +732,14 @@ func probeConfig(cfg *sarama.Config) *sarama.Config {
 // legacy pre-0.10 probes (ListGroups/FindCoordinator/OffsetFetch/Metadata) so
 // a 0.8/0.9 deployment still connects (review item D11, item 5). It is the
 // default detectVersion seam.
-func detectBrokerVersion(brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error) {
+func detectBrokerVersion(ctx context.Context, brokers []string, cfg *sarama.Config) (sarama.KafkaVersion, error) {
 	probe := probeConfig(cfg)
 	var lastErr error
 	for _, addr := range brokers {
-		ver, err := probeOneBroker(addr, probe)
+		if err := ctx.Err(); err != nil {
+			return sarama.V0_10_0_0, err
+		}
+		ver, err := probeOneBroker(ctx, addr, probe)
 		if err == nil {
 			return ver, nil
 		}
@@ -576,8 +753,13 @@ func detectBrokerVersion(brokers []string, cfg *sarama.Config) (sarama.KafkaVers
 
 // probeOneBroker determines one broker's version. The ApiVersions attempt and
 // the legacy fallback each use their own connection, because a failed probe on
-// an old broker may have left the socket unusable.
-func probeOneBroker(addr string, probe *sarama.Config) (sarama.KafkaVersion, error) {
+// an old broker may have left the socket unusable. The probe's dialer is the
+// construction tracking dialer, so ctx cancellation terminates the probe's
+// connections (review round-3 item 2).
+func probeOneBroker(ctx context.Context, addr string, probe *sarama.Config) (sarama.KafkaVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return sarama.KafkaVersion{}, err
+	}
 	if ver, err := probeViaAPIVersions(addr, probe); err == nil {
 		return ver, nil
 	}
@@ -748,11 +930,13 @@ func (s *Sender) ensureProducer(ctx context.Context) (producer, error) {
 		return nil, err
 	}
 	s.logf("Initializing Kafka client, address: %r for %s", strings.Join(pc.brokers, ","), s.name())
-	// The dial is cancellation-aware: a stalled broker or SOCKS
-	// negotiation must not hold shutdown/reload past the grace window
-	// (review item C7). If the context wins the race the late producer is
-	// closed by a drain goroutine so nothing leaks.
-	p, err := runCancellable(ctx, func() (producer, error) { return s.newProducer(*pc) }, nil, closeProducerValue)
+	// Construction is cancellation-aware end to end: the caller's context is
+	// threaded through the factory (version probes, metadata retries, DNS,
+	// SOCKS), whose tracking dialer terminates the connections the moment ctx
+	// ends, so a stalled broker cannot hold shutdown/reload past the grace
+	// window (review round-3 items 2 and C7). If the context wins the race the
+	// late producer is closed by the cleanup so nothing leaks.
+	p, err := runCancellable(ctx, func() (producer, error) { return s.newProducer(ctx, *pc) }, nil, closeProducerValue)
 	if err != nil {
 		return nil, err
 	}
@@ -767,6 +951,7 @@ func (s *Sender) ensureProducer(ctx context.Context) (producer, error) {
 	// Python creates the topic after a successful connect, tolerating an
 	// already-existing topic (kafka_sender.py:143-153).
 	if err := s.maybeCreateTopic(ctx, *pc); err != nil {
+		s.markConnectFailure(*pc)
 		s.dropProducer()
 		return nil, err
 	}
@@ -789,19 +974,20 @@ func (s *Sender) maybeCreateTopic(ctx context.Context, pc producerConfig) error 
 	if !ok {
 		return nil
 	}
-	a, err := runCancellable(ctx, func() (admin, error) { return s.newAdmin(pc) }, nil, closeAdminValue)
+	a, err := runCancellable(ctx, func() (admin, error) { return s.newAdmin(ctx, pc) }, nil, closeAdminValue)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = a.Close() }()
-	// Abort the in-flight CreateTopic by closing the admin client, then JOIN
-	// the worker so a cancelled create cannot leave a goroutine behind.
+	// abortFn terminates the in-flight CreateTopic's network operations,
+	// then runCancellable JOINS the worker so a cancelled create cannot leave
+	// a goroutine behind (review round-3 items 1 and 3).
 	_, err = runCancellable(ctx, func() (struct{}, error) {
 		return struct{}{}, a.CreateTopic(s.topic, &sarama.TopicDetail{
 			NumPartitions:     numPartitions,
 			ReplicationFactor: repFactor,
 		}, false)
-	}, func() { _ = a.Close() }, nil)
+	}, abortFn(a), nil)
 	if err != nil {
 		if errors.Is(err, sarama.ErrTopicAlreadyExists) {
 			s.logf("Kafka topic %r already exists for %s", s.topic, s.name())
@@ -891,10 +1077,11 @@ func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) err
 // sendBatch sends one batch under a client-side delivery deadline and is
 // cancellation-aware. sarama's Producer.Timeout is the BROKER-side ack
 // timeout and bounds neither the client's retry loop nor SendMessages, so
-// the delivery_timeout_ms parity is enforced here: the call is abandoned
-// (and the producer closed, aborting the in-flight request) once ctx is
-// done or the deadline elapses, and the worker is joined before returning
-// (review items 2 and 3).
+// the delivery_timeout_ms parity is enforced here: once ctx is done or the
+// deadline elapses the in-flight produce is TERMINATED (the producer's
+// connections are closed, so the stalled ack and any pending retry fail at
+// once) BEFORE the worker is joined; the producer is closed only after the
+// join (review round-3 item 1).
 func (s *Sender) sendBatch(ctx context.Context, p producer, msgs []*sarama.ProducerMessage) error {
 	deadline := s.deliveryDeadline
 	if deadline <= 0 {
@@ -904,13 +1091,12 @@ func (s *Sender) sendBatch(ctx context.Context, p producer, msgs []*sarama.Produ
 	defer cancel()
 	_, err := runCancellable(ctx, func() (struct{}, error) {
 		return struct{}{}, p.SendMessages(msgs)
-	}, func() {
-		// Abort the in-flight produce: detach first so the outer dropProducer
-		// does not close the same producer twice, then close to cancel the
-		// underlying network request.
+	}, abortFn(p), func(struct{}) {
+		// Detach first so the outer dropProducer does not close the same
+		// producer twice, then join its goroutines.
 		s.detachProducer(p)
 		_ = p.Close()
-	}, nil)
+	})
 	return wrapProducerErrors(err)
 }
 
@@ -969,10 +1155,11 @@ func wrapProducerErrors(err error) error {
 // MaintenanceOperations implements sender.Sender; kafka has none.
 func (s *Sender) MaintenanceOperations(context.Context) error { return nil }
 
-// Close releases the producer (io.Closer, called by the supervisor). The
-// close is bounded so a stalled broker cannot hold shutdown/reload past the
-// grace window; the closing goroutine still finishes and releases the client
-// (review item 3).
+// Close releases the producer (io.Closer, called by the supervisor). It
+// TERMINATES the producer's outstanding network operations first, then
+// JOINS every resource it owns (the producer and its client goroutines)
+// before returning — no timer, so a stalled broker cannot leave a retired
+// worker and client alive behind a released Close (review round-3 item 3).
 func (s *Sender) Close() error {
 	s.mu.Lock()
 	p := s.prod
@@ -981,18 +1168,10 @@ func (s *Sender) Close() error {
 	if p == nil {
 		return nil
 	}
-	wait := s.closeWait
-	if wait <= 0 {
-		wait = closeTimeout
+	if a, ok := p.(aborter); ok {
+		a.abort()
 	}
-	done := make(chan error, 1)
-	go func() { done <- p.Close() }()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(wait):
-		return fmt.Errorf("kafka producer close exceeded %s; releasing", wait)
-	}
+	return p.Close()
 }
 
 // SetConnectionObserver implements sender.ConnectionReporter.

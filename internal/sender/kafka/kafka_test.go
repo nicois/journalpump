@@ -568,11 +568,11 @@ func TestBuildSaramaConfigDetectsVersion(t *testing.T) {
 	}
 	s := newSender(t, raw)
 	probed := false
-	s.detectVersion = func([]string, *sarama.Config) (sarama.KafkaVersion, error) {
+	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
 		probed = true
 		return sarama.V2_5_0_0, nil
 	}
-	cfg, err := s.buildSaramaConfig(pc)
+	cfg, _, err := s.buildSaramaConfig(context.Background(), pc)
 	if err != nil {
 		t.Fatalf("buildSaramaConfig: %v", err)
 	}
@@ -588,11 +588,11 @@ func TestBuildSaramaConfigDetectsVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveProducerConfig: %v", err)
 	}
-	s.detectVersion = func([]string, *sarama.Config) (sarama.KafkaVersion, error) {
+	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
 		t.Error("detection ran despite an explicit api_version")
 		return sarama.V0_10_0_0, nil
 	}
-	cfg2, err := s.buildSaramaConfig(pc2)
+	cfg2, _, err := s.buildSaramaConfig(context.Background(), pc2)
 	if err != nil {
 		t.Fatalf("buildSaramaConfig: %v", err)
 	}
@@ -601,9 +601,12 @@ func TestBuildSaramaConfigDetectsVersion(t *testing.T) {
 	}
 }
 
-// TestSaramaConfigRetryTimeouts pins the D12 mapping: exponential metadata
-// backoff capped at 10s, delivery timeout 120s, request timeout 30s,
-// retry backoff 100ms.
+// TestSaramaConfigRetryTimeouts pins the retry/timeout mapping: the metadata
+// retry uses the 100ms retry_backoff_ms (NOT the reconnect backoff — the
+// per-broker connect delay lives in the dialer, so keeping both would double
+// it), Producer.Timeout carries the BROKER-side request_timeout_ms and the
+// 120s delivery_timeout_ms is a separate client-side deadline, and the
+// producer retry count stays bounded (review round-3 items 4 and 5).
 func TestSaramaConfigRetryTimeouts(t *testing.T) {
 	pc, err := resolveProducerConfig(baseConfig())
 	if err != nil {
@@ -613,29 +616,29 @@ func TestSaramaConfigRetryTimeouts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("saramaConfig: %v", err)
 	}
-	if cfg.Metadata.Retry.Backoff != time.Second {
-		t.Errorf("Metadata.Retry.Backoff = %v, want 1s", cfg.Metadata.Retry.Backoff)
+	if cfg.Metadata.Retry.Backoff != 100*time.Millisecond {
+		t.Errorf("Metadata.Retry.Backoff = %v, want 100ms (retry_backoff_ms)", cfg.Metadata.Retry.Backoff)
 	}
-	if cfg.Metadata.Retry.BackoffFunc == nil {
-		t.Fatal("Metadata.Retry.BackoffFunc is nil; the 10s cap cannot be expressed")
+	if cfg.Metadata.Retry.BackoffFunc != nil {
+		t.Error("Metadata.Retry.BackoffFunc must be nil: the reconnect backoff belongs to the dialer, not the metadata retry (no double backoff)")
 	}
-	wantBackoff := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
-	for i, want := range wantBackoff {
-		if got := cfg.Metadata.Retry.BackoffFunc(i, cfg.Metadata.Retry.Max); got != want {
-			t.Errorf("BackoffFunc(%d) = %v, want %v", i, got, want)
-		}
+	// Producer.Timeout is transmitted in Produce requests, so it is the
+	// request_timeout_ms, NOT the 120s delivery_timeout_ms (review round-3
+	// item 5).
+	if cfg.Producer.Timeout != requestTimeout {
+		t.Errorf("Producer.Timeout = %v, want %v (request_timeout_ms)", cfg.Producer.Timeout, requestTimeout)
 	}
-	if cfg.Producer.Timeout != 120*time.Second {
-		t.Errorf("Producer.Timeout = %v, want 120s", cfg.Producer.Timeout)
+	if deliveryTimeout == requestTimeout {
+		t.Fatal("deliveryTimeout and requestTimeout must be distinct so the two are independently observable")
 	}
-	if cfg.Producer.Retry.Backoff != 100*time.Millisecond {
-		t.Errorf("Producer.Retry.Backoff = %v, want 100ms", cfg.Producer.Retry.Backoff)
+	if cfg.Producer.Retry.Backoff != retryBackoff {
+		t.Errorf("Producer.Retry.Backoff = %v, want %v", cfg.Producer.Retry.Backoff, retryBackoff)
 	}
-	if cfg.Net.ReadTimeout != 30*time.Second || cfg.Net.WriteTimeout != 30*time.Second {
-		t.Errorf("Net timeouts = %v/%v, want 30s/30s", cfg.Net.ReadTimeout, cfg.Net.WriteTimeout)
+	if cfg.Net.ReadTimeout != requestTimeout || cfg.Net.WriteTimeout != requestTimeout {
+		t.Errorf("Net timeouts = %v/%v, want %v/%v", cfg.Net.ReadTimeout, cfg.Net.WriteTimeout, requestTimeout, requestTimeout)
 	}
 	if cfg.Producer.Retry.Max <= 3 {
-		t.Errorf("Producer.Retry.Max = %d, want effectively unlimited (> sarama default 3)", cfg.Producer.Retry.Max)
+		t.Errorf("Producer.Retry.Max = %d, want bounded but > sarama default 3", cfg.Producer.Retry.Max)
 	}
 }
 
@@ -687,9 +690,13 @@ func TestProducerConfigWithSocks5Proxy(t *testing.T) {
 	if pc.socks5Proxy != "socks5://proxy:1080" {
 		t.Errorf("socks5Proxy = %q", pc.socks5Proxy)
 	}
-	sc, err := pc.saramaConfig()
+	s := newSender(t, raw)
+	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
+		return sarama.V2_5_0_0, nil
+	}
+	sc, _, err := s.buildSaramaConfig(context.Background(), pc)
 	if err != nil {
-		t.Fatalf("saramaConfig: %v", err)
+		t.Fatalf("buildSaramaConfig: %v", err)
 	}
 	if !sc.Net.Proxy.Enable || sc.Net.Proxy.Dialer == nil {
 		t.Errorf("sarama proxy enable=%v dialer=%v, want enabled with dialer", sc.Net.Proxy.Enable, sc.Net.Proxy.Dialer)
@@ -704,19 +711,26 @@ func TestProducerConfigWithoutSocks5Proxy(t *testing.T) {
 	if pc.socks5Proxy != "" {
 		t.Errorf("socks5Proxy = %q, want empty", pc.socks5Proxy)
 	}
-	sc, err := pc.saramaConfig()
+	s := newSender(t, baseConfig())
+	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
+		return sarama.V2_5_0_0, nil
+	}
+	sc, td, err := s.buildSaramaConfig(context.Background(), pc)
 	if err != nil {
-		t.Fatalf("saramaConfig: %v", err)
+		t.Fatalf("buildSaramaConfig: %v", err)
 	}
 	// The dialer chain is installed unconditionally (sarama only consults
 	// Net.Proxy.Dialer when Enable is set) to carry the per-broker reconnect
-	// backoff; without socks5_proxy the chain is a direct dialer wrapped by
-	// the backoff dialer (review item 6).
+	// backoff; buildSaramaConfig wraps the persistent backoff dialer in the
+	// cancellation-tracking dialer (review round-3 items 2 and 4).
 	if !sc.Net.Proxy.Enable {
 		t.Error("dialer chain not installed: sarama would ignore the per-broker backoff dialer")
 	}
-	if _, ok := sc.Net.Proxy.Dialer.(*backoffDialer); !ok {
-		t.Errorf("dialer = %T, want *backoffDialer", sc.Net.Proxy.Dialer)
+	if sc.Net.Proxy.Dialer != td {
+		t.Errorf("proxy dialer = %T, want the tracking dialer", sc.Net.Proxy.Dialer)
+	}
+	if _, ok := td.inner.(*backoffDialer); !ok {
+		t.Errorf("tracking dialer inner = %T, want *backoffDialer", td.inner)
 	}
 }
 
@@ -727,8 +741,9 @@ func TestProducerConfigInvalidSocks5Proxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveProducerConfig: %v", err)
 	}
-	if _, err := pc.saramaConfig(); err == nil {
-		t.Fatal("invalid socks5 scheme: saramaConfig want error")
+	s := newSender(t, raw)
+	if _, _, err := s.buildSaramaConfig(context.Background(), pc); err == nil {
+		t.Fatal("invalid socks5 scheme: buildSaramaConfig want error")
 	}
 }
 
@@ -917,7 +932,7 @@ func TestSendMessagesSuccess(t *testing.T) {
 			return nil
 		})
 	}
-	s.newProducer = func(producerConfig) (producer, error) { return mp, nil }
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return mp, nil }
 
 	if err := s.SendMessages(context.Background(), bodies, "cursor"); err != nil {
 		t.Fatalf("SendMessages: %v", err)
@@ -940,7 +955,7 @@ func TestSendMessagesWithoutKey(t *testing.T) {
 		}
 		return nil
 	})
-	s.newProducer = func(producerConfig) (producer, error) { return mp, nil }
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return mp, nil }
 
 	if err := s.SendMessages(context.Background(), [][]byte{[]byte("one")}, "cursor"); err != nil {
 		t.Fatalf("SendMessages: %v", err)
@@ -958,7 +973,7 @@ func TestSendMessagesFailureDropsProducer(t *testing.T) {
 	}
 	mp := mockProducer(t, pc)
 	mp.ExpectSendMessageAndFail(sarama.ErrOutOfBrokers)
-	s.newProducer = func(producerConfig) (producer, error) { return mp, nil }
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return mp, nil }
 
 	err = s.SendMessages(context.Background(), [][]byte{[]byte("one")}, "cursor")
 	if err == nil {
@@ -975,7 +990,7 @@ func TestSendMessagesFailureDropsProducer(t *testing.T) {
 func TestSendMessagesConnectFailure(t *testing.T) {
 	s := newSender(t, baseConfig())
 	connectErr := errors.New("no brokers")
-	s.newProducer = func(producerConfig) (producer, error) { return nil, connectErr }
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return nil, connectErr }
 	if err := s.SendMessages(context.Background(), [][]byte{[]byte("one")}, "cursor"); !errors.Is(err, connectErr) {
 		t.Fatalf("SendMessages error = %v, want %v", err, connectErr)
 	}
@@ -1012,7 +1027,7 @@ func TestMaybeCreateTopicWithBothValues(t *testing.T) {
 	s := newSender(t, raw)
 	pc, _ := resolveProducerConfig(raw)
 	fa := &fakeAdmin{}
-	s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
+	s.newAdmin = func(context.Context, producerConfig) (admin, error) { return fa, nil }
 	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("maybeCreateTopic: %v", err)
 	}
@@ -1035,7 +1050,7 @@ func TestMaybeCreateTopicWithJSONNumberConfig(t *testing.T) {
 	s := newSender(t, raw)
 	pc, _ := resolveProducerConfig(raw)
 	fa := &fakeAdmin{}
-	s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
+	s.newAdmin = func(context.Context, producerConfig) (admin, error) { return fa, nil }
 	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("maybeCreateTopic: %v", err)
 	}
@@ -1050,7 +1065,7 @@ func TestMaybeCreateTopicAlreadyExistsTolerated(t *testing.T) {
 	s := newSender(t, raw)
 	pc, _ := resolveProducerConfig(raw)
 	fa := &fakeAdmin{err: sarama.ErrTopicAlreadyExists}
-	s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
+	s.newAdmin = func(context.Context, producerConfig) (admin, error) { return fa, nil }
 	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("TopicAlreadyExists should be tolerated, got %v", err)
 	}
@@ -1071,7 +1086,7 @@ func TestMaybeCreateTopicPartialConfigSkips(t *testing.T) {
 			s := newSender(t, raw)
 			pc, _ := resolveProducerConfig(raw)
 			fa := &fakeAdmin{}
-			s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
+			s.newAdmin = func(context.Context, producerConfig) (admin, error) { return fa, nil }
 			if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 				t.Fatalf("maybeCreateTopic: %v", err)
 			}
@@ -1112,7 +1127,7 @@ func TestTopicConfigRejectsInvalidValues(t *testing.T) {
 			s := newSender(t, raw)
 			pc, _ := resolveProducerConfig(baseConfig())
 			fa := &fakeAdmin{}
-			s.newAdmin = func(producerConfig) (admin, error) { return fa, nil }
+			s.newAdmin = func(context.Context, producerConfig) (admin, error) { return fa, nil }
 			if err := s.maybeCreateTopic(context.Background(), pc); err == nil {
 				t.Fatal("maybeCreateTopic: want error, got nil")
 			}
@@ -1174,7 +1189,7 @@ func TestTopicConfigAcceptsIntegers(t *testing.T) {
 func TestEnsureProducerReportsConnected(t *testing.T) {
 	s := newSender(t, baseConfig())
 	fp := &fakeProducer{}
-	s.newProducer = func(producerConfig) (producer, error) { return fp, nil }
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return fp, nil }
 	connected := 0
 	s.SetConnectionObserver(func() { connected++ }, func(error) {})
 	if _, err := s.ensureProducer(context.Background()); err != nil {
@@ -1231,7 +1246,7 @@ func TestEnsureProducerRespectsCancellation(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{})
 	late := &signalledProducer{closed: make(chan struct{})}
-	s.newProducer = func(producerConfig) (producer, error) {
+	s.newProducer = func(context.Context, producerConfig) (producer, error) {
 		close(entered)
 		<-release
 		return late, nil
@@ -1283,7 +1298,7 @@ func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{})
 	late := &signalledAdmin{closed: make(chan struct{})}
-	s.newAdmin = func(producerConfig) (admin, error) {
+	s.newAdmin = func(context.Context, producerConfig) (admin, error) {
 		close(entered)
 		<-release
 		return late, nil
@@ -1315,7 +1330,7 @@ func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 func TestSendMessagesCancelledContext(t *testing.T) {
 	s := newSender(t, baseConfig())
 	called := false
-	s.newProducer = func(producerConfig) (producer, error) {
+	s.newProducer = func(context.Context, producerConfig) (producer, error) {
 		called = true
 		return &fakeProducer{}, nil
 	}

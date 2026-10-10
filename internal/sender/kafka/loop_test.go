@@ -99,7 +99,7 @@ func startKafkaLoop(t *testing.T, raw map[string]any) (*sender.Loop, chan<- send
 	}
 	s := inst.Transport.(*Sender)
 	rp := &recordingProducer{}
-	s.newProducer = func(producerConfig) (producer, error) { return rp, nil }
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return rp, nil }
 	in := make(chan sender.Item, 16)
 	loop := sender.NewLoop(sender.LoopConfig{Name: "kafka-loop"}, inst, in)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -226,7 +226,7 @@ func TestLoopRetriesRetriableBatch(t *testing.T) {
 		// the failure but before the successful resend clears it.
 		connectEntered := make(chan struct{})
 		connectGate := make(chan struct{})
-		s.newProducer = func(producerConfig) (producer, error) {
+		s.newProducer = func(context.Context, producerConfig) (producer, error) {
 			connects++
 			if connects == 2 {
 				close(connectEntered)
@@ -317,11 +317,11 @@ func TestLoopPartialBatchFailureResendsWholeBatch(t *testing.T) {
 		}
 		rp.errs = []error{mixed, nil}
 		connects, adminCalls := 0, 0
-		s.newProducer = func(producerConfig) (producer, error) {
+		s.newProducer = func(context.Context, producerConfig) (producer, error) {
 			connects++
 			return rp, nil
 		}
-		s.newAdmin = func(producerConfig) (admin, error) {
+		s.newAdmin = func(context.Context, producerConfig) (admin, error) {
 			adminCalls++
 			return &fakeAdmin{err: sarama.ErrTopicAlreadyExists}, nil
 		}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"golang.org/x/net/proxy"
 )
 
 // --- Item 1: the producer retry state must be BOUNDED ---------------------
@@ -47,119 +48,9 @@ func TestProducerRetryMaxIsBounded(t *testing.T) {
 	}
 }
 
-// --- Item 2: a real client-side delivery deadline -------------------------
-
-// stallProducer blocks inside SendMessages until Close aborts it, modelling a
-// produce request stuck against an unresponsive broker.
-type stallProducer struct {
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
-	closed  bool
-}
-
-func newStallProducer() *stallProducer {
-	return &stallProducer{started: make(chan struct{}), release: make(chan struct{})}
-}
-
-func (p *stallProducer) SendMessages([]*sarama.ProducerMessage) error {
-	p.once.Do(func() { close(p.started) })
-	<-p.release
-	return nil
-}
-
-func (p *stallProducer) Close() error {
-	p.mu.Lock()
-	p.closed = true
-	p.mu.Unlock()
-	select {
-	case <-p.release:
-	default:
-		close(p.release)
-	}
-	return nil
-}
-
-func (p *stallProducer) wasClosed() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.closed
-}
-
-// TestSendDeliveryDeadlineAbortsStalledProduce: sarama's Producer.Timeout is
-// the broker-side acks timeout and does NOT bound the client's retry loop or
-// SendMessages, so delivery_timeout_ms must be enforced client-side: the
-// stalled call is abandoned, the in-flight request aborted, and no producer
-// left behind (review item 2).
-func TestSendDeliveryDeadlineAbortsStalledProduce(t *testing.T) {
-	s := newSender(t, baseConfig())
-	s.deliveryDeadline = 50 * time.Millisecond
-	sp := newStallProducer()
-	s.newProducer = func(producerConfig) (producer, error) { return sp, nil }
-
-	start := time.Now()
-	err := s.SendMessages(context.Background(), [][]byte{[]byte("payload")}, "c0")
-	elapsed := time.Since(start)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("SendMessages error = %v, want context.DeadlineExceeded", err)
-	}
-	if elapsed > 5*time.Second {
-		t.Fatalf("SendMessages took %v; the delivery deadline did not bound it", elapsed)
-	}
-	if !sp.wasClosed() {
-		t.Error("stalled producer was not closed; the in-flight produce was not aborted")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.prod != nil {
-		t.Error("producer left installed after a deadline abort; the next send would reuse a stalled client")
-	}
-}
-
-// --- Item 3: in-flight cancellation terminates AND joins ------------------
-
-// TestSendCancellationAbortsInFlightProduce cancels DURING a real produce
-// (not before sending, and not via a manually-released fake): the call must
-// return promptly with context.Canceled, the producer must be closed to abort
-// the network op, and the worker must be joined before return so shutdown or
-// reload cannot leave a retired worker behind (review item 3).
-func TestSendCancellationAbortsInFlightProduce(t *testing.T) {
-	s := newSender(t, baseConfig())
-	// No deadline: the ONLY thing that can end this send is the cancellation.
-	s.deliveryDeadline = time.Hour
-	sp := newStallProducer()
-	s.newProducer = func(producerConfig) (producer, error) { return sp, nil }
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- s.SendMessages(ctx, [][]byte{[]byte("payload")}, "c0") }()
-
-	select {
-	case <-sp.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("send never reached the producer")
-	}
-	cancel()
-
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("SendMessages error = %v, want context.Canceled", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("SendMessages did not return after cancellation")
-	}
-	// The join guarantee: the producer was closed before SendMessages returned.
-	if !sp.wasClosed() {
-		t.Error("producer not closed before SendMessages returned (worker not joined)")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.prod != nil {
-		t.Error("cancelled send left a producer installed")
-	}
-}
+// --- Item 2/3: the delivery deadline and cancellation, against a REAL
+// sarama producer with a stalled broker, live in round3_test.go. A fake whose
+// Close releases the send would not exercise the abortive path.
 
 // --- Item 4: SASL handshake selection for the detected/configured version --
 
@@ -244,10 +135,10 @@ func TestSASLHandshakeVersionFollowsBrokerVersion(t *testing.T) {
 				if err != nil {
 					t.Fatalf("resolveProducerConfig: %v", err)
 				}
-				s.detectVersion = func([]string, *sarama.Config) (sarama.KafkaVersion, error) {
+				s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
 					return tc.detected, nil
 				}
-				cfg, err := s.buildSaramaConfig(pc)
+				cfg, _, err := s.buildSaramaConfig(context.Background(), pc)
 				if err != nil {
 					t.Fatalf("buildSaramaConfig: %v", err)
 				}
@@ -328,7 +219,7 @@ func TestDetectVersionFallsBackToLegacyProbe(t *testing.T) {
 	})
 	cfg := sarama.NewConfig()
 	cfg.Net.ReadTimeout = time.Second
-	ver, err := detectBrokerVersion([]string{addr}, cfg)
+	ver, err := detectBrokerVersion(context.Background(), []string{addr}, cfg)
 	if err != nil {
 		t.Fatalf("detectBrokerVersion: %v", err)
 	}
@@ -378,67 +269,119 @@ type dummyAddr struct{}
 func (dummyAddr) Network() string { return "tcp" }
 func (dummyAddr) String() string  { return "dummy" }
 
+// fakeClock drives the backoff dialer's now/sleep seams deterministically so
+// the elapsed-time behavior (review round-3 item 4) can be asserted exactly.
+type fakeClock struct {
+	now   time.Time
+	slept []time.Duration
+}
+
+func (c *fakeClock) sleep(_ context.Context, d time.Duration) error {
+	c.slept = append(c.slept, d)
+	c.now = c.now.Add(d)
+	return nil
+}
+
+func newTestBackoffDialer(inner proxy.Dialer, initial, maxDelay time.Duration) (*backoffDialer, *fakeClock) {
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	d := newBackoffDialer(inner, brokerBackoffConfig{initial: initial, max: maxDelay})
+	d.now = func() time.Time { return clock.now }
+	d.sleep = clock.sleep
+	d.randFloat = func() float64 { return 0.5 } // factor exactly 1.0
+	return d, clock
+}
+
+// TestBackoffDialerGrowsCapsAndJitters: each failed attempt waits the growing,
+// capped, jittered interval (raw randFloat=0.5 makes the jitter factor 1.0).
 func TestBackoffDialerGrowsCapsAndJitters(t *testing.T) {
 	fail := errors.New("dial refused")
-	inner := &flakyDialer{results: []error{fail, fail, fail, fail, fail, fail, fail}}
-	d := newBackoffDialer(inner, brokerBackoffConfig{initial: time.Second, max: 10 * time.Second})
-	var slept []time.Duration
-	d.sleep = func(dur time.Duration) { slept = append(slept, dur) }
-	d.randFloat = func() float64 { return 0.5 } // factor exactly 1.0
+	inner := &flakyDialer{results: []error{fail, fail, fail, fail, fail}}
+	d, clock := newTestBackoffDialer(inner, time.Second, 4*time.Second)
 
-	for i := 0; i < 7; i++ {
+	for i := 0; i < 5; i++ {
 		if _, err := d.Dial("tcp", "broker:9092"); err == nil {
 			t.Fatalf("dial %d: want error", i)
 		}
 	}
-	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
-	if len(slept) != len(want) {
-		t.Fatalf("slept = %v, want %v", slept, want)
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 4 * time.Second}
+	if len(clock.slept) != len(want) {
+		t.Fatalf("slept = %v, want %v", clock.slept, want)
 	}
 	for i := range want {
-		if slept[i] != want[i] {
-			t.Errorf("sleep %d = %v, want %v", i, slept[i], want[i])
+		if clock.slept[i] != want[i] {
+			t.Errorf("sleep %d = %v, want %v", i, clock.slept[i], want[i])
 		}
 	}
 }
 
-func TestBackoffDialerResetsOnSuccess(t *testing.T) {
+// TestBackoffDialerWaitsOnlyRemaining: the elapsed time since the failed
+// attempt counts against the interval, so only the remaining part is waited
+// (kafka-python _can_connect; review round-3 item 4).
+func TestBackoffDialerWaitsOnlyRemaining(t *testing.T) {
 	fail := errors.New("dial refused")
-	inner := &flakyDialer{results: []error{fail, fail, nil, fail}}
-	d := newBackoffDialer(inner, brokerBackoffConfig{initial: time.Second, max: 10 * time.Second})
-	var slept []time.Duration
-	d.sleep = func(dur time.Duration) { slept = append(slept, dur) }
-	d.randFloat = func() float64 { return 0.5 }
+	inner := &flakyDialer{results: []error{fail, fail}}
+	d, clock := newTestBackoffDialer(inner, time.Second, 10*time.Second)
 
-	_, _ = d.Dial("tcp", "broker:9092") // fail -> 1s
-	_, _ = d.Dial("tcp", "broker:9092") // sleep 1s, fail -> 2s
-	_, _ = d.Dial("tcp", "broker:9092") // sleep 2s, succeed -> reset
-	_, _ = d.Dial("tcp", "broker:9092") // reset, fail -> 1s, no sleep
+	_, _ = d.Dial("tcp", "broker:9092") // fail: next = now+1s
+	clock.now = clock.now.Add(300 * time.Millisecond)
+	_, _ = d.Dial("tcp", "broker:9092") // only 700ms remain
 
-	want := []time.Duration{time.Second, 2 * time.Second}
-	if len(slept) != len(want) {
-		t.Fatalf("slept = %v, want %v", slept, want)
-	}
-	for i := range want {
-		if slept[i] != want[i] {
-			t.Errorf("sleep %d = %v, want %v", i, slept[i], want[i])
-		}
+	if len(clock.slept) != 1 || clock.slept[0] != 700*time.Millisecond {
+		t.Fatalf("slept = %v, want [700ms]", clock.slept)
 	}
 }
 
+// TestBackoffDialerTCPSuccessDoesNotReset: a successful dial keeps the history
+// (TLS/SASL may still fail); only markConnected resets it (review round-3 item
+// 4).
+func TestBackoffDialerTCPSuccessDoesNotReset(t *testing.T) {
+	fail := errors.New("dial refused")
+	inner := &flakyDialer{results: []error{fail, nil, fail}}
+	d, clock := newTestBackoffDialer(inner, time.Second, 10*time.Second)
+
+	_, _ = d.Dial("tcp", "broker:9092") // fail -> attempts 1, next = now+1s
+	_, _ = d.Dial("tcp", "broker:9092") // sleep 1s, TCP succeeds, history kept
+	_, _ = d.Dial("tcp", "broker:9092") // fail -> attempts 2 (NOT reset to 1)
+
+	// A reset would have scheduled 1s; the retained history schedules 2s.
+	clock.now = clock.now.Add(time.Second)
+	clock.slept = nil
+	_, _ = d.Dial("tcp", "broker:9092") // dial refused (scripted out), remaining after 1s elapsed
+	if len(clock.slept) != 1 || clock.slept[0] != time.Second {
+		t.Fatalf("slept = %v, want [1s] (2s interval minus 1s elapsed); a TCP success must not reset", clock.slept)
+	}
+}
+
+// TestBackoffDialerTracksAddressesIndependently: one address's backoff does
+// not delay another (review round-3 item 4).
 func TestBackoffDialerTracksAddressesIndependently(t *testing.T) {
 	fail := errors.New("dial refused")
-	inner := &flakyDialer{results: []error{fail}}
-	d := newBackoffDialer(inner, brokerBackoffConfig{initial: time.Second, max: 10 * time.Second})
-	var slept []time.Duration
-	d.sleep = func(dur time.Duration) { slept = append(slept, dur) }
-	d.randFloat = func() float64 { return 0.5 }
+	inner := &flakyDialer{results: []error{fail, fail}}
+	d, clock := newTestBackoffDialer(inner, time.Second, 10*time.Second)
 
 	_, _ = d.Dial("tcp", "a:9092") // fail: a backs off
-	_, _ = d.Dial("tcp", "b:9092") // b's first dial: no sleep
-	if len(slept) != 0 {
-		t.Fatalf("slept = %v; a different address must not inherit a's backoff", slept)
+	_, _ = d.Dial("tcp", "b:9092") // b's first dial: no wait
+	if len(clock.slept) != 0 {
+		t.Fatalf("slept = %v; a different address must not inherit a's backoff", clock.slept)
 	}
+}
+
+// TestBackoffDialerMarkConnectedResetsAndMarkFailedGrows: a post-connect
+// failure (handshake/admin) grows the delay, and a full success resets it
+// (review round-3 item 4).
+func TestBackoffDialerMarkConnectedResetsAndMarkFailedGrows(t *testing.T) {
+	d, clock := newTestBackoffDialer(&flakyDialer{}, time.Second, 10*time.Second)
+
+	d.markFailed("broker:9092") // post-connect failure recorded
+	d.markFailed("broker:9092") // second failure doubles it
+	if got := d.remaining("broker:9092"); got != 2*time.Second {
+		t.Fatalf("remaining after two failures = %v, want 2s", got)
+	}
+	d.markConnected("broker:9092")
+	if got := d.remaining("broker:9092"); got != 0 {
+		t.Fatalf("remaining after markConnected = %v, want 0", got)
+	}
+	_ = clock
 }
 
 func TestJitterBounds(t *testing.T) {

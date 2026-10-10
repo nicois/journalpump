@@ -74,7 +74,14 @@ func lookupHost(ctx context.Context, host string) (string, error) {
 }
 
 func (d *socks5ProxyDialer) Dial(network, addr string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), d.timeout)
+	return d.DialContext(context.Background(), network, addr)
+}
+
+// DialContext bounds the whole exchange by min(ctx, timeout): the caller's
+// context (construction/shutdown cancellation) is honored alongside the
+// proxy deadline (review round-3 item 2).
+func (d *socks5ProxyDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 	if d.resolve != nil {
 		host, port, err := net.SplitHostPort(addr)
