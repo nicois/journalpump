@@ -331,6 +331,40 @@ func TestBackoffDialerWaitsOnlyRemaining(t *testing.T) {
 	}
 }
 
+// slowFailDialer advances a shared clock by took before failing, modelling a
+// dial that itself consumes time (e.g. a connect timeout).
+type slowFailDialer struct {
+	clock *fakeClock
+	took  time.Duration
+}
+
+func (d *slowFailDialer) Dial(string, string) (net.Conn, error) {
+	d.clock.now = d.clock.now.Add(d.took)
+	return nil, errors.New("dial timed out")
+}
+
+// TestBackoffDialerMeasuresFromAttemptStart: the reconnect interval runs from
+// when the attempt STARTED, so a slow dial that already exceeded the interval
+// leaves no wait at all (kafka-python sets last_attempt at connect() start;
+// review round-4 item 4).
+func TestBackoffDialerMeasuresFromAttemptStart(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	inner := &slowFailDialer{clock: clock, took: 2 * time.Second}
+	d := newBackoffDialer(inner, brokerBackoffConfig{initial: time.Second, max: 10 * time.Second})
+	d.now = func() time.Time { return clock.now }
+	d.sleep = clock.sleep
+	d.randFloat = func() float64 { return 0.5 } // jitter factor 1.0
+
+	_, _ = d.Dial("tcp", "broker:9092") // attempt starts at 0s, fails at 2s
+	// Measured from attempt start (0s), the 1s interval is already elapsed, so
+	// the next dial waits nothing. Measuring from the failure (2s) would wait 1s.
+	clock.slept = nil
+	_, _ = d.Dial("tcp", "broker:9092")
+	if len(clock.slept) != 0 {
+		t.Fatalf("slept = %v, want none (1s interval measured from the 0s attempt start, not the 2s failure)", clock.slept)
+	}
+}
+
 // TestBackoffDialerTCPSuccessDoesNotReset: a successful dial keeps the history
 // (TLS/SASL may still fail); only markConnected resets it (review round-3 item
 // 4).

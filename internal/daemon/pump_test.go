@@ -1466,6 +1466,62 @@ func TestShutdownCleanupDespiteNotifyError(t *testing.T) {
 	})
 }
 
+// TestWaitSendersBoundedProceedsAfterHardStop locks the sanctioned §2
+// deviation (assessment docs/assess-sender-cancellation.md item 1): a sender
+// that has not returned after cancel must NOT hang shutdown. The bounded join
+// returns at senderJoinHardStop, logs the still-draining sender by name, and
+// lets the supervisor finalize, save state and exit. synctest fast-forwards
+// the hard-stop timer so the test does not wait 30s.
+func TestWaitSendersBoundedProceedsAfterHardStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		log := &captureLog{}
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+		p, _ := newTestRuntime(t, cfg, log)
+
+		release := make(chan struct{})
+		p.senderGroup.Go(func() error { <-release; return nil })
+		t.Cleanup(func() { close(release) })
+
+		// A live sender whose loop goroutine never closes done: still draining.
+		entry := &senderEntry{name: "kafka", done: make(chan struct{})}
+		live := []liveSender{{reader: "r", entry: entry}}
+
+		start := time.Now()
+		if err := p.waitSendersBounded(live); err != nil {
+			t.Fatalf("waitSendersBounded err = %v, want nil (proceed at the hard stop)", err)
+		}
+		if elapsed := time.Since(start); elapsed < senderJoinHardStop {
+			t.Fatalf("returned after %v, want the %v hard stop", elapsed, senderJoinHardStop)
+		}
+		if !log.containsError("still draining") || !log.containsError("kafka") {
+			t.Errorf("hard-stop warning missing or did not name the sender; lines = %v", log.lines)
+		}
+	})
+}
+
+// TestWaitSendersBoundedJoinsCleanlyWhenSendersFinish locks the fast path:
+// when every sender has already finished, the bounded join returns the group's
+// result and logs no warning.
+func TestWaitSendersBoundedJoinsCleanlyWhenSendersFinish(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		log := &captureLog{}
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+		p, _ := newTestRuntime(t, cfg, log)
+
+		done := make(chan struct{})
+		close(done)
+		p.senderGroup.Go(func() error { return nil })
+
+		entry := &senderEntry{name: "kafka", done: done}
+		if err := p.waitSendersBounded([]liveSender{{reader: "r", entry: entry}}); err != nil {
+			t.Fatalf("waitSendersBounded err = %v, want nil", err)
+		}
+		if log.containsError("still draining") {
+			t.Errorf("unexpected hard-stop warning on the clean path; lines = %v", log.lines)
+		}
+	})
+}
+
 // TestFailedFinalFlushRollsBackState locks the flush ordering (major 2):
 // the buffered transport is finalized BEFORE the final state save; a
 // failed final flush is surfaced as an error and the sender's sent

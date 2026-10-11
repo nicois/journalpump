@@ -54,9 +54,14 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // brokerBackoffState is the per-address reconnect state. next is the instant
 // a dial becomes allowed again, so a caller only ever waits the REMAINING
 // time, exactly like kafka-python's _can_connect (review round-3 item 4).
+// attemptStart is when the last attempt began, so the interval is measured
+// from attempt START (kafka-python sets last_attempt at the start of
+// connect(), conn.py _reconnect_backoff) rather than from when a slow dial
+// happened to report its failure.
 type brokerBackoffState struct {
-	attempts int
-	next     time.Time
+	attempts     int
+	next         time.Time
+	attemptStart time.Time
 }
 
 // backoffDialer implements kafka-python's PER-BROKER reconnect backoff at the
@@ -104,12 +109,28 @@ func (d *backoffDialer) DialContext(ctx context.Context, network, addr string) (
 			return nil, err
 		}
 	}
+	d.beginAttempt(addr)
 	conn, err := dialWithContext(ctx, d.inner, network, addr)
 	if err != nil {
 		d.markFailed(addr)
 	}
 	// A successful dial does NOT reset the history: TLS/SASL may still fail.
 	return conn, err
+}
+
+// beginAttempt records the instant a connection attempt starts for addr, so
+// the reconnect interval is measured from attempt START (kafka-python's
+// last_attempt is set at the start of connect()) instead of from when the
+// failure was observed, which would add the dial's own duration to the wait.
+func (d *backoffDialer) beginAttempt(addr string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.state[addr]
+	if st == nil {
+		st = &brokerBackoffState{}
+		d.state[addr] = st
+	}
+	st.attemptStart = d.now()
 }
 
 // remaining is the time left before a dial to addr is allowed again (zero
@@ -128,10 +149,13 @@ func (d *backoffDialer) remaining(addr string) time.Duration {
 }
 
 // markFailed records a failed connection attempt (a transport error or a
-// post-connect handshake failure) and schedules the next allowed dial.
+// post-connect handshake failure) and schedules the next allowed dial. The
+// interval is measured from the attempt's start (see beginAttempt), so a dial
+// that itself took time counts against the backoff.
 func (d *backoffDialer) markFailed(addrs ...string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	now := d.now()
 	for _, addr := range addrs {
 		st := d.state[addr]
 		if st == nil {
@@ -139,7 +163,11 @@ func (d *backoffDialer) markFailed(addrs ...string) {
 			d.state[addr] = st
 		}
 		st.attempts++
-		st.next = d.now().Add(jitter(d.backoff(st.attempts), d.randFloat()))
+		base := st.attemptStart
+		if base.IsZero() {
+			base = now
+		}
+		st.next = base.Add(jitter(d.backoff(st.attempts), d.randFloat()))
 	}
 }
 
@@ -173,13 +201,14 @@ func jitter(base time.Duration, r float64) time.Duration {
 
 // trackingDialer records every connection it hands out so the sender can
 // TERMINATE them (aborting in-flight produce/metadata/admin/SOCKS requests)
-// before joining the worker that owns them (review round-3 items 1-3). Its
-// dials also honor the construction context, so an in-flight dial is
-// abandoned when that context ends rather than running to its own timeout
-// (review round-3 item 2).
+// before joining the worker that owns them (review round-3 items 1-3). It
+// owns a cancellable lifetime, so closeAll also cancels an in-flight DIAL
+// (sarama's context-less Dial at broker.go:203 is the only hook it offers),
+// not just established connections.
 type trackingDialer struct {
-	inner proxy.Dialer
-	ctx   context.Context
+	inner  proxy.Dialer
+	base   context.Context
+	cancel context.CancelFunc
 
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{}
@@ -190,11 +219,12 @@ func newTrackingDialer(ctx context.Context, inner proxy.Dialer) *trackingDialer 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return &trackingDialer{inner: inner, ctx: ctx, conns: make(map[net.Conn]struct{})}
+	lifetime, cancel := context.WithCancel(ctx)
+	return &trackingDialer{inner: inner, base: lifetime, cancel: cancel, conns: make(map[net.Conn]struct{})}
 }
 
 func (d *trackingDialer) Dial(network, addr string) (net.Conn, error) {
-	return d.DialContext(d.ctx, network, addr)
+	return d.DialContext(d.base, network, addr)
 }
 
 func (d *trackingDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -220,10 +250,15 @@ func (d *trackingDialer) DialContext(ctx context.Context, network, addr string) 
 	return tracked, nil
 }
 
-// closeAll terminates every live connection and refuses new ones, so any
-// request in flight on them fails at once.
+// closeAll cancels the dialer's lifetime (abandoning an in-flight dial) and
+// closes every live connection, so any request in flight on them fails and no
+// new one is started. It is idempotent.
 func (d *trackingDialer) closeAll() {
 	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
 	d.closed = true
 	conns := make([]net.Conn, 0, len(d.conns))
 	for c := range d.conns {
@@ -231,6 +266,7 @@ func (d *trackingDialer) closeAll() {
 	}
 	d.conns = make(map[net.Conn]struct{})
 	d.mu.Unlock()
+	d.cancel()
 	for _, c := range conns {
 		_ = c.Close()
 	}

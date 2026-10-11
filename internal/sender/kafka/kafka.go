@@ -526,20 +526,14 @@ func (s *Sender) markConnectFailure(pc producerConfig) {
 	}
 }
 
-// watchCancel aborts the tracking dialer (closing every tracked
-// connection, so any in-flight dial, TLS/SASL handshake or metadata
-// request fails at once) when ctx ends. The returned stop function ends
-// the watch so a later context cancellation cannot kill a live client.
+// watchCancel aborts the tracking dialer (cancelling an in-flight dial and
+// closing every tracked connection, so any handshake or metadata request
+// fails) when ctx ends. It is the stdlib idiom (context.AfterFunc) used by
+// the rsyslog path; the returned stop prevents a later context cancellation
+// from killing a live client.
 func watchCancel(ctx context.Context, td *trackingDialer) func() {
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			td.closeAll()
-		case <-done:
-		}
-	}()
-	return func() { close(done) }
+	stop := context.AfterFunc(ctx, td.closeAll)
+	return func() { stop() }
 }
 
 // connectProducer builds a live sarama SyncProducer from a client it owns.
@@ -684,15 +678,19 @@ func (s *Sender) buildSaramaConfig(ctx context.Context, pc producerConfig) (*sar
 		return nil, nil, err
 	}
 	td := newTrackingDialer(ctx, backoff)
-	// sarama only consults Net.Proxy.Dialer when Net.Proxy.Enable is set, so
-	// the chain is installed unconditionally.
+	// Net.Proxy is abused as the dialer hook because it is the ONLY one
+	// sarama exposes (config.go:875-878 returns Net.Proxy.Dialer when Enable
+	// is set, otherwise a plain *net.Dialer). Consequences to be aware of:
+	// the chain below re-implements Net.DialTimeout/KeepAlive/LocalAddr (see
+	// dialerFor), and sarama logs "using proxy" on every dial. It is
+	// installed unconditionally.
 	cfg.Net.Proxy.Enable = true
 	cfg.Net.Proxy.Dialer = td
 	if pc.apiVersion == nil {
 		// The probe dials and requests run under the construction context;
-		// watchCancel closes the tracked connections the moment ctx ends so a
-		// stalled probe cannot hold construction past the caller's deadline
-		// (review round-3 item 2).
+		// watchCancel cancels the dialer's lifetime and closes the tracked
+		// connections the moment ctx ends, so a stalled probe cannot hold
+		// construction past the caller's deadline (review round-3 item 2).
 		stop := watchCancel(ctx, td)
 		ver, err := s.detectVersion(ctx, pc.brokers, cfg)
 		stop()

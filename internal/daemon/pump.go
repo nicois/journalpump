@@ -1469,10 +1469,6 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 
 	// liveSender remembers which reader owns each entry so a flush
 	// rollback can address the persisted state.
-	type liveSender struct {
-		reader string
-		entry  *senderEntry
-	}
 	p.senderMu.Lock()
 	live := make([]liveSender, 0, len(p.senders))
 	for readerName, readerEntries := range p.senders {
@@ -1487,7 +1483,7 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 	for _, l := range live {
 		l.entry.cancel()
 	}
-	senderErr := p.senderGroup.Wait()
+	senderErr := p.waitSendersBounded(live)
 
 	// Finalize buffered transports BEFORE the final state save: the
 	// bytes a sender buffered (e.g. the file sender's BufferedWriter)
@@ -1569,6 +1565,60 @@ func rollbackSent(st, prev *state.State, reader, senderName string) {
 			rs.Senders[i].State.Sent = state.SentState{}
 		}
 		return
+	}
+}
+
+// senderJoinHardStop bounds how long shutdown waits for the sender
+// goroutines to finish after they are cancelled. It is the larger of 10s
+// and one Kafka request_timeout_ms (30s): sarama cannot abort a call
+// immediately (context-less dials at broker.go:203, uninterruptible
+// retry/backoff time.Sleeps at async_producer.go:627/667, client.go:961),
+// so a sender built on it can need up to
+// Producer.Retry.Max x Retry.Backoff (plus the metadata path) to drain
+// after its connection is closed. Without this bound an unbounded
+// senderGroup.Wait() turns "bounded shutdown" into "must be perfectly
+// abortive", which no Go library-based sender can guarantee.
+//
+// SANCTIONED DEVIATION (charter §2, operator-visible): if a sender is still
+// draining at the bound, shutdown logs a warning and PROCEEDS to
+// finalize/state-save/exit rather than blocking. A sender that did not
+// finish leaves its persisted cursor at the flushed boundary, which is the
+// delivery-checkpoint contract (no acknowledged batch is ever advanced past
+// what was flushed).
+const senderJoinHardStop = 30 * time.Second
+
+// liveSender links a live sender entry to the reader that owns it, so the
+// bounded join can name the senders still draining and the shutdown flush
+// rollback can address the persisted state.
+type liveSender struct {
+	reader string
+	entry  *senderEntry
+}
+
+// waitSendersBounded waits for the sender group to finish, but no longer
+// than senderJoinHardStop. On timeout it logs which senders are still
+// draining and returns so the supervisor can finalize, save state and exit
+// (see senderJoinHardStop).
+func (p *Pump) waitSendersBounded(live []liveSender) error {
+	done := make(chan error, 1)
+	go func() { done <- p.senderGroup.Wait() }()
+	timer := time.NewTimer(senderJoinHardStop)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		draining := make([]string, 0, len(live))
+		for _, l := range live {
+			select {
+			case <-l.entry.done:
+			default:
+				draining = append(draining, l.entry.name)
+			}
+		}
+		sort.Strings(draining)
+		p.logError("Sender shutdown exceeded %s; proceeding with shutdown while these senders are still draining: %s", senderJoinHardStop, strings.Join(draining, ", "))
+		return nil
 	}
 }
 
