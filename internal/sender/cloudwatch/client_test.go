@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/smithy-go"
 )
 
@@ -121,24 +123,92 @@ func TestResolveConfigCABundlePrecedence(t *testing.T) {
 	}
 }
 
-// TestResolveConfigRetry pins the retry defaults: 5 attempts unless
-// AWS_MAX_ATTEMPTS is set, and AWS_RETRY_MODE=legacy mapped to standard mode.
-func TestResolveConfigRetry(t *testing.T) {
-	sc, _ := resolveConfig(nil, nil)
-	if !sc.setMaxAttempts || sc.maxAttempts != defaultRetryMaxAttempts {
-		t.Errorf("default attempts = (%v,%d), want (true,5)", sc.setMaxAttempts, sc.maxAttempts)
+// TestResolveConfigEnvCredentials pins botocore's env-credential precedence:
+// the env pair is captured when the config supplies none, the legacy pair is
+// the fallback, and a partial env pair is rejected.
+func TestResolveConfigEnvCredentials(t *testing.T) {
+	sc, err := resolveConfig(nil, []string{
+		"AWS_ACCESS_KEY_ID=envkey",
+		"AWS_SECRET_ACCESS_KEY=envsecret",
+		"AWS_SESSION_TOKEN=envsession",
+	})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
 	}
-	sc, _ = resolveConfig(nil, []string{"AWS_MAX_ATTEMPTS=9"})
-	if sc.setMaxAttempts {
-		t.Error("explicit max attempts set despite AWS_MAX_ATTEMPTS (env should win)")
+	if !sc.hasEnvCreds || sc.envAccessKey != "envkey" || sc.envSecretKey != "envsecret" || sc.envSession != "envsession" {
+		t.Errorf("env creds = %+v", sc)
 	}
-	sc, _ = resolveConfig(nil, []string{"AWS_RETRY_MODE=legacy"})
-	if !sc.setRetryMode || sc.retryMode != aws.RetryModeStandard {
-		t.Errorf("legacy mode = (%v,%v), want standard", sc.setRetryMode, sc.retryMode)
+
+	sc, err = resolveConfig(nil, []string{"AWS_ACCESS_KEY=legacy", "AWS_SECRET_KEY=legacysecret"})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
 	}
-	sc, _ = resolveConfig(nil, []string{"AWS_RETRY_MODE=adaptive"})
-	if sc.retryMode != aws.RetryModeAdaptive {
-		t.Errorf("adaptive mode = %v, want adaptive", sc.retryMode)
+	if !sc.hasEnvCreds || sc.envAccessKey != "legacy" {
+		t.Errorf("legacy env creds = %+v", sc)
+	}
+
+	// A config pair suppresses env credentials entirely.
+	sc, err = resolveConfig(map[string]any{"aws_access_key_id": "c", "aws_secret_access_key": "d"},
+		[]string{"AWS_ACCESS_KEY_ID=envkey", "AWS_SECRET_ACCESS_KEY=envsecret"})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if !sc.hasCreds || sc.hasEnvCreds {
+		t.Errorf("config pair did not suppress env creds: %+v", sc)
+	}
+
+	if _, err := resolveConfig(nil, []string{"AWS_ACCESS_KEY_ID=envkey"}); err == nil {
+		t.Error("partial env credentials accepted, want error")
+	}
+}
+
+// TestSDKRetryResolution uses the real SDK loader to pin the retry behavior:
+// the standard-mode default is 3 attempts, AWS_MAX_ATTEMPTS overrides it, and
+// AWS_RETRY_MODE=legacy is rejected by the SDK (a documented deviation —
+// botocore accepts it).
+func TestSDKRetryResolution(t *testing.T) {
+	base := sdkConfig{region: "us-east-1", accessKey: "k", secretKey: "s", hasCreds: true}
+
+	// attempts reads the retryer the REAL CloudWatch client resolves (the
+	// SDK applies the mode's default attempt count when none is set).
+	attempts := func(t *testing.T) int {
+		t.Helper()
+		loaded, err := loadAWSConfig(context.Background(), base)
+		if err != nil {
+			t.Fatalf("loadAWSConfig: %v", err)
+		}
+		return cloudwatchlogs.NewFromConfig(loaded).Options().Retryer.MaxAttempts()
+	}
+
+	t.Setenv("AWS_MAX_ATTEMPTS", "")
+	t.Setenv("AWS_RETRY_MODE", "")
+	if got := attempts(t); got != 3 {
+		t.Errorf("default max attempts = %d, want 3 (standard/adaptive default)", got)
+	}
+
+	t.Setenv("AWS_MAX_ATTEMPTS", "9")
+	if got := attempts(t); got != 9 {
+		t.Errorf("AWS_MAX_ATTEMPTS max attempts = %d, want 9", got)
+	}
+	t.Setenv("AWS_MAX_ATTEMPTS", "")
+
+	t.Setenv("AWS_RETRY_MODE", "adaptive")
+	loaded, err := loadAWSConfig(context.Background(), base)
+	if err != nil {
+		t.Fatalf("loadAWSConfig adaptive: %v", err)
+	}
+	if loaded.RetryMode != aws.RetryModeAdaptive {
+		t.Errorf("adaptive mode = %q, want adaptive", loaded.RetryMode)
+	}
+	if got := attempts(t); got != 3 {
+		t.Errorf("adaptive default max attempts = %d, want 3", got)
+	}
+
+	// The SDK rejects botocore's default mode value; this is the deviation the
+	// parity doc records (botocore treats legacy as its default).
+	t.Setenv("AWS_RETRY_MODE", "legacy")
+	if _, err := loadAWSConfig(context.Background(), base); err == nil {
+		t.Error("AWS_RETRY_MODE=legacy accepted, want SDK rejection")
 	}
 }
 
@@ -233,40 +303,52 @@ func TestProxySelectorRouting(t *testing.T) {
 	if u, _ := botocoreProxyFunc([]string{"ALL_PROXY=" + proxy.URL})(req); u != nil {
 		t.Errorf("ALL_PROXY used as a fallback: %v", u)
 	}
+	// A scheme-relative value is completed with http, not left malformed.
+	if u, err := botocoreProxyFunc([]string{"https_proxy=//proxy.example:8080"})(req); err != nil || u == nil || u.String() != "http://proxy.example:8080" {
+		t.Errorf("scheme-relative proxy = %v err %v, want http://proxy.example:8080", u, err)
+	}
 }
 
-// TestTransportVerifiesCustomCA loads REQUESTS_CA_BUNDLE roots and completes a
-// verified TLS handshake.
-func TestTransportVerifiesCustomCA(t *testing.T) {
+// TestClientCustomCATrustSet drives the FULL production construction path: the
+// AWS_CA_BUNDLE (and REQUESTS_CA_BUNDLE) bundle must reach the real SDK client
+// through the BuildableClient, completing a verified TLS handshake. Without the
+// bundle the handshake must fail.
+func TestClientCustomCATrustSet(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "secure")
+		_, _ = io.WriteString(w, "{}")
 	}))
 	defer server.Close()
 
 	caPath := writeCertPEM(t, server.Certificate())
 
-	sc, err := resolveConfig(nil, []string{"REQUESTS_CA_BUNDLE=" + caPath})
-	if err != nil {
-		t.Fatalf("resolveConfig: %v", err)
+	base := func() sdkConfig {
+		return sdkConfig{region: "us-east-1", accessKey: "k", secretKey: "s", hasCreds: true, baseEndpoint: server.URL}
 	}
-	tr, err := sc.transport()
-	if err != nil {
-		t.Fatalf("transport: %v", err)
-	}
-	client := &http.Client{Transport: tr}
-	resp, err := client.Get(server.URL)
-	if err != nil {
-		t.Fatalf("GET with custom CA: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "secure" {
-		t.Errorf("body = %q, want secure", body)
+
+	for _, env := range []string{"AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"} {
+		t.Run(env, func(t *testing.T) {
+			sc, err := resolveConfig(nil, []string{env + "=" + caPath})
+			if err != nil {
+				t.Fatalf("resolveConfig: %v", err)
+			}
+			merged := base()
+			merged.caBundle = sc.caBundle
+			c, err := buildSDKClient(context.Background(), merged)
+			if err != nil {
+				t.Fatalf("buildSDKClient: %v", err)
+			}
+			if err := c.CreateLogGroup(context.Background(), "group"); err != nil {
+				t.Fatalf("CreateLogGroup with %s trusts: %v", env, err)
+			}
+		})
 	}
 
 	// Without the CA the handshake must fail (proves the CA is actually used).
-	bad := &http.Client{Transport: &http.Transport{}}
-	if _, err := bad.Get(server.URL); err == nil {
+	c, err := buildSDKClient(context.Background(), base())
+	if err != nil {
+		t.Fatalf("buildSDKClient: %v", err)
+	}
+	if err := c.CreateLogGroup(context.Background(), "group"); err == nil {
 		t.Error("handshake succeeded without the custom CA")
 	}
 }
@@ -373,10 +455,43 @@ func TestSDKClientWireShape(t *testing.T) {
 	if strings.Contains(reqs[1].Body, "sequenceToken") {
 		t.Errorf("first put body unexpectedly carries a token: %q", reqs[1].Body)
 	}
-	var secondPut map[string]any
-	_ = json.Unmarshal([]byte(reqs[2].Body), &secondPut)
-	if secondPut["sequenceToken"] != "tok1" {
-		t.Errorf("second put token = %v, want tok1", secondPut["sequenceToken"])
+	var firstPut struct {
+		LogGroupName  string `json:"logGroupName"`
+		LogStreamName string `json:"logStreamName"`
+		LogEvents     []struct {
+			Timestamp int64  `json:"timestamp"`
+			Message   string `json:"message"`
+		} `json:"logEvents"`
+		SequenceToken *string `json:"sequenceToken"`
+	}
+	if err := json.Unmarshal([]byte(reqs[1].Body), &firstPut); err != nil {
+		t.Fatalf("first put body: %v", err)
+	}
+	if firstPut.LogGroupName != "group" || firstPut.LogStreamName != "stream" {
+		t.Errorf("first put names = (%q,%q), want (group,stream)", firstPut.LogGroupName, firstPut.LogStreamName)
+	}
+	if len(firstPut.LogEvents) != 1 || firstPut.LogEvents[0].Timestamp != 123 || firstPut.LogEvents[0].Message != "hi" {
+		t.Errorf("first put events = %+v", firstPut.LogEvents)
+	}
+	if firstPut.SequenceToken != nil {
+		t.Errorf("first put token = %v, want omitted", *firstPut.SequenceToken)
+	}
+
+	var secondPut struct {
+		SequenceToken *string `json:"sequenceToken"`
+		LogEvents     []struct {
+			Timestamp int64  `json:"timestamp"`
+			Message   string `json:"message"`
+		} `json:"logEvents"`
+	}
+	if err := json.Unmarshal([]byte(reqs[2].Body), &secondPut); err != nil {
+		t.Fatalf("second put body: %v", err)
+	}
+	if secondPut.SequenceToken == nil || *secondPut.SequenceToken != "tok1" {
+		t.Errorf("second put token = %v, want tok1", secondPut.SequenceToken)
+	}
+	if len(secondPut.LogEvents) != 1 || secondPut.LogEvents[0].Timestamp != 124 || secondPut.LogEvents[0].Message != "yo" {
+		t.Errorf("second put events = %+v", secondPut.LogEvents)
 	}
 }
 
@@ -400,10 +515,21 @@ func TestSDKClientDescribePagination(t *testing.T) {
 		t.Fatalf("found=%v token=%q, want found/recovered", found, token)
 	}
 	srv.mu.Lock()
-	n := len(srv.requests)
+	reqs := append([]capturedRequest(nil), srv.requests...)
 	srv.mu.Unlock()
-	if n != 2 {
-		t.Fatalf("describe pages = %d, want 2", n)
+	if len(reqs) != 2 {
+		t.Fatalf("describe pages = %d, want 2", len(reqs))
+	}
+	// The second page must carry the token the first response returned.
+	var second map[string]any
+	if err := json.Unmarshal([]byte(reqs[1].Body), &second); err != nil {
+		t.Fatalf("second describe body: %v", err)
+	}
+	if second["nextToken"] != "page2" {
+		t.Errorf("second describe nextToken = %v, want page2", second["nextToken"])
+	}
+	if second["logGroupName"] != "group" {
+		t.Errorf("second describe logGroupName = %v, want group", second["logGroupName"])
 	}
 }
 
@@ -436,6 +562,122 @@ func (e fakeErrorAPI) Error() string                 { return e.code }
 func (e fakeErrorAPI) ErrorCode() string             { return e.code }
 func (e fakeErrorAPI) ErrorMessage() string          { return e.msg }
 func (e fakeErrorAPI) ErrorFault() smithy.ErrorFault { return smithy.FaultUnknown }
+
+// TestHTTPClientReadTimeoutBoundsStalledResponse proves the transport applies
+// an inactivity bound: a server that accepts the connection but never writes a
+// response must not hold the request open forever.
+func TestHTTPClientReadTimeoutBoundsStalledResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case accepted <- conn:
+			default:
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	sc := sdkConfig{proxy: botocoreProxyFunc(nil), readTimeout: 200 * time.Millisecond}
+	hc, err := sc.newHTTPClient()
+	if err != nil {
+		t.Fatalf("newHTTPClient: %v", err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	start := time.Now()
+	resp, err := hc.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("stalled response did not time out")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("stalled response returned after %v, want a bounded timeout", d)
+	}
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	default:
+	}
+}
+
+// TestSDKCredentialPrecedence pins botocore's precedence through the real
+// client: an environment credential pair wins over the selected profile.
+func TestSDKCredentialPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+	credPath := filepath.Join(dir, "credentials")
+	if err := os.WriteFile(cfgPath, []byte("[profile probe]\nregion = us-east-2\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(credPath, []byte("[probe]\naws_access_key_id = PROFKEY\naws_secret_access_key = PROFSECRET\n"), 0o600); err != nil {
+		t.Fatalf("write credentials: %v", err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", cfgPath)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credPath)
+
+	// Env pair present: it must win over the selected profile.
+	sc := sdkConfig{
+		region:       "us-east-1",
+		profile:      "probe",
+		envAccessKey: "ENVKEY",
+		envSecretKey: "ENVSECRET",
+		hasEnvCreds:  true,
+	}
+	loaded, err := loadAWSConfig(context.Background(), sc)
+	if err != nil {
+		t.Fatalf("loadAWSConfig: %v", err)
+	}
+	creds, err := loaded.Credentials.Retrieve(context.Background())
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if creds.AccessKeyID != "ENVKEY" {
+		t.Errorf("access key = %q, want ENVKEY (env wins over profile)", creds.AccessKeyID)
+	}
+
+	// Without env credentials the selected profile supplies the identity.
+	sc.hasEnvCreds, sc.envAccessKey, sc.envSecretKey = false, "", ""
+	loaded, err = loadAWSConfig(context.Background(), sc)
+	if err != nil {
+		t.Fatalf("loadAWSConfig: %v", err)
+	}
+	creds, err = loaded.Credentials.Retrieve(context.Background())
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if creds.AccessKeyID != "PROFKEY" {
+		t.Errorf("access key = %q, want PROFKEY (profile fallback)", creds.AccessKeyID)
+	}
+}
+
+// TestBuildSDKClientBoundedConstruction is a construction-path regression:
+// an already-cancelled context must not leave construction blocked (the
+// documented residual is the container-credential hostname lookup, which does
+// not observe ctx).
+func TestBuildSDKClientBoundedConstruction(t *testing.T) {
+	sc := sdkConfig{region: "us-east-1", accessKey: "k", secretKey: "s", hasCreds: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = buildSDKClient(ctx, sc)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("construction did not return for a cancelled context")
+	}
+}
 
 // TestWrapAPIError checks the smithy API error mapping.
 func TestWrapAPIError(t *testing.T) {

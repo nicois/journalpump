@@ -678,7 +678,8 @@ func TestLoopSingleBackoffOnFailedPut(t *testing.T) {
 func TestLoopChunksLargeBatch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		steps := []fakeStep{
-			{op: "create_group"}, {op: "create_stream"},
+			{op: "create_group"},
+			{op: "create_stream"},
 			{op: "describe", token: "token", found: true},
 			putStep("n1", 200),
 			putStep("n2", 200),

@@ -6,9 +6,8 @@
 package cloudwatch
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
@@ -33,14 +33,18 @@ import (
 // without a bound. See the parity doc (Task 25) for the credentials-cache
 // caveat: aws.CredentialsCache performs its own background retrieval and can
 // suppress a caller deadline, so the caller may return before credentials
-// resolve.
+// resolve. One SDK-internal step remains outside this bound: the
+// container-credentials provider's host validation performs its own
+// hostname resolution that does not observe ctx (documented residual).
 const sdkInitTimeout = 5 * time.Second
 
-// defaultRetryMaxAttempts matches botocore's legacy retry default
-// (AWS_MAX_ATTEMPTS unset → 5 attempts). The retry STRATEGY differs (the
-// SDK's standard mode is not botocore's legacy policy); the attempt count is
-// the closest faithful bound. AWS_MAX_ATTEMPTS, when set, takes precedence.
-const defaultRetryMaxAttempts = 5
+// botocore's default HTTP timeouts (Config: connect_timeout/read_timeout are
+// both 60s). They are applied through the SDK's BuildableClient so the SDK
+// keeps ownership of the transport.
+const (
+	connectTimeout = 60 * time.Second
+	readTimeout    = 60 * time.Second
+)
 
 // sdkConfig is the botocore-compatible settings resolved from the sender
 // config and the environment before the SDK client is built.
@@ -48,9 +52,20 @@ type sdkConfig struct {
 	region  string
 	profile string
 
+	// Explicit pair from the journalpump config (aws_access_key_id/secret);
+	// wins over the environment chain, as in botocore.
 	accessKey string
 	secretKey string
 	hasCreds  bool
+
+	// Env pair (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or the legacy
+	// AWS_ACCESS_KEY/AWS_SECRET_KEY) with AWS_SESSION_TOKEN. Passed as an
+	// explicit provider when config credentials are absent so the env pair
+	// keeps botocore's precedence over the selected profile.
+	envAccessKey string
+	envSecretKey string
+	envSession   string
+	hasEnvCreds  bool
 
 	// caBundle is the CA bundle path (AWS_CA_BUNDLE then REQUESTS_CA_BUNDLE);
 	// empty means the SDK/system default trust set.
@@ -59,15 +74,15 @@ type sdkConfig struct {
 	// proxy is the botocore-compatible transport proxy selector.
 	proxy func(*http.Request) (*url.URL, error)
 
-	setMaxAttempts bool
-	maxAttempts    int
-	setRetryMode   bool
-	retryMode      aws.RetryMode
-
 	// baseEndpoint overrides the service endpoint (tests).
 	baseEndpoint string
 	// httpClient overrides the transport (tests).
 	httpClient *http.Client
+
+	// connectTimeout/readTimeout bound the transport; zero means the
+	// botocore defaults (tests use smaller values).
+	connectTimeout time.Duration
+	readTimeout    time.Duration
 }
 
 // sdkClient wraps the aws-sdk-go-v2 cloudwatchlogs client behind logsClient.
@@ -133,45 +148,68 @@ func resolveConfig(cfg map[string]any, environ []string) (sdkConfig, error) {
 		return sdkConfig{}, errors.New("cloudwatch: partial credentials: aws_secret_access_key supplied without aws_access_key_id")
 	}
 
+	// Environment credentials: botocore's env provider reads
+	// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (plus AWS_SESSION_TOKEN), then
+	// the legacy AWS_ACCESS_KEY/AWS_SECRET_KEY. They take precedence over the
+	// selected profile, so they are resolved here (only when the config pair
+	// did not supply credentials) and passed as an explicit provider.
+	if !sc.hasCreds {
+		envAccess := envLookup(environ, "AWS_ACCESS_KEY_ID")
+		envSecret := envLookup(environ, "AWS_SECRET_ACCESS_KEY")
+		if envAccess == "" && envSecret == "" {
+			envAccess = envLookup(environ, "AWS_ACCESS_KEY")
+			envSecret = envLookup(environ, "AWS_SECRET_KEY")
+		}
+		switch {
+		case envAccess != "" && envSecret != "":
+			sc.envAccessKey, sc.envSecretKey = envAccess, envSecret
+			sc.envSession = envLookup(environ, "AWS_SESSION_TOKEN")
+			sc.hasEnvCreds = true
+		case envAccess != "":
+			return sdkConfig{}, errors.New("cloudwatch: partial credentials: AWS_ACCESS_KEY_ID supplied without AWS_SECRET_ACCESS_KEY")
+		case envSecret != "":
+			return sdkConfig{}, errors.New("cloudwatch: partial credentials: AWS_SECRET_ACCESS_KEY supplied without AWS_ACCESS_KEY_ID")
+		}
+	}
+
 	// CA bundle: botocore honors AWS_CA_BUNDLE, then REQUESTS_CA_BUNDLE.
 	sc.caBundle = envLookup(environ, "AWS_CA_BUNDLE")
 	if sc.caBundle == "" {
 		sc.caBundle = envLookup(environ, "REQUESTS_CA_BUNDLE")
 	}
 
-	// Retry: botocore defaults to legacy mode with 5 attempts. AWS_MAX_ATTEMPTS
-	// takes precedence when set; AWS_RETRY_MODE=legacy (which the SDK rejects)
-	// maps to the SDK's standard mode. The strategy is the SDK's (a documented
-	// deviation); the attempt count matches botocore's default.
-	if envLookup(environ, "AWS_MAX_ATTEMPTS") == "" {
-		sc.setMaxAttempts, sc.maxAttempts = true, defaultRetryMaxAttempts
-	}
-	switch envLookup(environ, "AWS_RETRY_MODE") {
-	case "legacy":
-		sc.setRetryMode, sc.retryMode = true, aws.RetryModeStandard
-	case "standard":
-		sc.setRetryMode, sc.retryMode = true, aws.RetryModeStandard
-	case "adaptive":
-		sc.setRetryMode, sc.retryMode = true, aws.RetryModeAdaptive
-	}
+	// Retry is left to the SDK's own env/profile resolution. botocore and the
+	// SDK agree on standard/adaptive defaults (3 attempts) and on
+	// AWS_MAX_ATTEMPTS / profile max_attempts. The SDK has no "legacy" mode,
+	// so AWS_RETRY_MODE=legacy cannot be honored and surfaces the SDK's own
+	// rejection (documented deviation; see the parity doc).
 	return sc, nil
 }
 
 // buildSDKClient loads the SDK config and constructs the client, applying any
 // extra client options (tests inject a base endpoint / HTTP client).
 func buildSDKClient(ctx context.Context, sc sdkConfig, clientOpts ...func(*cloudwatchlogs.Options)) (logsClient, error) {
-	loadOpts, err := sc.loadOptions()
-	if err != nil {
-		return nil, err
-	}
-	loaded, err := config.LoadDefaultConfig(ctx, loadOpts...)
+	loaded, err := loadAWSConfig(ctx, sc)
 	if err != nil {
 		return nil, fmt.Errorf("cloudwatch: load AWS config: %w", err)
 	}
 	return &sdkClient{client: cloudwatchlogs.NewFromConfig(loaded, clientOpts...)}, nil
 }
 
-// loadOptions renders the resolved settings as SDK config options.
+// loadAWSConfig renders the resolved settings as SDK config options and loads
+// them. Exposed separately so tests can assert the SDK-resolved region,
+// profile, retry, and credentials.
+func loadAWSConfig(ctx context.Context, sc sdkConfig) (aws.Config, error) {
+	loadOpts, err := sc.loadOptions()
+	if err != nil {
+		return aws.Config{}, err
+	}
+	return config.LoadDefaultConfig(ctx, loadOpts...)
+}
+
+// loadOptions renders the resolved settings as SDK config options. The HTTP
+// client is a BuildableClient so the SDK itself injects the custom CA bundle
+// (WithCustomCABundle) without hand-rolling TLS roots.
 func (sc sdkConfig) loadOptions() ([]func(*config.LoadOptions) error, error) {
 	var opts []func(*config.LoadOptions) error
 	if sc.region != "" {
@@ -180,65 +218,53 @@ func (sc sdkConfig) loadOptions() ([]func(*config.LoadOptions) error, error) {
 	if sc.profile != "" {
 		opts = append(opts, config.WithSharedConfigProfile(sc.profile))
 	}
-	if sc.hasCreds {
+	switch {
+	case sc.hasCreds:
 		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(sc.accessKey, sc.secretKey, ""),
 		))
+	case sc.hasEnvCreds:
+		opts = append(opts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(sc.envAccessKey, sc.envSecretKey, sc.envSession),
+		))
 	}
-	if sc.setMaxAttempts {
-		opts = append(opts, config.WithRetryMaxAttempts(sc.maxAttempts))
-	}
-	if sc.setRetryMode {
-		opts = append(opts, config.WithRetryMode(sc.retryMode))
+	if sc.caBundle != "" {
+		pem, err := os.ReadFile(sc.caBundle)
+		if err != nil {
+			return nil, fmt.Errorf("cloudwatch: read CA bundle %s: %w", sc.caBundle, err)
+		}
+		opts = append(opts, config.WithCustomCABundle(bytes.NewReader(pem)))
 	}
 	if sc.baseEndpoint != "" {
 		opts = append(opts, config.WithBaseEndpoint(sc.baseEndpoint))
 	}
-	tr, err := sc.transport()
+	httpClient, err := sc.newHTTPClient()
 	if err != nil {
 		return nil, err
 	}
-	opts = append(opts, config.WithHTTPClient(&http.Client{Transport: tr}))
+	opts = append(opts, config.WithHTTPClient(httpClient))
 	return opts, nil
 }
 
-// transport builds the HTTP transport: the botocore-compatible proxy selector
-// and (when a CA bundle is configured) TLS roots loaded from it.
-func (sc sdkConfig) transport() (*http.Transport, error) {
+// newHTTPClient builds the HTTP client through the SDK's BuildableClient so the
+// SDK owns the transport: it keeps its TLS/CA injection (which requires a
+// BuildableClient), applies the botocore-compatible proxy selector, and bounds
+// the connection with botocore's connect/read (inactivity) timeouts.
+func (sc sdkConfig) newHTTPClient() (aws.HTTPClient, error) {
 	if sc.httpClient != nil {
-		// Tests may inject a fully-formed client; extract its transport.
-		if tr, ok := sc.httpClient.Transport.(*http.Transport); ok {
-			return tr, nil
-		}
-		return &http.Transport{Proxy: sc.proxy}, nil
+		return sc.httpClient, nil
 	}
-	pool, err := rootCAsFor(sc.caBundle)
-	if err != nil {
-		return nil, err
+	connect, read := sc.connectTimeout, sc.readTimeout
+	if connect <= 0 {
+		connect = connectTimeout
 	}
-	return &http.Transport{
-		Proxy:             sc.proxy,
-		ForceAttemptHTTP2: true,
-		TLSClientConfig:   &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-	}, nil
-}
-
-// rootCAsFor loads a PEM CA bundle into a fresh pool. An empty path yields a
-// nil pool (the transport then uses the system roots — the documented default
-// trust-set deviation, charter §2).
-func rootCAsFor(path string) (*x509.CertPool, error) {
-	if path == "" {
-		return nil, nil
+	if read <= 0 {
+		read = readTimeout
 	}
-	pem, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("cloudwatch: read CA bundle %s: %w", path, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("cloudwatch: CA bundle %s contains no certificates", path)
-	}
-	return pool, nil
+	b := awshttp.NewBuildableClient().
+		WithTransportOptions(func(tr *http.Transport) { tr.Proxy = sc.proxy }).
+		WithDialerOptions(func(d *net.Dialer) { d.Timeout = connect })
+	return b.WithReadTimeout(read), nil
 }
 
 // envLookup returns the value of key in an os.Environ()-style list ("" when
@@ -341,7 +367,11 @@ func botocoreProxyFunc(environ []string) func(*http.Request) (*url.URL, error) {
 		if raw == "" {
 			return nil, nil
 		}
-		if !strings.Contains(raw, "://") {
+		// A scheme-relative value ("//host:port") is completed with http, the
+		// same as a bare authority, rather than producing "http:////host".
+		if strings.HasPrefix(raw, "//") {
+			raw = "http:" + raw
+		} else if !strings.Contains(raw, "://") {
 			raw = "http://" + raw
 		}
 		return url.Parse(raw)
