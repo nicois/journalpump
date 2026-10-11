@@ -2384,6 +2384,23 @@ HTTP-client deviations (charter §2, Task 23):
   reproduced (no reference sender owns a statsd client); the errors are
   logged and routed through the loop's disconnect/backoff path.
 
+Shared HTTP helper (coordinator decision 2026-10-11): closing Task 23
+extracted the raw-HTTP client plumbing into `internal/httpx` and moved
+both logplex and this sender onto it, so GCL (Task 26) builds on one
+helper. Proxy selection is a PER-SENDER parameter (`httpx.ProxySelector`);
+logplex and ES/OpenSearch both pass `httpx.RequestsProxy`, the port of
+requests' `should_bypass_proxies`/`get_environ_proxies`, because BOTH
+Python senders talk to the server through `requests` — ES via
+`journalpump.util.get_requests_session` → `requests.Session`, NOT
+elasticsearch-py/urllib3. This corrects the initial ES port, which used
+Go's `http.ProxyFromEnvironment`: matching requests is Python-faithful, so
+it is a **bug fix toward Python, not a deviation**
+(`TestHTTPClientUsesRequestsProxySemantics`; logplex's pinned proxy tests
+pass unchanged). logplex keeps its own dial hook (inactivity-timeout conn
+wrapper), so its timing semantics are untouched, and the helper
+deliberately provides no retry hook — retries stay owned by
+`sender.Loop`.
+
 Fixture parity: `systest-go/fixtures/elasticsearch.json` (Task 11) is
 consumed by `TestFixtureStructuralParity`: for each captured index the 40
 payloads are sent through the production HTTP client against an `httptest`

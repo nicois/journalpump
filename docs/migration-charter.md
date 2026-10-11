@@ -362,6 +362,15 @@ NEWS entry — plan Task 28):
   reference sender in this tree owns a statsd client; the errors are logged
   and routed through the loop's disconnect/backoff path. Not
   operator-visible (same timeout value and success/quirk semantics).
+  Closing Task 23 (2026-10-11) extracted the raw-HTTP plumbing into the
+  shared `internal/httpx` helper (logplex + ES), parameterized by
+  proxy-selection strategy. Both senders use the requests-compatible
+  selector (`httpx.RequestsProxy`) because both Python senders use
+  `requests` — ES through `journalpump.util.get_requests_session`, NOT
+  elasticsearch-py/urllib3. This corrects the initial ES port's use of Go's
+  `http.ProxyFromEnvironment`; matching requests is Python-faithful, so it
+  is a bug fix toward Python, not a deviation (recorded in
+  go-test-parity.md).
 
 ## 3. Resolved decisions (spec §9, user-confirmed 2026-10-09)
 
