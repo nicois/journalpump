@@ -2749,3 +2749,70 @@ Dispositions (coordinator rulings 2026-10-12):
 6. **Explicit null compression enums: reject.** `websocket_compression:
    null` / `compression: null` now error (Python's `websockets_compression
    == None` path raises `ValueError`); only ABSENT keys take the default.
+
+## Task 25 — CloudWatch sender (spec §5)
+
+`internal/sender/cloudwatch` ports `journalpump/senders/aws_cloudwatch.py`
+and is registered as `output_type aws_cloudwatch`. It drives an
+`aws-sdk-go-v2` `cloudwatchlogs` client behind a small `logsClient`
+interface, so the botocore-Stubber Python cases port to a hand-written
+fake client (`aws-sdk-go-v2` ships no generated mocks).
+
+Parity points:
+- Config: `aws_cloudwatch_log_group` and `aws_cloudwatch_log_stream` are
+  both required (Python's `ValueError`); `max_send_interval` default 0.3 s;
+  optional `aws_region` and static `aws_access_key_id`/`aws_secret_access_key`
+  (absent keys fall back to the SDK's default provider chain).
+- Init (`aws_cloudwatch.py:36-101`): create the log group and stream with
+  up to `MAX_INIT_TRIES` (3) attempts, ignoring
+  `ResourceAlreadyExistsException` on EACH call; a persistent
+  `AccessDeniedException` becomes a `SenderInitializationError`
+  (`sender.InitializationError`, routed PERMANENT by the default
+  classifier) after a backoff; another persisted `ClientError` is returned
+  raw. The upload sequence token is recovered by paging
+  `describe_log_streams` for the named stream's `uploadSequenceToken`; a
+  paginator failure is logged, emits `stats.unexpected_exception` and backs
+  off but is NOT raised — Python logs "Failed to init sender..." and leaves
+  the sender disconnected (`aws_cloudwatch.py:93-101`).
+- Send (`aws_cloudwatch.py:103-141`): one event per raw JSON message line,
+  timestamp `int((REALTIME_TIMESTAMP or time.time()) * 1000.0)` in ms (a
+  missing/falsy `REALTIME_TIMESTAMP` falls back to the wall clock; a truthy
+  non-numeric value fails like Python's `TypeError`);
+  `PutLogEvents` is called with the current sequence token, and a 2xx
+  response records `NextSequenceToken`. A failed put marks the sender
+  disconnected, logs, emits `unexpected_exception` and RE-INITS within the
+  SAME call (Python does), returning the error so the shared loop also backs
+  off and retries.
+- Transport: the SDK owns request transport, its own retry, proxy selection
+  (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) and TLS, so the shared
+  `internal/httpx` helper does NOT apply to this sender (it is used by the
+  ES/OS sender and will be used by the GCL sender in Task 26). Every SDK
+  call takes `ctx`, so cancellation and deadlines propagate — there is no
+  sarama/gorilla-style in-library cancellation limitation here.
+- Strict-at-load config validation (a present non-string group/stream name
+  or `max_send_interval` is rejected at construction) — same class as the
+  Task 22/23 decisions.
+
+Tests: the three Python cases port against a scripted fake client —
+`TestSenderPutSequence` (`test_awscloudwatch_sender`: init recovers the
+token, three puts asserting the token carried and the ms timestamps
+`123456789000` / `1590581737308`, a `ThrottlingException` then an
+`InternalFailure` put each re-init and stay connected, exactly two
+`unexpected_exception` emissions), `TestSenderInit`
+(`test_awscloudwatch_sender_init`: `AccessDenied` exhaustion →
+`InitializationError`; `AccessDenied` and `ServiceUnavailable` each recover
+on retry) and `TestSenderInitPaginateAccessDenied`
+(`test_awscloudwatch_sender_init_paginate`: an `AccessDenied` inside the
+paginator is logged, NOT raised, and leaves the sender disconnected with a
+single emission). Plus `TestConfigRequiresGroupAndStream` and
+`TestEventTimestampNonNumeric`.
+
+Test mapping note: `test_single_sender_init_fail`
+(`test/test_journalpump.py:1512`) uses `aws_cloudwatch` only as an
+`output_type` stub for a reader-level init-failure test; it belongs to the
+Task 16 reader framework and has no CloudWatch-package counterpart. Like
+Task 21, the sent-count/mark-sent transition is owned by the shared loop
+(Task 13), so a nil `SendMessages` return is the assertion point rather than
+a sender-private counter. No Task 11 fixture or systest-go e2e driver was
+added for this sender (the Python ground truth is botocore Stubber
+responses, reproduced directly in the fake-client unit tests).
