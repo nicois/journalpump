@@ -2505,3 +2505,81 @@ the quirk-locks and the fixture parity above. The Task 11 capture is the
 committed Python ground truth; no systest-go e2e driver was added — the
 plan's Task 23 test list scopes this task to the package-level httptest
 suite.
+
+## Task 24 — websocket sender (spec §5)
+
+`internal/sender/websocket` ports `journalpump/senders/websocket.py`. The
+asyncio-event-loop-in-a-Thread design (a dummy consumer draining inbound
+plus `run_coroutine_threadsafe` sends) collapses to ONE runner goroutine
+that owns the connection: it dials, drains inbound frames (a dead drain
+means the connection is dead), serializes outbound frames, and reconnects
+with Python's runner backoff.
+
+Parity points:
+- Config: `websocket_uri` (required), `socks5_proxy`, `ssl` (bool),
+  `ca`/`keyfile`/`certfile` (all three required when `ssl`),
+  `websocket_compression` (`none` default; `deflate` = permessage-deflate),
+  `compression` (`snappy` default; app-level snappy),
+  `max_batch_size` (1048576; 0 disables batching), `max_send_interval`
+  (1.0).
+- Two-level compression: app-level snappy (`github.com/golang/snappy`,
+  `snappy.Encode` block format = python-snappy's `compress`) and
+  protocol-level permessage-deflate.
+- Batching: `max_batch_size > 0` NUL-joins one batch's messages into a
+  SINGLE frame; the connect header `Journalpump-Batch-Size` carries the
+  configured `max_batch_size`; `0` sends each message as its own frame.
+  This sender overrides the shared batch overhead to 1 byte
+  (per the plan/spec — see the flagged discrepancy below).
+- Connect headers: `User-Agent: journalpump/<version>`,
+  `Journalpump-Compression` when compression is not `none`.
+- TLS: client cert (`certfile`/`keyfile`) + CA verification (`ca`).
+- SOCKS5 (`socks5_proxy`): `socks5` resolves the target locally,
+  `socks5h` defers the name to the proxy; HTTP_PROXY is NOT honored
+  (Python supports only the SOCKS5 option).
+- Inbound cap 2 MiB (`max_size=MAX_KAFKA_MESSAGE_SIZE*2`); close timeout
+  20 s; reconnect backoff base 20 s factor 1.8 cap 90 s jittered, reset
+  after a connection stable >60 s; send waits up to 20 s for the
+  connected event.
+
+Tests: the two `test/test_websocket.py` cases are ported as
+`TestSendMessagesBatchedSnappy` and `TestSendMessagesNobatch` against an
+in-process gorilla websocket server (asserting the exact
+`snappy(NUL-join(batch))` frame, per-message frames, and the connect
+headers). Config parsing (`TestParseConfig*`, ssl-triple, enum/number
+validation), framing (`TestFrames*`), headers (`TestHandshakeHeaders*`),
+the instance wiring (`TestNewRegistersInstance`), the not-connected send
+wait (`TestSendMessagesNotConnected`), and the ExponentialBackoff
+sequence (`TestExponentialBackoffSequence`) are unit-tested; the
+reconnect cadence (20/36/64.8 s) is pinned under `testing/synctest`
+(`TestRunnerReconnectBackoffTiming`).
+
+Fixture parity: unlike Task 23, a systest-go e2e driver WAS added
+(`systest-go/websocket_e2e_test.go:TestWebsocketSenderEndToEnd`): the real
+Go binary runs against an in-process gorilla capture server, and the
+decompressed message stream byte-matches the Task 11 fixture
+(`systest-go/fixtures/websocket.json`, 40 messages), the
+`Journalpump-Batch-Size`/`Journalpump-Compression` headers match exactly
+(the `User-Agent` is compared by the `journalpump/` prefix because the
+fixture carries the Python version string, not the Go binary's), and the
+state sent count + cursor match.
+
+Flagged deviations (operator-visible; for coordinator → user):
+1. **Strict-at-load config validation.** Python reads every websocket key
+   lazily inside `send_messages` and treats a bad value (unknown
+   `compression`/`websocket_compression` enum, missing `websocket_uri`,
+   `ssl` without the ca/keyfile/certfile triple) as a retriable send
+   failure that it retries forever; the Go constructor validates
+   structurally at load and reports one clear error. This surfaces the
+   misconfiguration instead of retrying it silently.
+2. **Plan/spec batch-overhead claim vs Python.** The plan and spec §5 say
+   the websocket sender overrides the shared batch overhead to 1 byte
+   (`websocket.py:73`). That line sets an attribute on the
+   `WebsocketRunner` Thread, NOT on the LogSender that does the batch
+   slicing (`base.py:262` uses `self.batch_message_overhead`, which for
+   `WebsocketSender` stays the 30-byte base default; `self.max_batch_size`
+   likewise stays the base 1 MiB). Go implements the plan (MessageOverhead
+   1, framework MaxBatchSize = configured `max_batch_size`). This changes
+   batch boundaries relative to Python for messages near 1 MiB; the
+   fixture (a decompressed message stream) is unaffected. Needs a
+   coordinator/user ruling: match the plan, or match Python's 30-byte
+   slicing overhead + 1 MiB slicing limit.
