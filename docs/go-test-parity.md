@@ -2315,3 +2315,87 @@ Review round 7 (confirmation of round 6; verdict changes-required, 2 majors
    the initial 1s before its first use.
    `TestReconnectBackoffActualWaitsGrowFromBase` observes the waits on the
    virtual clock (not just the stored value).
+
+## Task 23 — Elasticsearch/OpenSearch sender (spec §5)
+
+`internal/sender/elasticsearch` ports
+`journalpump/senders/elasticsearch_opensearch_sender.py`: a raw-HTTP
+sender (not the elasticsearch-py client). It is registered as output_types
+`elasticsearch` and `opensearch`, sharing one transport (Python's
+`_EsOsLogSenderBase`); the two differ only in the `<type>_*` config-key
+prefix, the state-file `type` string, and the Elasticsearch ≤ 7 legacy
+mapping-type quirks.
+
+Wire and config:
+
+- `New` requires `<type>_url` (rstripped of a trailing `/`; missing →
+  `"<type>_url hasn't been defined"`), and reads `<type>_timeout` (60 s),
+  `<type>_index_prefix` (`journalpump`), `<type>_index_days_max` (3),
+  `max_send_interval` (10 s) and `ca` (default true = system CAs).
+- Version probe: one `GET /` per sender, `version.number` parsed as exactly
+  major.minor.patch (`Version.from_json`), cached.
+- Alias census: `GET /_aliases`, keys cached as the known index set. Both
+  probes run only on the cold path (Python's `_load_indices` early-returns
+  when the index set is non-empty). `TestLoadIndicesVersionProbeOnce`.
+- Daily rollover: index `<prefix>-<timestamp[:10]>`; a missing/empty
+  `timestamp` uses the current UTC date plus a warning. The warning names
+  `timestamp`, so it survives a WARNING log threshold
+  (`TestSendMessagesUsesCurrentDateWhenTimestampMissing`,
+  `TestSendMessagesUsesTimestampForIndexName`).
+- Index create: `PUT <index>` with the mapping derived from the FIRST
+  message of that index; success is 200/201 OR a body containing
+  `already_exists_exception` (`TestCreateIndexAlreadyExistsTolerated`). A
+  failing create is logged and does NOT fail the batch (Python continues to
+  the bulk write — `TestCreateIndexFailureLoggedButContinues`).
+- Mapping: fixed `SYSTEMD_SESSION`/`SESSION_ID` text fields plus the message
+  fields — bool→boolean, float→float, int→integer, str→text, nested
+  dict→recursive properties; `timestamp` skipped; anything else (null, list)
+  is dropped with an "Unmapped fields" warning. Integer-vs-float identity
+  comes from `json.Decoder.UseNumber` and the literal spelling
+  (`isIntegerLiteral`), matching `json.loads`' int/float split.
+- ES ≤ 7 legacy type: `PUT <index>?include_type_name=true`, the action
+  header carries `_type: journal_msg`, and the mapping wraps the properties
+  under `journal_msg` (`TestCreateIndexUsesMappingAndTypeQuirk`,
+  `TestMessageHeaderWithType`, `TestCreateMappingWithType`,
+  `TestIndexURLForElasticsearch`).
+- Bulk write: one `POST <latest-index>/_bulk` per flush (the URL is
+  cosmetic — each action header carries its own `_index`), body the NDJSON
+  of `{"index": {"_index": "<index>"}}` action lines + raw payload lines,
+  with an explicit `content-length` and `content-type:
+  application/x-ndjson` (`TestBulkBodyAndHeaders`). The response status is
+  logged but NOT enforced, and per-item bulk errors are never inspected
+  (quirk-lock: `TestBulkStatusCodeIgnored`).
+- Retention: `MaintenanceOperations` runs at most hourly (and on the first
+  call) — `GET /_aliases`, keep the `<prefix>-*` keys sorted, `DELETE` the
+  oldest while more than `index_days_max` remain
+  (`TestMaintenanceDeletesOldestIndices`; non-prefixed indices are never
+  deleted, and a second call inside the hour issues no request).
+- Connection-error logging is deduped by error class (Python compares
+  `ex.__class__`): `TestLoadErrorDedupLogging`.
+
+HTTP-client deviations (charter §2, Task 23):
+
+- Per-request timeout: Python's `requests` session timeout is a per-request
+  INACTIVITY timeout; Go applies a per-request `context` deadline (the bulk
+  request gets 2× the configured timeout, exactly as Python passes
+  `timeout=request_timeout*2`). A stalled peer fails the batch and the
+  shared loop retries it rather than hanging the sender goroutine.
+- `stats.unexpected_exception` from the connect/create paths is not
+  reproduced (no reference sender owns a statsd client); the errors are
+  logged and routed through the loop's disconnect/backoff path.
+
+Fixture parity: `systest-go/fixtures/elasticsearch.json` (Task 11) is
+consumed by `TestFixtureStructuralParity`: for each captured index the 40
+payloads are sent through the production HTTP client against an `httptest`
+capture server (version 9.0.0), and the captured `PUT` mapping deep-equals
+the fixture mapping while every `_bulk` action header and payload line is
+compared byte-for-byte.
+
+Tests: ported from `test/test_elasticsearch_opensearch_sender.py` (config
+defaults/custom, request URL, missing URL, `max_send_interval` + type name,
+header/mapping with/without the legacy type, ES index URL) and the ES/OS
+cases in `test/test_journalpump.py` (send with/without `timestamp`), plus
+the quirk-locks and the fixture parity above. The Task 11 capture is the
+committed Python ground truth; no systest-go e2e driver was added — the
+plan's Task 23 test list scopes this task to the package-level httptest
+suite.
