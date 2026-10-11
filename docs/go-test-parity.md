@@ -2650,6 +2650,15 @@ establishment and a multi-hop redirect chain;
 preconnection is bounded by `connectTimeout`, not `openTimeout`; and
 `TestNoProxyPaddedWildcardDoesNotBypass` covers the padded `" * "` value.
 
+A closing review round added `TestStopBetweenDialAndPublishRejectsConnection`:
+a dial is completed strictly AFTER `stop()` (which observed no published
+connection and thus installed no watchdog), and the test asserts the
+connection is neither published nor served and is closed — covering the
+stop/dial publication race. `TestExplicitSocksPreconnectUsesOuterBudget` was
+rewritten to drive `runner.dial` through a forwarding SOCKS5 proxy (stall
+past `openTimeout`, complete within `connectTimeout`) so it fails if
+`openTimeout` were applied to explicit-SOCKS establishment.
+
 Fixture parity: unlike Task 23, a systest-go e2e driver WAS added
 (`systest-go/websocket_e2e_test.go:TestWebsocketSenderEndToEnd`): the real
 Go binary runs against an in-process gorilla capture server, and the
@@ -2696,9 +2705,14 @@ Dispositions (coordinator rulings 2026-10-12):
    one-shot deadline, but gorilla re-arms that deadline at the start of a
    later frame write, so a goroutine now irreversibly `abort()`s the
    connection after the close deadline even while `serve` is stuck inside
-   `writeFrames`. Verified by `TestAbortPreventsWriteRearm`,
-   `TestCloseUnblocksBlockedWrite` and `TestStopWatchdogAbortsBlockedWrite` —
-   in-library, so no cross-reviewer→user library decision is needed.
+   `writeFrames`. A connection published before stop is therefore always
+   covered; a dial completing AFTER stop is instead rejected and closed
+   (publication is synchronized with stopping under the runner mutex), so it
+   can never be served without a watchdog. Verified by
+   `TestAbortPreventsWriteRearm`, `TestCloseUnblocksBlockedWrite`,
+   `TestStopWatchdogAbortsBlockedWrite` and
+   `TestStopBetweenDialAndPublishRejectsConnection` — in-library, so no
+   cross-reviewer→user library decision is needed.
 4. **HTTPS proxy + urllib env rules + per-redirect proxy: parity.** The
    environment proxy is selected per target URI (and re-selected per redirect
    destination, since scheme and `no_proxy` can change). An `https://` proxy
@@ -2725,8 +2739,8 @@ Dispositions (coordinator rulings 2026-10-12):
    outer 30 s `connectTimeout`. Round 3 removes gorilla's `HandshakeTimeout`
    (which restarted the deadline per attempt) so one shared context deadline
    governs; tests `TestDialOrdinarySharedOpeningDeadline`,
-   `TestExplicitSocksPreconnectUsesOuterBudget` and the rewritten
-   `TestDialStalledHandshake`.
+   `TestExplicitSocksPreconnectUsesOuterBudget` (drives `runner.dial` through
+   a forwarding SOCKS5 proxy) and the rewritten `TestDialStalledHandshake`.
 5. **`ssl: true` with a `ws://` URI: reject (security).** gorilla ignores
    `TLSClientConfig` for `ws://`, so the config would silently send
    PLAINTEXT; Python rejects the combination. The Go parser now rejects it
