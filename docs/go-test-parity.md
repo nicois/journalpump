@@ -1815,16 +1815,19 @@ Send path (thread A7):
     `TestConnectProducerCancellationTerminatesMetadata` cancels a blocked
     metadata handshake against a silent broker WITHOUT releasing it by hand.
   - A send is bounded by the client-side delivery deadline; on deadline or
-    cancellation the in-flight produce and its retries are terminated
-    (connections closed) BEFORE the worker is joined, then the producer is
-    closed. Tested against a REAL sarama SyncProducer pointed at a broker
+    cancellation the connections are closed, which fails the in-flight
+    produce promptly, BEFORE the worker is joined; sarama's subsequent
+    retry loop is uninterruptible, so the call returns within the sarama
+    floor (see "Sarama limitation" below), then the producer is closed.
+    Tested against a REAL sarama SyncProducer pointed at a broker
     that answers metadata but stalls Produce
     (`TestSendDeliveryDeadlineAbortsRealStalledProduce`,
     `TestSendCancellationAbortsRealStalledProduce`); a fake whose Close
     releases the send would not exercise the abortive path.
   - `Close` aborts the producer's outstanding network operations and JOINS
-    the producer and client goroutines before returning; there is no timer
-    (`TestCloseAbortsAndJoinsWithoutTimer`).
+    the worker it owns before returning; there is no timer
+    (`TestCloseAbortsAndJoinsWithoutTimer`). The join is bounded by the
+    same sarama floor, not by a deadline.
   `TestEnsureProducerRespectsCancellation` and
   `TestMaybeCreateTopicRespectsCancellation` cover the late-client cleanup;
   `TestSendMessagesCancelledContext` covers the pre-dial short-circuit.
@@ -1851,6 +1854,36 @@ Send path (thread A7):
   there is no write-behind buffer whose flush boundary would lag the
   cursor — the file sender alone is the durable (disk-buffered) sink
   (`TestSourceNotDurableReporter`).
+
+Sarama limitation — shutdown and cancellation latency floor (this is a
+PROPERTY OF THE LIBRARY, not a defect to engineer around):
+
+- IBM/sarama v1.45.2 is not context-aware. No producer/client API takes a
+  `context.Context` (only `ConsumerGroup.Consume` does); broker dials use
+  the context-less `dialer.Dial` (`sarama/broker.go:203`); every
+  retry/backoff is an uninterruptible `time.Sleep`
+  (`async_producer.go:627,667`, `client.go:961,1156`);
+  `SyncProducer.SendMessages` blocks with no abort path; and
+  `AsyncProducer.Close`/`Client.Close` drain rather than abort. The only
+  lever sarama exposes is to close the underlying `net.Conn` from outside,
+  which is what the tracking dialer does (`dialer.go`; `abort()`).
+- Closing the connection fails the in-flight I/O promptly, but sarama then
+  runs its retry loop with uninterruptible sleeps. So `SendMessages` (and
+  `Close`) return within a FLOOR of roughly
+  `Producer.Retry.Max × Producer.Retry.Backoff` (`producerRetryMax` =
+  20 × 100 ms = 2 s) plus the metadata path
+  (`Metadata.Retry.Max` 10 × 100 ms = 1 s), i.e. ~3 s — NOT "at once".
+  The round-3 tests assert ≤ 5 s, consistent with that floor. "Immediate"
+  cancellation was never attainable with this library; a bounded,
+  few-second return is.
+- Bounded shutdown therefore does NOT depend on the sender being perfectly
+  abortive. The supervisor caps its join at `senderJoinHardStop` (30 s =
+  the larger of 10 s and one `request_timeout_ms`) and proceeds with
+  finalize/state-save/exit if a sender is still draining
+  (`internal/daemon/pump.go`; charter deviation, operator-visible). This is
+  what keeps process shutdown bounded regardless of the sarama floor. A
+  further finding of the form "sarama still sleeps/retries after the socket
+  is closed" is answered by this bound, not by more code.
 
 Unit tests use the maintained sarama mocks
 (`github.com/IBM/sarama/mocks`) behind a `producer`/`admin` seam
@@ -1918,7 +1951,7 @@ Review round 2 (verdict changes-required: 1 blocker + 7 majors + 2 minors),
 all fixed:
 
 - BLOCKER (1): `Producer.Retry.Max` is now bounded (`producerRetryMax`,
-  =100). sarama's async producer allocates `Retry.Max+1`
+  =20). sarama's async producer allocates `Retry.Max+1`
   `partitionRetryState` entries per partition on the first message to it, so
   the previous `2147483647` (mirroring kafka-python's effectively-unlimited
   retries) would have allocated ~2^31 entries — tens of GiB per partition —
@@ -1982,8 +2015,10 @@ all addressed:
   Close before joining. `sendBatch` now runs the synchronous
   `SendMessages` under the delivery deadline; on deadline/cancellation it
   calls `abort()` on the tracking dialer — closing every connection, which
-  makes the stalled ack and any pending retry fail at once — and only then
-  JOINS the worker and closes the producer (`runCancellable`). The clients
+  fails the in-flight I/O promptly — and only then JOINS the worker and
+  closes the producer (`runCancellable`). sarama's retry loop is
+  uninterruptible, so the return is bounded by the sarama floor (~3 s; see
+  the "Sarama limitation" subsection), not instant. The clients
   expose `abort()`, and `sendBatch` reaches it through the `aborter`
   interface. Pinned against a REAL sarama SyncProducer whose broker
   answers metadata but never Produce:
@@ -2003,19 +2038,24 @@ all addressed:
 - (3, major): `Close` no longer returns on a timer. The old
   `closeWait`/`closeTimeout` (5 s) timer and its abandoned closing
   goroutine are gone; `Close` aborts the producer's outstanding work and
-  joins the owned producer and client goroutines before returning. The
+  joins the worker it owns before returning (the join is bounded by the
+  sarama retry floor, not by a deadline). The
   live clients own their `sarama.Client` (built via `NewClient` +
   `NewSyncProducerFromClient`/`NewClusterAdminFromClient`) and close it
   after the producer/admin, so no retired client is left alive. Pinned by
   `TestCloseAbortsAndJoinsWithoutTimer`.
 - (4, major): reconnect timing now matches kafka-python. The per-address
-  state stores the instant the next dial is allowed, so a later attempt
-  waits only the REMAINING interval (elapsed time counts); the history
+  state stores the instant the next dial is allowed, measured from the
+  ATTEMPT START (kafka-python sets `last_attempt` at the top of
+  `connect()`), so a slow dial that already exceeded the interval leaves no
+  wait and a later attempt waits only the REMAINING interval (elapsed time
+  counts); the history
   resets ONLY after a complete connection succeeds
   (`markConnected`, after `NewClient` — TCP/TLS/SASL/metadata), a TCP-only
   success does not reset it, and a post-connect failure is recorded with
   `markFailed`. The double-backoff `Metadata.Retry.BackoffFunc` is removed
   and `Metadata.Retry.Backoff` is the 100 ms `retry_backoff_ms`. Pinned by
+  `TestBackoffDialerMeasuresFromAttemptStart`,
   `TestBackoffDialerWaitsOnlyRemaining`,
   `TestBackoffDialerTCPSuccessDoesNotReset`,
   `TestBackoffDialerMarkConnectedResetsAndMarkFailedGrows`,
@@ -2033,6 +2073,48 @@ all addressed:
   removed/replaced by the production-path regression tests above. The
   round-2 "reset on a successful dial" and "5 s bounded Close" statements
   were wrong and are corrected here.
+
+Review round 4 (direction change: STOP the escalation; basis is the
+read-only assessment `docs/assess-sender-cancellation.md`): the residual
+"sarama still sleeps/retries after the socket is closed" behaviour is a
+LIBRARY limitation, not a defect to engineer around. Addressed by:
+
+- Bounded supervisor join (`internal/daemon/pump.go`): after cancelling the
+  senders, shutdown waits on `senderGroup.Wait()` for at most
+  `senderJoinHardStop` (30 s = the larger of 10 s and one
+  `request_timeout_ms`), then logs which senders are still draining and
+  proceeds to finalize/state-save/exit instead of blocking. This is a
+  sanctioned §2 deviation, operator-visible: shutdown may complete with a
+  sender still draining, and its persisted cursor stays at the flushed
+  boundary — the delivery-checkpoint contract (no acknowledged batch is
+  advanced past what was flushed). Pinned by
+  `TestWaitSendersBoundedProceedsAfterHardStop` and
+  `TestWaitSendersBoundedJoinsCleanlyWhenSendersFinish`.
+- `watchCancel` is now `context.AfterFunc` (the stdlib idiom already used
+  by the rsyslog path — no goroutine/stop channel); the tracking dialer
+  owns a cancellable lifetime, so `closeAll` also cancels an in-flight
+  DIAL, not only established connections.
+- The `Net.Proxy.Enable` dialer-hook abuse is documented at the call site:
+  it is sarama's only dialer hook, and it bypasses
+  `Net.DialTimeout`/`KeepAlive`/`LocalAddr` (re-implemented in the chain)
+  and makes sarama log "using proxy" on every dial.
+- No further abort layers were added. `producerRetryMax` stays 20:
+  lowering it to 3-5 (assessment proposal) would cut the floor to ~0.5 s
+  but changes leader-election behaviour (transparent leader moves) and is
+  operator-visible, so it is left as a recorded open decision, not slipped
+  in.
+- Docs: the kafka shutdown/cancellation latency FLOOR is now written down
+  as a sarama limitation (see the "Sarama limitation" subsection); the
+  unsupported "fails at once" claim is removed, `producerRetryMax` is
+  corrected to 20, and the Close/join lifecycle claims are qualified.
+
+Open decision for the operator (not a blocker):
+
+- `producerRetryMax` = 20 keeps the ~3 s floor. Dropping it to 3-5 would
+  shrink the floor to ~0.5 s at the cost of surfacing leader moves to the
+  loop's outer retry (a `dropProducer` teardown + jittered backoff on each
+  leader election) instead of sarama handling them transparently. Left
+  unchanged pending that trade-off being chosen.
 
 Recorded divergences / open items for adjudication:
 
