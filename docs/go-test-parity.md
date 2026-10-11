@@ -2868,30 +2868,102 @@ SDK config (botocore parity, items 6-11, 13):
   `TestProxySelectorRouting` (real proxy server; proxied loopback,
   conflicting-case pair, `no_proxy`).
 - **CA bundle (item 7).** `AWS_CA_BUNDLE` then `REQUESTS_CA_BUNDLE`; a custom
-  bundle replaces the roots. `TestTransportVerifiesCustomCA` completes a
-  verified TLS handshake with `REQUESTS_CA_BUNDLE` and fails without it
-  (non-vacuous). The DEFAULT trust set (system roots vs botocore's certifi)
-  is the same §2 deviation class as ES/OS.
+  bundle replaces the roots. `TestClientCustomCATrustSet` (renamed in round 2;
+  see below) completes a verified TLS handshake through the real client and
+  fails without the bundle (non-vacuous). The DEFAULT trust set (system roots
+  vs botocore's certifi) is the same §2 deviation class as ES/OS.
 - **Region/profile (item 8).** `AWS_DEFAULT_REGION` (not `AWS_REGION`);
   `AWS_DEFAULT_PROFILE` over `AWS_PROFILE`. `TestResolveConfigRegionProfile
   Precedence`.
 - **Partial credentials (item 9).** Either half of an explicit pair alone is
   rejected (botocore `PartialCredentialsError`, probe-confirmed);
   present-empty counts as supplied. `TestResolveConfigPartialCredentials`.
-- **Retry (item 10).** Attempts default to botocore's 5 (or
-  `AWS_MAX_ATTEMPTS`); `AWS_RETRY_MODE=legacy` maps to the SDK's standard
-  mode. The retry STRATEGY is the SDK's, not botocore's legacy policy —
-  a documented deviation (charter §2).
-  `TestResolveConfigRetry`.
+- **Retry (item 10).** Round 2 supersedes the initial `5`/`legacy→standard`
+  mapping; see the round-2 section.
 - **Bounded construction + real cancellation (items 11, 13).** `LoadDefault
   Config` runs under a 5 s timeout; `TestSDKClientCancellation` drives the
   REAL client with a cancelled context. `aws.CredentialsCache` still performs
-  its own background retrieval and can suppress a caller deadline — recorded
-  in §2, not claimed as complete propagation.
+  its own background retrieval and can suppress a caller deadline, and the
+  container-credential provider's hostname validation does not observe `ctx`
+  — recorded in §2, not claimed as complete propagation.
 - **Real-SDK tests (item 12).** `TestSDKClientWireShape` (request target/body,
   first-put token omission then the token) and `TestSDKClientDescribe
   Pagination` (two describe pages) drive the real SDK against an httptest
-  endpoint override.
+  endpoint override. Round 2 strengthens their assertions; see below.
 
 Residual documented difference: an `AWS_REGION` value is still honored by the
 SDK when `AWS_DEFAULT_REGION` is unset, which botocore would ignore.
+
+### Task 25 review round 2 (changes-required: 7 majors + 2 minors)
+
+All items fixed in `444c78f`. The guiding change was to stop hand-rolling a
+plain `*http.Client` and use `aws-sdk-go-v2`'s native extension points, so the
+SDK keeps ownership of CA injection, transport timeouts, and retry resolution.
+
+- **Item 1 — CA injection through the SDK (`client.go`).** A plain
+  `*http.Client` made `LoadDefaultConfig` reject a configured CA bundle
+  ("unable to add custom RootCAs HTTPClient, has no WithTransportOptions").
+  The client is now an `awshttp.BuildableClient`, the bundle goes through
+  `config.WithCustomCABundle`, and the SDK's own `resolveCustomCABundle`
+  appends it. `TestClientCustomCATrustSet` drives the FULL construction path
+  for both `AWS_CA_BUNDLE` and `REQUESTS_CA_BUNDLE` and asserts a verified TLS
+  handshake (and a failure without the bundle).
+- **Item 2 — bounded transport (`client.go`).** The replacement transport had
+  no handshake/read timeout. The `BuildableClient` now carries botocore's 60 s
+  connect timeout and 60 s read-inactivity timeout.
+  `TestHTTPClientReadTimeoutBoundsStalledResponse` accepts a connection that
+  never responds and asserts the request returns a bounded error.
+- **Item 3 — `AWS_RETRY_MODE=legacy`: INFEASIBLE, deviation.**
+  `config.LoadDefaultConfig` ALWAYS runs its environment loader, and
+  `config.NewEnvConfig` eagerly calls `aws.ParseRetryMode` on
+  `AWS_RETRY_MODE`; `legacy` (botocore's default mode) is not an SDK
+  `RetryMode`, so loading fails before any `config.WithRetryMode` / retryer
+  option can apply. Probe against the real SDK:
+  `load err: invalid AWS_RETRY_MODE value, unknown RetryMode, legacy`. The
+  shared-config `retry_mode` key rejects `legacy` the same way. Honoring it
+  would require mutating process-global env around the load (unsafe, and
+  against the review guidance) or abandoning `LoadDefaultConfig` — so the
+  pragmatic boundary is to accept the SDK's modes
+  (`standard`/`adaptive`/unset) and let an explicit `legacy` fail
+  construction. `TestSDKRetryResolution` pins the rejection. This is an
+  operator-visible deviation flagged for the coordinator→user decision.
+- **Item 4 — attempts resolution (`client.go`).** The forced 5-attempt
+  default overrode a profile `max_attempts` and inflated explicitly selected
+  standard/adaptive modes (botocore default 3). The forced default is removed;
+  the SDK resolves attempts from env → profile → effective mode.
+  `TestSDKRetryResolution` reads the real client's retryer (`MaxAttempts`) and
+  asserts 3 by default, 9 under `AWS_MAX_ATTEMPTS`, 3 under `adaptive`.
+- **Item 5 — credential precedence (`client.go`).** Passing the env-selected
+  profile as `WithSharedConfigProfile` made the SDK skip environment
+  credentials; botocore keeps env credentials ahead of the profile. The env
+  pair (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` + `AWS_SESSION_TOKEN`,
+  legacy `AWS_ACCESS_KEY`/`AWS_SECRET_KEY` fallback; partial pair rejected) is
+  now resolved and passed as an explicit static provider when the config
+  supplies no pair. `TestResolveConfigEnvCredentials` and
+  `TestSDKCredentialPrecedence` (env key wins over a populated profile;
+  profile used when env is absent) pin it.
+- **Item 6 — construction bound (`client.go`).** The 5 s ctx bounds the
+  profile/IMDS config load, but the container-credential provider's hostname
+  validation calls a resolver that does not observe `ctx` — an SDK-internal
+  residual, not fixable from the config/extension model.
+  `TestBuildSDKClientBoundedConstruction` pins that a cancelled-context
+  construction returns promptly; the residual is documented in charter §2.
+- **Item 7 — wire assertions (`client_test.go`).** `TestSDKClientWireShape`
+  now parses the full `PutLogEvents` documents (group/stream names, event
+  timestamps and message bytes, token omission then `tok1`) and
+  `TestSDKClientDescribePagination` asserts the second page's request carries
+  `nextToken=page2` (and the group name).
+- **Item 8 — scheme-relative proxy (`client.go`, minor).** `https_proxy=
+  //proxy.example:8080` became `http:////proxy.example:8080`; a leading `//`
+  is now completed as `http://proxy.example:8080` (handler in
+  `botocoreProxyFunc`, pinned in `TestProxySelectorRouting`).
+- **Item 9 — gofumpt (minor).** `cloudwatch_test.go:681` had a formatting
+  failure (`TestLoopChunksLargeBatch`'s composite literal); gofumpt is
+  confirmed in the lint gate (`formatters.enable: [gofumpt]` in
+  `.golangci.yml`) and `make lint-go` is clean.
+
+Execution after `444c78f` (UNCACHED): `go test -race -count=1 ./...` PASS;
+`make lint-go` 0 issues; `make build-go` green; `go test -race -count=1 -tags
+systest ./systest-go/...` PASS (144.7 s); `JOURNALPUMP_BIN=go python -m pytest
+-q systest/` 38 passed; `python -m pytest -q test/` 160 passed. Ledger row 25
+stays `review` pending the confirmation verdict.

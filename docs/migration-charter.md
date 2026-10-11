@@ -533,21 +533,35 @@ NEWS entry — plan Task 28):
   `REQUESTS_CA_BUNDLE`, a botocore-compatible transport proxy selector
   (urllib `getproxies_environment` + `proxy_bypass_environment`: lowercase
   wins, present-empty lowercase removes, no `ALL_PROXY` fallback, loopback NOT
-  special-cased), and construction bounded by a 5 s config-load timeout.
-  Three deviations are recorded rather than reproduced: (a) the DEFAULT trust
-  set uses Go's system roots where botocore uses its certifi bundle — same
-  class as the ES/OS default-trust deviation (coincides in the reference RPM
-  deployment, differs for deb/pip or extra trust inputs); (b) the RETRY
-  strategy is the SDK's standard mode with botocore's default attempt count
-  (5, or `AWS_MAX_ATTEMPTS`), not botocore's legacy policy — `AWS_RETRY_MODE=
-  legacy` (which the SDK rejects) maps to standard mode; (c) an `AWS_REGION`
-  value is still honored by the SDK when `AWS_DEFAULT_REGION` is unset
-  (botocore would ignore it). Cancellation: every SDK request call takes
-  `ctx` and propagates it, but `aws.CredentialsCache` performs its own
-  background credential retrieval and can SUPPRESS a caller deadline — the
-  caller returns promptly, yet the retrieval is not cancelled; construction
-  and per-request cancellation are bounded, complete propagation through the
-  credential provider is not claimed.
+  special-cased, scheme-relative `//host:port` completed with `http`), and
+  construction bounded by a 5 s config-load timeout. Credentials keep
+  botocore's precedence: an explicit config pair wins, then the environment
+  pair (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` + `AWS_SESSION_TOKEN`,
+  legacy `AWS_ACCESS_KEY`/`AWS_SECRET_KEY` fallback; a partial pair is
+  rejected), then the selected profile. The HTTP client is built through the
+  SDK's `awshttp.BuildableClient` so the SDK itself injects the custom CA
+  (`config.WithCustomCABundle`) and owns the transport; botocore's 60 s
+  connect and read-inactivity timeouts are applied through it. Retry is left
+  to the SDK's own env/profile resolution: standard/adaptive default to 3
+  attempts and `AWS_MAX_ATTEMPTS`/profile `max_attempts` win. Recorded
+  deviations rather than reproductions: (a) the DEFAULT trust set uses Go's
+  system roots where botocore uses its certifi bundle — same class as the
+  ES/OS default-trust deviation (coincides in the reference RPM deployment,
+  differs for deb/pip or extra trust inputs); (b) the RETRY strategy is the
+  SDK's standard mode, not botocore's legacy policy — and `AWS_RETRY_MODE=
+  legacy` is INFEASIBLE to honor: the SDK's environment loader eagerly rejects
+  the value before any `WithRetryMode` option can apply, so an explicit
+  `legacy` fails construction (botocore's legacy is its default), while unset
+  / `standard` / `adaptive` work; (c) an `AWS_REGION` value is still honored
+  by the SDK when `AWS_DEFAULT_REGION` is unset (botocore would ignore it).
+  Cancellation: every SDK request call takes `ctx` and propagates it, but
+  `aws.CredentialsCache` performs its own background credential retrieval and
+  can SUPPRESS a caller deadline — the caller returns promptly, yet the
+  retrieval is not cancelled; the container-credential provider's hostname
+  validation also resolves without observing `ctx`. Construction and
+  per-request cancellation are bounded for the profile/IMDS paths and a
+  construction-path regression test pins the bound; complete propagation
+  through the credential provider is not claimed.
 
 ## 3. Resolved decisions (spec §9, user-confirmed 2026-10-09)
 
