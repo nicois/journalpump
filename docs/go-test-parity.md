@@ -2816,3 +2816,82 @@ Task 21, the sent-count/mark-sent transition is owned by the shared loop
 a sender-private counter. No Task 11 fixture or systest-go e2e driver was
 added for this sender (the Python ground truth is botocore Stubber
 responses, reproduced directly in the fake-client unit tests).
+
+### Task 25 review round (changes-required: 12 majors + 2 minors)
+
+All items fixed in `97243e4`.
+
+Sender path:
+- **Backoff before re-init (item 1).** Python's failed-put path
+  (`aws_cloudwatch.py:125-129`) is mark_disconnected → log → stats →
+  `self._backoff()` → `_init_log_group()`. The Go sender now waits the
+  shared backoff BEFORE re-initializing and wraps the returned error in
+  `sender.BackoffError`, which the loop's `drain` detects to skip its own
+  `backoffSleep` — so the wait happens exactly once and before the re-init.
+  Non-vacuous: with the skip removed the loop logs a second "sleeping for"
+  line (`TestLoopSingleBackoffOnFailedPut` asserts exactly one). Ordering is
+  pinned by `TestFailedPutBacksOffBeforeReinit`.
+- **Put failure preserved (item 2).** A re-init failure no longer replaces
+  the put error as the returned cause (it could flip classification to
+  `InitializationError`); it is logged separately. `TestFailedPutError
+  PreservedWhenReinitAlsoFails` scripts a ThrottlingException put plus an
+  AccessDenied-exhausting re-init and asserts the returned cause is the
+  Throttling `*apiError` wrapped in `BackoffError`, never an
+  `InitializationError`.
+- **Local connected flag on success (item 3).** A successful put now sets
+  the sender-local `connected` flag (Python `mark_sent` → `mark_connected`),
+  so a batch whose init `describe` did not find the stream does not re-init
+  next time. `TestSuccessfulPutSyncsConnected` scripts a not-found describe
+  then two successful puts and asserts the second send performs no
+  create/describe (the fake Fatal's on an unscripted call).
+- **Timestamp truthiness (item 4).** `timestamp` now implements Python's
+  truthiness: None/false/0/0.0/""/[]/{} fall back to the wall clock, `true`
+  is the integer 1, a non-empty string/list/dict raises (Python's
+  `TypeError`). Table-driven `TestTimestampTruthiness`.
+- **`%q` not `%r` (item 5).** The send-error diagnostic used a nonexistent
+  Go verb and rendered `%!r(...)`; now `%q`.
+  `TestErrorLogUsesPercentQ` asserts the quoted code/message and the absence
+  of `%!`.
+
+Batch guard (correct-the-Python fix, charter §2): the sender chunks a batch
+under the API's 10,000-event and 1 MiB limits, chaining the sequence token.
+`TestChunkEventsBoundaries` (10,000 vs 10,001; oversized first event),
+`TestSendMessagesChunksLargeBatch` (token chained across chunks) and the
+loop-level `TestLoopChunksLargeBatch` (an oversized batch sliced by bytes
+then split by the sender).
+
+SDK config (botocore parity, items 6-11, 13):
+- **Proxy selector (item 6).** A botocore-compatible `http.Transport.Proxy`
+  reproduces urllib's `getproxies_environment` and `proxy_bypass_environment`
+  (lowercase wins, present-empty lowercase removes, no `ALL_PROXY` fallback,
+  loopback NOT special-cased). `TestBotocoreProxies`,
+  `TestProxySelectorRouting` (real proxy server; proxied loopback,
+  conflicting-case pair, `no_proxy`).
+- **CA bundle (item 7).** `AWS_CA_BUNDLE` then `REQUESTS_CA_BUNDLE`; a custom
+  bundle replaces the roots. `TestTransportVerifiesCustomCA` completes a
+  verified TLS handshake with `REQUESTS_CA_BUNDLE` and fails without it
+  (non-vacuous). The DEFAULT trust set (system roots vs botocore's certifi)
+  is the same §2 deviation class as ES/OS.
+- **Region/profile (item 8).** `AWS_DEFAULT_REGION` (not `AWS_REGION`);
+  `AWS_DEFAULT_PROFILE` over `AWS_PROFILE`. `TestResolveConfigRegionProfile
+  Precedence`.
+- **Partial credentials (item 9).** Either half of an explicit pair alone is
+  rejected (botocore `PartialCredentialsError`, probe-confirmed);
+  present-empty counts as supplied. `TestResolveConfigPartialCredentials`.
+- **Retry (item 10).** Attempts default to botocore's 5 (or
+  `AWS_MAX_ATTEMPTS`); `AWS_RETRY_MODE=legacy` maps to the SDK's standard
+  mode. The retry STRATEGY is the SDK's, not botocore's legacy policy —
+  a documented deviation (charter §2).
+  `TestResolveConfigRetry`.
+- **Bounded construction + real cancellation (items 11, 13).** `LoadDefault
+  Config` runs under a 5 s timeout; `TestSDKClientCancellation` drives the
+  REAL client with a cancelled context. `aws.CredentialsCache` still performs
+  its own background retrieval and can suppress a caller deadline — recorded
+  in §2, not claimed as complete propagation.
+- **Real-SDK tests (item 12).** `TestSDKClientWireShape` (request target/body,
+  first-put token omission then the token) and `TestSDKClientDescribe
+  Pagination` (two describe pages) drive the real SDK against an httptest
+  endpoint override.
+
+Residual documented difference: an `AWS_REGION` value is still honored by the
+SDK when `AWS_DEFAULT_REGION` is unset, which botocore would ignore.
