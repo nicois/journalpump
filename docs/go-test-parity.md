@@ -2373,21 +2373,42 @@ Wire and config:
 - Connection-error logging is deduped by error class (Python compares
   `ex.__class__`): `TestLoadErrorDedupLogging`.
 
-HTTP client (parity, 2026-10-11 review round — no §2 deviation remains):
+HTTP client (parity, 2026-10-11 review rounds — no §2 deviation remains):
 
-- Timeout: requests' per-request INACTIVITY timeout, implemented with
-  `httpx.IdleTimeoutDialer` (the deadline resets on every read/write), NOT a
-  total context deadline — a slow-but-progressing response is not aborted.
-  The bulk request uses 2× the configured timeout (Python's
-  `timeout=request_timeout*2`). A configured `0` maps to the 60 s default
-  (requests substitutes the session default for a falsy timeout) and a
-  negative value is rejected at load (`TestTimeoutZeroFallsBackAndNegativeRejected`,
-  both sender types).
-- CA resolution mirrors `session.verify`: a bundle FILE or a DIRECTORY of
-  PEM files, an empty `ca` string DISABLES verification (requests treats a
-  falsy verify as no verification), `false` disables, and
-  REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE are honored when `ca` is absent/true
-  (`TestHTTPClientCAResolution`; HTTPS against a `httptest.NewTLSServer`).
+- Timeout: requests' per-request INACTIVITY timeout applied at each REQUEST
+  boundary (`httpx.InactivityClient`; the deadline resets on every
+  read/write), NOT a total context deadline and NOT fixed at dial time — a
+  slow-but-progressing response is not aborted, and a reused keep-alive
+  connection carries the CURRENT request's timeout rather than the one that
+  dialed it. The bulk request uses 2× the configured timeout (Python's
+  `timeout=request_timeout*2`); an ordinary request reusing a connection a
+  bulk just used does NOT inherit the bulk's 2× (`TestInactivityTimeoutPerRequestOnReusedConnection`,
+  ordinary→bulk→ordinary with gaps that distinguish 0.15 s from 0.3 s, on a
+  single counted keep-alive connection). A configured non-positive
+  `*_timeout` (zero AND negative) is REJECTED at load, matching requests
+  (`get_requests_session` installs a `TimeoutAdapter` whose fallback IS the
+  configured value, which requests rejects when non-positive); this differs
+  from logplex's real 60 s session default (`TestZeroAndNegativeTimeoutRejected`,
+  both sender types, config loader AND constructors).
+- CA resolution reproduces requests' `merge_environment_settings` +
+  `merge_setting` precedence: REQUESTS_CA_BUNDLE (then CURL_CA_BUNDLE) WINS
+  over `session.verify` whenever non-empty — even when `ca` is `false`,
+  empty, or an explicit path — because the ES sender passes NO per-request
+  verify. Otherwise `ca` applies: absent/true → system roots, empty/`false`
+  → verification DISABLED, a path → CA FILE or DIRECTORY. A DIRECTORY is an
+  OpenSSL capath, so only HASHED entries (`<hash>.n`) contribute trust, in
+  line with OpenSSL (an un-hashed `*.pem` is IGNORED, not silently trusted)
+  (`TestHTTPClientCAResolution`: env-overrides-false/empty/explicit,
+  hashed directory trusted, un-hashed sibling cert NOT trusted, missing path
+  and certificate-less directory rejected; HTTPS via generated self-signed
+  certs).
+- Default trust store: NOT a divergence for the supported deployment. The
+  RPM `python3-requests` pulls RPM `python3-certifi`, whose `certifi.where()`
+  is `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`; Go's
+  `x509.SystemCertPool` reads the same OS bundle (via
+  `/etc/pki/tls/certs/ca-bundle.crt`, a symlink to it), so Python and Go
+  trust the SAME CAs. The bundled Mozilla certifi set would differ only for
+  a non-RPM (pip) install, which is not the supported deployment.
 - `stats.unexpected_exception` is reproduced for the connect
   (`es_pump_init_es_client`), create (`es_pump_create_index_and_mappings`)
   and delete (`es_pump_check_indices`) paths, via the pump statsd client
@@ -2416,12 +2437,6 @@ HTTP client (parity, 2026-10-11 review round — no §2 deviation remains):
   daemon's retire path closes it (`TestCloseReleasesIdleConnections`,
   `TestRetireReaderClosesCloserTransport`).
 
-REMAINING operator-visible divergence (flagged for coordinator→user, NOT
-decided here): with `ca` absent/true and no `*_CA_BUNDLE` env, requests
-verifies against the bundled **certifi** CA set while Go verifies against
-the **OS** trust store (a private CA in the OS store is trusted by Go, not
-by Python).
-
 Shared HTTP helper (coordinator decision 2026-10-11): closing Task 23
 extracted the raw-HTTP client plumbing into `internal/httpx` and moved
 both logplex and this sender onto it, so GCL (Task 26) builds on one
@@ -2434,11 +2449,13 @@ elasticsearch-py/urllib3. This corrects the initial ES port, which used
 Go's `http.ProxyFromEnvironment`: matching requests is Python-faithful, so
 it is a **bug fix toward Python, not a deviation**
 (`TestHTTPClientUsesRequestsProxySemantics`; logplex's pinned proxy tests
-pass unchanged). Both senders use the shared `httpx.IdleTimeoutDialer`
-inactivity dial hook (logplex's own conn wrapper moved into `httpx`), so its
-timing semantics are unchanged, and the helper deliberately provides no
-retry hook — retries stay owned by `sender.Loop` (the ES create path borrows
-the loop's backoff through `sender.Backoffer`).
+pass unchanged). The helper owns both timing variants: logplex uses the
+fixed-dial `httpx.IdleTimeoutDialer` (its connection carries a constant
+session timeout), while ES/OpenSearch use `httpx.InactivityClient`, which
+applies the timeout at each REQUEST boundary so a reused connection uses the
+current request's timeout. The helper deliberately provides no retry hook —
+retries stay owned by `sender.Loop` (the ES create path borrows the loop's
+backoff through `sender.Backoffer`).
 
 Fixture parity: `systest-go/fixtures/elasticsearch.json` (Task 11) is
 consumed by `TestFixtureStructuralParity`: for each captured index the 40
