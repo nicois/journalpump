@@ -1743,9 +1743,13 @@ Config mapping (config validation outcomes identical to Python;
   the BOUNDED `producerRetryMax` (20), not kafka-python's effectively
   unlimited default; `RetryBackoffFn` is a fixed 100 ms `retry_backoff_ms`
   so a retry sleep cannot delay the cancellation check beyond a few
-  hundred ms. franz-go retries internally, so the reconnect-backoff
-  plumbing is gone. Pinned by `TestProducerSemanticsConstants` and the
-  `kgo.NewClient` construction test.
+  hundred ms. franz-go retries INTERNAL produce requests on its own; the
+  kafka-python per-BROKER reconnect backoff is still reproduced, but on
+  the kgo dialer (`kgo.Dialer` → `reconnectBackoff`) rather than a sarama
+  `BackoffFunc`: 1s→10s exponential, ±20% jitter, measured from the
+  attempt START and reset after a complete connection (review round 6;
+  see below). Pinned by `TestProducerSemanticsConstants`, the
+  `kgo.NewClient` construction test, and the `reconnect_test.go` cases.
 - Producer config adds `linger_ms = 500` (`ProducerLinger`) and the
   compression choice. The deployment pins snappy (python-snappy present,
   zstandard absent — Task 12 fixture notes): `kgo.SnappyCompression`,
@@ -2185,10 +2189,18 @@ What we still add on top of franz-go:
   `Partitioner`/`TopicPartitioner` interfaces (`partitioner.go`).
 - The bounded supervisor join (`waitSendersBounded`) is KEPT, now as
   defence in depth rather than a sarama-floor workaround (see above).
-- The custom SOCKS5 dialer (`socks5.go`, still `socks5h` semantics) and
-  the reconnect-backoff semantics (`RetryBackoffFn` fixed at
-  `reconnect_backoff_ms`; franz-go re-dials internally, so the sarama-era
-  per-address `backoffDialer` jitter tracker is not carried over).
+- The custom SOCKS5 dialer (`socks5.go`, still `socks5h` semantics),
+  the per-broker reconnect backoff (`reconnect.go`, re-expressed on the
+  kgo dialer — the sarama-era `backoffDialer` jitter tracker IS carried
+  over after all; the round-5 note that it was dropped was wrong), and
+  `RetryBackoffFn` fixed at `reconnect_backoff_ms` for franz-go's
+  internal produce retries.
+- TLS folded into the dialer (`dial.go`): franz-go refuses a client
+  configured with both `kgo.Dialer` and `kgo.DialTLSConfig`, so when
+  `socks5_proxy` is set together with SSL/SASL_SSL the TLS handshake runs
+  inside the dialer with `ServerName` = the BROKER host (never the proxy
+  or a locally resolved IP), preserving certificate verification and SNI
+  (review round 6, item 1, SECURITY).
 
 Operator-visible deviation recorded in charter §2: dropping pre-0.10
 broker version inference. The sender supports brokers 0.10.0+ (version
@@ -2208,3 +2220,64 @@ Verification (all UNCACHED + a real broker):
   sarama, OFF by default in franz-go) and `TestKafkaPythonConsumerInterop`
   (snappy round-trip read back by the deployed kafka-python client).
 - Code commit `0b73164` (docs in a follow-up commit).
+
+Review round 6 (review of the round-5 rewrite; verdict changes-required, 5
+majors). All fixed. Nothing in the framework contract changed; the fixes
+stay inside `internal/sender/kafka` plus one shutdown refinement.
+
+1. Security — socks5 + TLS bypass. `kafka.go`'s `clientOpts` no longer
+   sets `kgo.DialTLSConfig` when it also installs a custom dialer (franz
+   would reject both, and the round-5 code would have silently sent SASL
+   in plaintext or failed construction). TLS is now performed INSIDE
+   `kafkaDialer.DialContext` (`dial.go`): after the proxy/direct connect,
+   the conn is wrapped with `tls.Client` and `HandshakeContext`, with
+   `ServerName` set to the BROKER host from the dial address, so
+   certificate verification and SNI target the broker the operator
+   configured — never the proxy or a locally resolved IP. `dial_test.go`
+   proves the handshake happens and that verification is against the
+   broker hostname (a DNS-only leaf verifies for `broker.test` and FAILS
+   for an IP `ServerName`), and that `kgo.NewClient` accepts the
+   socks5+TLS option set.
+2. Per-broker reconnect backoff restored. `reconnect.go` reproduces
+   kafka-python `BrokerConnection`'s scheduling per broker ADDRESS
+   (1s→10s, ±20% jitter, measured from the attempt START, reset after a
+   complete connection) on the kgo dialer; `dial.go` records the dial
+   outcome (connected/failed) and enforces the interval ctx-aware before
+   dialing. `reconnect_test.go` pins remaining-interval accounting,
+   measurement from attempt start, growth/cap/reset, per-address
+   isolation and ctx-honoring.
+3. Broker-version floor is strict-at-load. `New` rejects a
+   `kafka_api_version` below 0.10.0 (and non-string values) when the
+   configuration is loaded; the version constructor table starts at
+   `0.10.0`. `kafka_test.go` pins rejection of `0.9.0`/`0.9`/`0.8.2`/
+   `0.8.0`/`0.0.1` and acceptance of `0.10.0`; the daemon test
+   `TestSenderKafkaPre010RejectedAtLoadAndReload` pins startup REJECTION
+   (`failed_to_start`) and rejection again after a reader recreation
+   (reload).
+4. Real-client cancellation. `realclient_test.go` adds a minimal
+   `fakeBroker` that completes negotiation (ApiVersions + Metadata) so a
+   REAL franz-go client finishes initialization, then observes Produce/
+   CreateTopics and WITHHOLDS the response. `TestRealProducerCancellation
+   AbortsStalledProduce` drives the real `sender.Loop` + real `Sender`,
+   cancels the loop context mid-produce and asserts a bounded stop with
+   NO sent-cursor advancement; `TestRealAdminCancellationAbortsCreate
+   Topic` cancels `maybeCreateTopic` mid-CreateTopics and asserts
+   `context.Canceled` bounded. This supersedes round3's stalled-produce
+   fake (whose Close released the send, so the abort was not proven).
+5. Bounded join now bounds cleanup too. `pump.go`'s `waitSendersBounded`
+   returns the set of senders still draining at `senderJoinHardStop`, and
+   `shutdown` SKIPS both `Finalize` and `Close` for them (already named in
+   the bounded-join warning), so a transport whose send AND close both
+   block cannot wedge shutdown; state is saved and the process exits.
+   `TestShutdownSkipsCleanupForDrainingSender` pins it (a blocking
+   Finalize/Close that is never entered).
+
+Verification (all UNCACHED + a real broker):
+
+- `go test -race -count=1 ./...` — PASS (all packages).
+- `go vet ./...` + `golangci-lint run ./...` — 0 issues.
+- `go test -race -count=1 -tags systest ./systest-go/...` — PASS.
+- `JOURNALPUMP_BIN=go python -m pytest -q systest/` — 38 passed.
+- `python -m pytest -q test/` — 160 passed.
+- `make systest-go-kafka` (podman apache/kafka:4.0.0 KRaft, `-race
+  -count=1 -tags systest -v`) — PASS.
