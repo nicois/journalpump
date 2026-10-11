@@ -2383,8 +2383,18 @@ HTTP client (parity, 2026-10-11/12 review rounds; one sanctioned §2 deviation �
   is armed only AFTER the request is written (via an httptrace
   `WroteRequest` hook), so a progressing upload whose TOTAL outlasts the
   timeout is not aborted before reading should begin (urllib3 arms its read
-  timeout after sending). All timeout/deadline updates for the current
-  request are serialized under one mutex, so a background read that already
+  timeout after sending). Connection ESTABLISHMENT (dial plus TLS handshake)
+  is its OWN phase: the read deadline is armed as the connection is dialed,
+  so a peer that accepts TCP but never completes the TLS handshake is bounded
+  even though `WroteRequest` cannot fire before the handshake completes
+  (`TestInactivityClientStalledTLSHandshake`). The phase is reset for EVERY
+  request attempt via the per-attempt httptrace hooks (`GotConn` → upload,
+  `WroteRequest` → read), so a 307/308 redirect re-enters the upload phase
+  rather than carrying the first attempt's read deadline into the redirected
+  upload (`TestInactivityClientRedirectedUploadExceedsTimeout`, a redirected
+  400 ms paced upload under a 200 ms timeout succeeds). All timeout/deadline
+  updates for the current request are serialized under one mutex, so a
+  background read that already
   loaded the previous timeout cannot overwrite a deadline installed at a new
   request boundary. The bulk request uses 2× the configured timeout (Python's
   `timeout=request_timeout*2`); an ordinary request reusing a connection a
@@ -2421,13 +2431,17 @@ HTTP client (parity, 2026-10-11/12 review rounds; one sanctioned §2 deviation �
 - SANCTIONED §2 deviation (user decision 2026-10-12) — DEFAULT TRUST SET:
   with `ca` absent/true and no `*_CA_BUNDLE`, Go uses `x509.SystemCertPool`,
   which loads certificate DIRECTORIES and honors `SSL_CERT_FILE`/`SSL_CERT_DIR`;
-  requests instead uses certifi's single bundle. In the reference RPM
-  deployment both resolve to the same CA file (RPM `python3-certifi`'s
-  `certifi.where()` is `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
-  which Go's system pool also reads via `/etc/pki/tls/certs/ca-bundle.crt`, a
-  symlink to it), so the trust sets AGREE there; but for other deployments
-  (deb, pip) the effective sets can differ. The user approved keeping Go's
-  system-store behavior and documenting this rather than restricting it.
+  requests instead uses certifi's single bundle. The two trust sets AGREE in
+  the reference RPM deployment ONLY when no ADDITIONAL trust inputs are in
+  play — no `SSL_CERT_FILE`/`SSL_CERT_DIR` and no extra system certificate
+  directories: RPM `python3-certifi`'s `certifi.where()` is
+  `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, which Go's system pool
+  also reads via `/etc/pki/tls/certs/ca-bundle.crt`, a symlink to it. A
+  `SSL_CERT_FILE`/`SSL_CERT_DIR` override, or the extra system certificate
+  directories Go's pool loads, contributes roots the certifi bundle lacks;
+  and other deployments (deb, pip) can differ even without those. The user
+  approved keeping Go's system-store behavior and documenting this rather
+  than restricting it.
 - `stats.unexpected_exception` is reproduced for the connect
   (`es_pump_init_es_client`), create (`es_pump_create_index_and_mappings`)
   and delete (`es_pump_check_indices`) paths, via the pump statsd client
