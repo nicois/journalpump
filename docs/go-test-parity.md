@@ -2528,8 +2528,15 @@ Parity points:
 - Batching: `max_batch_size > 0` NUL-joins one batch's messages into a
   SINGLE frame; the connect header `Journalpump-Batch-Size` carries the
   configured `max_batch_size`; `0` sends each message as its own frame.
-  This sender overrides the shared batch overhead to 1 byte
-  (per the plan/spec — see the flagged discrepancy below).
+  Batch SLICING keeps the LogSender base defaults (30-byte overhead,
+  1 MiB limit) at every configuration: `websocket.py:73` sets
+  `batch_message_overhead = 1` on the `WebsocketRunner` Thread, which
+  never slices and whose attribute is never read, while the
+  `WebsocketSender` LogSender that slices (`base.py:262,266`) keeps
+  `base.py:130-131`. A runtime probe instantiating `WebsocketSender` with
+  `max_batch_size=2048` reports 30 / 1048576. So the configured
+  `max_batch_size` changes only batching and the header, never the
+  slicing limit (coordinator ruling 2026-10-12: match Python).
 - Connect headers: `User-Agent: journalpump/<version>`,
   `Journalpump-Compression` when compression is not `none`.
 - TLS: client cert (`certfile`/`keyfile`) + CA verification (`ca`).
@@ -2547,11 +2554,12 @@ in-process gorilla websocket server (asserting the exact
 `snappy(NUL-join(batch))` frame, per-message frames, and the connect
 headers). Config parsing (`TestParseConfig*`, ssl-triple, enum/number
 validation), framing (`TestFrames*`), headers (`TestHandshakeHeaders*`),
-the instance wiring (`TestNewRegistersInstance`), the not-connected send
-wait (`TestSendMessagesNotConnected`), and the ExponentialBackoff
-sequence (`TestExponentialBackoffSequence`) are unit-tested; the
-reconnect cadence (20/36/64.8 s) is pinned under `testing/synctest`
-(`TestRunnerReconnectBackoffTiming`).
+the instance wiring (`TestNewRegistersInstance`), the slicing-limit
+independence (`TestNewSlicingIndependentOfConfiguredMaxBatchSize`), the
+not-connected send wait (`TestSendMessagesNotConnected`), and the
+ExponentialBackoff sequence (`TestExponentialBackoffSequence`) are
+unit-tested; the reconnect cadence (20/36/64.8 s) is pinned under
+`testing/synctest` (`TestRunnerReconnectBackoffTiming`).
 
 Fixture parity: unlike Task 23, a systest-go e2e driver WAS added
 (`systest-go/websocket_e2e_test.go:TestWebsocketSenderEndToEnd`): the real
@@ -2563,23 +2571,22 @@ decompressed message stream byte-matches the Task 11 fixture
 fixture carries the Python version string, not the Go binary's), and the
 state sent count + cursor match.
 
-Flagged deviations (operator-visible; for coordinator → user):
-1. **Strict-at-load config validation.** Python reads every websocket key
-   lazily inside `send_messages` and treats a bad value (unknown
-   `compression`/`websocket_compression` enum, missing `websocket_uri`,
-   `ssl` without the ca/keyfile/certfile triple) as a retriable send
-   failure that it retries forever; the Go constructor validates
-   structurally at load and reports one clear error. This surfaces the
-   misconfiguration instead of retrying it silently.
-2. **Plan/spec batch-overhead claim vs Python.** The plan and spec §5 say
-   the websocket sender overrides the shared batch overhead to 1 byte
-   (`websocket.py:73`). That line sets an attribute on the
-   `WebsocketRunner` Thread, NOT on the LogSender that does the batch
-   slicing (`base.py:262` uses `self.batch_message_overhead`, which for
-   `WebsocketSender` stays the 30-byte base default; `self.max_batch_size`
-   likewise stays the base 1 MiB). Go implements the plan (MessageOverhead
-   1, framework MaxBatchSize = configured `max_batch_size`). This changes
-   batch boundaries relative to Python for messages near 1 MiB; the
-   fixture (a decompressed message stream) is unaffected. Needs a
-   coordinator/user ruling: match the plan, or match Python's 30-byte
-   slicing overhead + 1 MiB slicing limit.
+Dispositions (coordinator rulings 2026-10-12):
+1. **Batch slicing: match Python (30 B / 1 MiB).** An earlier plan/spec
+   claim that the websocket sender overrides the shared overhead to 1
+   byte (`websocket.py:73`) was wrong: that line sets an attribute on the
+   `WebsocketRunner` Thread, which never slices and whose attribute is
+   never read. Python's runtime probe (instantiate `WebsocketSender` with
+   `max_batch_size=2048`) reports slicing overhead 30 and slicing
+   `max_batch_size` 1048576 — the `WebsocketSender` LogSender keeps
+   `base.py:130-131` and slices with `self.batch_message_overhead` /
+   `self.max_batch_size` at `base.py:262,266`. Go now uses 30 / 1 MiB
+   (the framework defaults) and the plan/spec lines are corrected. The
+   configured `max_batch_size` still drives only batching and the header.
+2. **Strict-at-load config validation: keep (approved policy).** Python
+   reads every websocket key lazily inside `send_messages` and treats a
+   bad value (unknown `compression`/`websocket_compression` enum, missing
+   `websocket_uri`, `ssl` without the ca/keyfile/certfile triple) as a
+   retriable send failure it retries forever; the Go constructor validates
+   structurally at load and reports one clear error. Same class as the
+   Task 22/23 strict-at-load decisions; kept per the coordinator ruling.

@@ -674,7 +674,8 @@ client helper instead of each carrying its own client code.
 Files: `internal/sender/websocket/`. Single goroutine replacing the
 asyncio-in-thread design; app-level snappy (github.com/golang/snappy) +
 permessage-deflate options; batch NUL-join with `Journalpump-Batch-Size`
-= configured max; batch overhead 1 (quirk-lock test); headers
+= configured max; batch slicing at the LogSender base defaults (30 B
+overhead, 1 MiB limit — see the correction note below); headers
 (`User-Agent: journalpump/{version}`, `Journalpump-Compression`); TLS
 triple ca/keyfile/certfile; SOCKS5; inbound drain consumer; reconnect
 backoff 20 s×1.8→90 s reset after 60 s; 2 MiB inbound cap; close timeout
@@ -684,8 +685,22 @@ batch, snappy bytes, headers).
 Tests: in-process Go websocket server (httptest, per thread B) — non-
 batched and snappy-compressed batched delivery (parity:
 `test/test_websocket.py` 2 tests, extended to cover header values and the
-1-byte overhead); `testing/synctest` for reconnect-backoff timing; update
-parity checklist.
+slicing overhead/slicing-limit independence); `testing/synctest` for
+reconnect-backoff timing; update parity checklist.
+
+CORRECTION (2026-10-12): an earlier draft of this task said websocket
+overrides the shared batch overhead to 1 byte, citing
+`websocket.py:73,168-169`. That is wrong. `websocket.py:73` sets
+`self.batch_message_overhead = 1` on the `WebsocketRunner` Thread, an
+object that never slices and whose attribute is never read; the
+`WebsocketSender` LogSender that slices keeps the base defaults set at
+`base.py:130-131` (overhead 30, limit 1 MiB) and slices with
+`self.batch_message_overhead` / `self.max_batch_size` at `base.py:262,266`.
+Runtime probe (instantiate `WebsocketSender` with `max_batch_size=2048`)
+reports slicing overhead 30 and slicing max_batch_size 1048576. The
+configured `max_batch_size` therefore affects only batching (the NUL-join)
+and the `Journalpump-Batch-Size` header, never the slicing limit. Go
+implements 30 / 1 MiB accordingly.
 Depends on: Tasks 13, 11.
 
 ## Phase 4 — CloudWatch + Google Cloud Logging
@@ -789,7 +804,7 @@ Acceptance: every one of the ~127 Python unit tests is
 ported/Go-idiomatic/dropped-with-reason; `make unittest-go systest-go`
 green locally and in CI; quirk-lock tests enumerated (logplex localhost +
 fire-and-forget, last-sender-wins resume, missing-cursor replay, `_bulk`
-item-ignore, websocket batch header + 1-byte overhead, kafka snappy wire
+item-ignore, websocket batch header + slicing at the 30 B / 1 MiB base defaults, kafka snappy wire
 format + fixed msg key, geohash tag values, state-file key order) all
 present; the Task 10/11/12 capture suites now run against the Go binary
 as parity assertions; `go-native` entries (rotation and sigterm suites,
