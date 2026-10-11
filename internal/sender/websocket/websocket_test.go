@@ -212,7 +212,7 @@ func TestRunnerReconnectBackoffTiming(t *testing.T) {
 		}
 		r := newRunner(s)
 		var at []time.Time
-		r.dialFn = func() (*websocket.Conn, error) {
+		r.dialFn = func() (*dialedConn, error) {
 			at = append(at, time.Now())
 			return nil, errors.New("dial failed")
 		}

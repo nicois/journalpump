@@ -193,7 +193,8 @@ const (
 	// logging relies on the same value).
 	DefaultMaxBatchSize = 1024 * 1024
 	// DefaultMessageOverhead is base.py:KAFKA_COMPRESSED_MESSAGE_OVERHEAD
-	// (30 B; websocket overrides it to 1).
+	// (30 B; every sender, websocket included, keeps this default — its
+	// configured max_batch_size drives only batching and the header).
 	DefaultMessageOverhead = 30
 	// TickInterval is the base.py:run poll step (time.sleep(0.1)).
 	TickInterval = 100 * time.Millisecond
@@ -253,9 +254,8 @@ type LoopConfig struct {
 
 // Instance is a constructed sender ready to be wrapped in a Loop: the
 // transport plus the per-sender loop parameters Python's sender
-// constructors set on the base class (max_send_interval defaults
-// differ per sender; the batch limits are overridable, e.g. the
-// websocket sender's 1-byte message overhead).
+// constructors set on the base class (max_send_interval defaults differ
+// per sender; the batch limits are overridable).
 type Instance struct {
 	// Transport is the sender implementation.
 	Transport Sender
