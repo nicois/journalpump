@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -250,8 +251,14 @@ func (f *fakeSOCKS5) serve() {
 	close(f.ready)
 	// Success reply with a dummy bound address.
 	_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	// Hold the connection open until the client closes it.
-	_, _ = io.Copy(io.Discard, conn)
+	// Forward to the requested target so a real dial can complete through us.
+	up, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))), 2*time.Second)
+	if err != nil {
+		return
+	}
+	defer func() { _ = up.Close() }()
+	go func() { _, _ = io.Copy(up, conn) }()
+	_, _ = io.Copy(conn, up)
 }
 
 func TestSocks5RemoteDNS(t *testing.T) {
@@ -1094,6 +1101,102 @@ func TestStopWatchdogAbortsBlockedWrite(t *testing.T) {
 	}
 }
 
+// closeNotifyConn signals when the socket is closed.
+type closeNotifyConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeNotifyConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// TestStopBetweenDialAndPublishRejectsConnection covers stop() arriving while
+// a dial is in flight: stop observes no published connection and installs no
+// watchdog, so run must NOT publish the just-completed dial (it is closed and
+// discarded instead) — otherwise serve could pick a ready send and block
+// shutdown unbounded (round-4 item #1).
+func TestStopBetweenDialAndPublishRejectsConnection(t *testing.T) {
+	srv := newStalledReadServer(t)
+	s := newTestSender(t, map[string]any{"websocket_uri": srv.url(), "compression": "none"})
+
+	r := newRunner(s)
+	dialEntered := make(chan struct{})
+	release := make(chan struct{})
+	connClosed := make(chan struct{})
+	r.dialFn = func() (*dialedConn, error) {
+		close(dialEntered)
+		<-release // complete the dial only after stop() has run
+		raw, err := net.Dial("tcp", srv.ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		wrapped := &closeNotifyConn{Conn: raw, closed: connClosed}
+		d := &websocket.Dialer{
+			NetDialContext: func(context.Context, string, string) (net.Conn, error) {
+				return wrapped, nil
+			},
+		}
+		ws, _, err := d.DialContext(context.Background(), srv.url(), nil)
+		if err != nil {
+			_ = wrapped.Close()
+			return nil, err
+		}
+		return &dialedConn{ws: ws, raw: wrapped, pongCh: make(chan string, 16)}, nil
+	}
+	s.runnerMu.Lock()
+	s.runner = r
+	s.runnerMu.Unlock()
+	go r.run()
+
+	select {
+	case <-dialEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dial was never entered")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		r.stop()
+		close(stopDone)
+	}()
+	// Wait until stop() has recorded the stop, so the dial completes strictly
+	// after it observed no published connection.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		r.mu.Lock()
+		stopped := r.stopped
+		r.mu.Unlock()
+		if stopped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stop() never marked the runner stopped")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+
+	select {
+	case <-stopDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close blocked: a post-stop dial was served without a watchdog")
+	}
+	r.mu.Lock()
+	published := r.conn
+	r.mu.Unlock()
+	if published != nil {
+		t.Fatal("connection completed after stop was published")
+	}
+	select {
+	case <-connClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-stop connection was not closed")
+	}
+}
+
 // --- item #2: a proxy that withholds its CONNECT response cannot hang dial ---
 
 // newHijackHoldServer starts an HTTP(S) proxy that reads the CONNECT request
@@ -1266,35 +1369,37 @@ func TestDialOrdinarySharedOpeningDeadline(t *testing.T) {
 	}
 }
 
-// TestExplicitSocksPreconnectUsesOuterBudget asserts the explicit socks5_proxy
-// preconnection sits under the OUTER connectTimeout, not openTimeout: the
-// proxy stalls past openTimeout but within connectTimeout and still connects.
+// TestExplicitSocksPreconnectUsesOuterBudget drives runner.dial (the value
+// that chooses each phase's budget) through a SOCKS5 proxy that stalls past
+// openTimeout but within connectTimeout, then forwards to a real websocket
+// endpoint. It succeeds only if establishment is bounded by the OUTER budget
+// and the handshake by openTimeout, so it genuinely covers the production
+// timeout choice (round-4 item #2).
 func TestExplicitSocksPreconnectUsesOuterBudget(t *testing.T) {
 	clearProxyEnv(t)
-	withVar(t, &openTimeout, 150*time.Millisecond)
+	withVar(t, &openTimeout, 300*time.Millisecond)
 	withVar(t, &connectTimeout, 3*time.Second)
-	f := newFakeSOCKS5WithDelay(t, 500*time.Millisecond)
+	f := newFakeSOCKS5WithDelay(t, 800*time.Millisecond)
+	target := newWebsocketTestServer(t)
 
 	s := newTestSender(t, map[string]any{
-		"websocket_uri": "ws://example.invalid:9999/pump",
+		"websocket_uri": target.wsURL(),
 		"socks5_proxy":  "socks5://" + f.addr(),
 		"compression":   "none",
 	})
 	r := newRunner(s)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
 	start := time.Now()
-	conn, err := r.preconnect(ctx, s.cfg.uri)
+	dc, err := r.dial()
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatalf("preconnect through explicit SOCKS: %v", err)
+		t.Fatalf("dial through explicit SOCKS: %v", err)
 	}
-	_ = conn.Close()
-	if elapsed < 500*time.Millisecond {
-		t.Fatalf("preconnect returned in %v, before the proxy delay", elapsed)
+	_ = dc.ws.Close()
+	if elapsed < 800*time.Millisecond {
+		t.Fatalf("dial returned in %v, before the proxy delay", elapsed)
 	}
 	if elapsed > 2*time.Second {
-		t.Fatalf("preconnect took %v, want within the outer budget", elapsed)
+		t.Fatalf("dial took %v, want establishment within the outer budget", elapsed)
 	}
 }
 

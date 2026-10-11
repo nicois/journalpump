@@ -831,6 +831,7 @@ type runner struct {
 
 	mu          sync.Mutex
 	conn        *liveConn
+	stopped     bool          // set with conn read under mu; blocks late publication
 	connectedCh chan struct{} // closed when a connection is established
 	backoff     *exponentialBackoff
 
@@ -870,7 +871,13 @@ func (r *runner) run() {
 		}
 		established := time.Now()
 		lc := &liveConn{ws: dc.ws, raw: dc.raw, sendCh: make(chan sendRequest), closed: make(chan struct{}), pongCh: dc.pongCh}
-		r.setConnected(lc)
+		if !r.setConnected(lc) {
+			// A dial that completed AFTER stop must not be served: stop() saw no
+			// published connection and therefore installed no watchdog, so a
+			// write here could block shutdown forever (round-4 item #1).
+			_ = lc.ws.Close()
+			return
+		}
 		r.s.logf("websocket connected to %s", r.s.cfg.uri)
 
 		_ = r.serve(lc)
@@ -1289,11 +1296,19 @@ func writeFrames(conn *websocket.Conn, frames [][]byte) error {
 	return nil
 }
 
-func (r *runner) setConnected(lc *liveConn) {
+// setConnected publishes lc as the live connection. It returns false (and
+// publishes nothing) when the runner has already stopped, so a dial that
+// completes after stop is rejected rather than served without a watchdog
+// (round-4 item #1).
+func (r *runner) setConnected(lc *liveConn) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return false
+	}
 	r.conn = lc
 	close(r.connectedCh)
-	r.mu.Unlock()
+	return true
 }
 
 func (r *runner) setDisconnected(lc *liveConn) {
@@ -1383,8 +1398,12 @@ func (r *runner) sleepBackoff() bool {
 // handshake in the common case (item #6).
 func (r *runner) stop() {
 	r.stopOnce.Do(func() {
-		close(r.stopCh)
 		r.mu.Lock()
+		// Mark stopped and close stopCh together with reading conn, so a dial
+		// completing concurrently either was published (and gets the watchdog)
+		// or is rejected by setConnected (round-4 item #1).
+		r.stopped = true
+		close(r.stopCh)
 		lc := r.conn
 		r.mu.Unlock()
 		if lc == nil {
