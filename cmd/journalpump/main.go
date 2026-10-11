@@ -22,6 +22,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/sender/kafka"
 	"github.com/Aiven-Open/journalpump/internal/sender/logplex"
 	"github.com/Aiven-Open/journalpump/internal/sender/rsyslog"
+	"github.com/Aiven-Open/journalpump/internal/sender/websocket"
 )
 
 // exitCode mirrors the exit codes of Python's journalpump.daemon.ServiceDaemon.main:
@@ -161,6 +162,7 @@ func isRegularFile(path string) bool {
 //   - logplex (Task 21)
 //   - kafka (Task 22)
 //   - elasticsearch, opensearch (Task 23)
+//   - websocket (Task 24)
 func registerSenders() {
 	sender.Register("file", file.New)
 	sender.Register("rsyslog", rsyslog.New)
@@ -168,4 +170,5 @@ func registerSenders() {
 	sender.Register("kafka", kafka.New)
 	sender.Register("elasticsearch", elasticsearch.NewElasticsearch)
 	sender.Register("opensearch", elasticsearch.NewOpenSearch)
+	sender.Register("websocket", websocket.New)
 }

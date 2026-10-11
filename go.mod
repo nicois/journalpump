@@ -3,6 +3,8 @@ module github.com/Aiven-Open/journalpump
 go 1.27
 
 require (
+	github.com/golang/snappy v0.0.4
+	github.com/gorilla/websocket v1.5.3
 	github.com/oschwald/geoip2-golang/v2 v2.4.0
 	github.com/twmb/franz-go v1.22.1
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
