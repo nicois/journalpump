@@ -2540,13 +2540,50 @@ Parity points:
 - Connect headers: `User-Agent: journalpump/<version>`,
   `Journalpump-Compression` when compression is not `none`.
 - TLS: client cert (`certfile`/`keyfile`) + CA verification (`ca`).
-- SOCKS5 (`socks5_proxy`): `socks5` resolves the target locally,
-  `socks5h` defers the name to the proxy; HTTP_PROXY is NOT honored
-  (Python supports only the SOCKS5 option).
-- Inbound cap 2 MiB (`max_size=MAX_KAFKA_MESSAGE_SIZE*2`); close timeout
-  20 s; reconnect backoff base 20 s factor 1.8 cap 90 s jittered, reset
+  `ssl: true` with a `ws://` URI is REJECTED (Python's asyncio client
+  raises "ssl argument is incompatible with a ws:// URI"); gorilla would
+  otherwise silently ignore `TLSClientConfig` for `ws://` and send
+  PLAINTEXT.
+- Basic auth: a `websocket_uri` with userinfo (`ws://user:pass@host/`)
+  sends HTTP `Authorization: Basic base64(user:pass)`; the userinfo is
+  stripped from the dial URL (gorilla rejects userinfo in the URL).
+  Matches `websockets/client.py:111-112`.
+- Proxy: an explicit `socks5_proxy` wins; otherwise the environment is
+  consulted the way `websockets` 17.2 `proxy=True` does — for a `ws://`
+  endpoint the keys `ws`/`socks`/`https`/`http` are checked (`http_proxy`
+  selected), for `wss://` the keys `wss`/`socks`/`https`. `no_proxy`
+  bypass is honored. (Python supports only the SOCKS5 option for an
+  EXPLICIT proxy, but still selects an environment HTTP proxy by default.)
+- SOCKS5 (`socks5_proxy`): destination names are resolved at the PROXY
+  (remote DNS, SOCKS5 `ATYP=0x03`), matching python_socks'
+  `rdns=True` default (`aiohttp_socks.utils.Proxy`); the Go dialer no
+  longer resolves locally.
+- Redirects: the handshake follows supported `Location` responses up to
+  10 hops (`WEBSOCKETS_MAX_REDIRECTS`), refusing a TLS downgrade and a
+  redirect whose socket the caller pre-connected. Matches
+  `websockets/asyncio/client.py:448-559` `process_redirect`.
+- Heartbeat: an active ping every 20 s with a 20 s pong timeout
+  (`ping_interval`/`ping_timeout`); a missing pong closes and reconnects.
+  gorilla only auto-ANSWERS pings, so the lifecycle is driven explicitly.
+  The read deadline is `ping_interval + ping_timeout` and is reset by any
+  inbound frame.
+- Inbound cap 2 MiB (`max_size=MAX_KAFKA_MESSAGE_SIZE*2`), enforced on
+  the DECOMPRESSED stream: with permessage-deflate a small compressed
+  frame can expand arbitrarily, so the reader drains through a bounded
+  `io.LimitReader` and rejects oversized messages rather than trusting
+  gorilla's compressed-byte `SetReadLimit`. Close timeout 20 s awaits the
+  peer's close response (bounded) before force-closing and joining the
+  inbound reader. Opening/handshake timeout is Python's effective 10 s
+  (`open_timeout`), kept separate from the outer 30 s connection/SOCKS
+  budget. Reconnect backoff base 20 s factor 1.8 cap 90 s jittered, reset
   after a connection stable >60 s; send waits up to 20 s for the
-  connected event.
+  connected event. A blocked write is unblocked on shutdown/reload by
+  setting a deadline on the underlying socket (gorilla's
+  `SetWriteDeadline` cannot interrupt an in-flight write), so the runner
+  joins within the bounded shutdown.
+- Ordinary transport write failures (broken pipe, deadline exceeded)
+  are classified separately and do NOT emit `stats.unexpected_exception`;
+  Python catches them inside `async_send` and returns False.
 
 Tests: the two `test/test_websocket.py` cases are ported as
 `TestSendMessagesBatchedSnappy` and `TestSendMessagesNobatch` against an
@@ -2559,7 +2596,21 @@ independence (`TestNewSlicingIndependentOfConfiguredMaxBatchSize`), the
 not-connected send wait (`TestSendMessagesNotConnected`), and the
 ExponentialBackoff sequence (`TestExponentialBackoffSequence`) are
 unit-tested; the reconnect cadence (20/36/64.8 s) is pinned under
-`testing/synctest` (`TestRunnerReconnectBackoffTiming`).
+`testing/synctest` (`TestRunnerReconnectBackoffTiming`). The review-round
+parity fixes are covered in `websocket_fixes_test.go`:
+`TestParseConfigSSLWithWSURIRejected` / `TestParseConfigRejectsBadScheme` /
+`TestParseConfigNullEnumsRejected`, `TestStripUserinfoAndBasicAuth` +
+`TestSendMessagesBasicAuth`, `TestSelectEnvProxy`,
+`TestSocks5RemoteDNS` (a fake SOCKS5 server records the handshake
+`ATYP`/host/port), `TestSendMessagesFollowsRedirect` +
+`TestRedirectTargetRejectsTLSDowngrade` /
+`TestRedirectTargetRejectsPreexistingSocket`,
+`TestDrainDecompressionBomb` (a small compressed frame expanding past the
+2 MiB bound), `TestHeartbeatDetectsPongWithholding`,
+`TestCloseUnblocksBlockedWrite`, `TestCloseConnAwaitsPeerClose`,
+`TestDialStalledHandshake`, `TestShouldReport` +
+`TestSendMessagesNoMetricOnConnectionFailure` (a UDP statsd sink asserts
+no `exception` metric on an ordinary transport failure).
 
 Fixture parity: unlike Task 23, a systest-go e2e driver WAS added
 (`systest-go/websocket_e2e_test.go:TestWebsocketSenderEndToEnd`): the real
@@ -2590,3 +2641,21 @@ Dispositions (coordinator rulings 2026-10-12):
    retriable send failure it retries forever; the Go constructor validates
    structurally at load and reports one clear error. Same class as the
    Task 22/23 strict-at-load decisions; kept per the coordinator ruling.
+3. **gorilla write cancellation: not a library-blocking limitation.**
+   gorilla's `Conn.SetWriteDeadline` only stores a field (`conn.go:787-790`)
+   and `Conn.write` sets the socket deadline once at frame-write start then
+   blocks in `c.conn.Write` (`conn.go:379-403`), so it cannot interrupt an
+   IN-FLIGHT write; a peer that stops reading would block the runner past
+   the bounded shutdown. This is NOT a library-swap trigger: capturing the
+   raw `net.Conn` via a wrapped `NetDialContext` and setting deadlines on
+   THAT socket (`cancelConnIO`) unblocks the write and lets the runner join.
+   Verified by `TestCloseUnblocksBlockedWrite` (previously hung) — the fix
+   is in-library, so no cross-reviewer→user library decision is needed.
+4. **`ssl: true` with a `ws://` URI: reject (security).** gorilla ignores
+   `TLSClientConfig` for `ws://`, so the config would silently send
+   PLAINTEXT; Python rejects the combination. The Go parser now rejects it
+   at load (strict-at-load class, item 2 above), tested by
+   `TestParseConfigSSLWithWSURIRejected` asserting no connection is dialed.
+5. **Explicit null compression enums: reject.** `websocket_compression:
+   null` / `compression: null` now error (Python's `websockets_compression
+   == None` path raises `ValueError`); only ABSENT keys take the default.
