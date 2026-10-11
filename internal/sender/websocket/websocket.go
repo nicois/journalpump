@@ -37,11 +37,13 @@
 package websocket
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,6 +113,13 @@ var (
 	writeWait = 10 * time.Second
 )
 
+// httpsProxyTLSConfig returns the TLS client config used for the TLS hop to an
+// HTTPS proxy (item #2). It is a var so a test can trust a local proxy's
+// certificate; production uses the system roots.
+var httpsProxyTLSConfig = func() *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS12}
+}
+
 // errNotConnected is the send failure when no connection is established
 // within sendWaitConnected (websocket.py async_send returning False).
 var errNotConnected = errors.New("websocket: not connected")
@@ -172,16 +181,15 @@ type config struct {
 // Sender is the websocket transport (websocket.py WebsocketSender).
 type Sender struct {
 	cfg     config
-	dialer  *websocket.Dialer
 	headers http.Header
 	stats   exceptionStats
 	tags    *tagged.Tagged
 	name    string
 	log     sender.Logger
 
-	// dialBase is the underlying TCP dialer (direct or SOCKS); dial() wraps it
-	// to capture the raw connection for I/O-deadline cancellation.
-	dialBase func(context.Context, string, string) (net.Conn, error)
+	// tlsCfg is the client TLS config for wss (certfile/keyfile + ca), built
+	// once at construction; nil when ssl is off.
+	tlsCfg *tls.Config
 
 	// jitter returns a uniform value in [0, m) for the reconnect backoff;
 	// tests inject a deterministic source.
@@ -207,11 +215,13 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 		jitter: func(m float64) float64 { return rand.Float64() * m },
 	}
 	s.headers = s.handshakeHeaders()
-	d, err := s.buildDialer()
-	if err != nil {
-		return sender.Instance{}, err
+	if cfg.ssl {
+		tc, err := s.tlsConfig()
+		if err != nil {
+			return sender.Instance{}, err
+		}
+		s.tlsCfg = tc
 	}
-	s.dialer = d
 
 	inst := sender.Instance{
 		Transport:       s,
@@ -398,88 +408,146 @@ func (s *Sender) handshakeHeaders() http.Header {
 // batching reports whether frames are NUL-joined (websocket.py:69-72).
 func (s *Sender) batching() bool { return s.cfg.maxBatchSize > 0 }
 
-// buildDialer constructs the gorilla dialer: TLS when ssl is enabled,
-// SOCKS5 when socks5_proxy is set, permessage-deflate when requested.
-//
-// Proxy selection mirrors Python: an explicit socks5_proxy (websocket.py:44-46
-// builds a python_socks Proxy) takes priority and bypasses the environment;
-// otherwise websockets defaults proxy=True and selects an environment proxy
-// via get_proxy (websockets/proxy.py:97-131): ws:// honors ws, sock, https
-// then http; wss:// honors wss, sock then https; no_proxy is consulted first.
-func (s *Sender) buildDialer() (*websocket.Dialer, error) {
-	d := &websocket.Dialer{
-		// HandshakeTimeout is websockets' INNER open_timeout (10 s), the HTTP
-		// upgrade timeout; the outer connectTimeout (30 s) wraps the whole
-		// dial incl. SOCKS.
-		HandshakeTimeout: openTimeout,
+// resolveProxy returns the proxy URL to use for a given target URI. An
+// explicit socks5_proxy (websocket.py:44-46 builds a python_socks Proxy,
+// bypassing the environment) always wins; otherwise websockets defaults
+// proxy=True and selects an environment proxy via get_proxy
+// (websockets/proxy.py:97-131). The proxy is re-resolved for EVERY redirect
+// destination (item #4): the scheme and the no_proxy match can change.
+func (s *Sender) resolveProxy(rawURI string) string {
+	if s.cfg.socks5Proxy != "" {
+		return s.cfg.socks5Proxy
 	}
-	if s.cfg.websocketCompression == wsCompressionDeflate {
-		d.EnableCompression = true
+	return selectEnvProxy(rawURI)
+}
+
+// preconnect establishes the TCP (and any proxy tunnel) connection to the
+// target under the OUTER connectTimeout budget (websocket.py's 30 s
+// websocket_connect timeout), leaving the HTTP/TLS opening handshake to the
+// separate 10 s open_timeout phase (item #8). The returned net.Conn is handed
+// to gorilla so no further socket work happens under the handshake timeout.
+func (r *runner) preconnect(ctx context.Context, rawURI string) (net.Conn, error) {
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return nil, fmt.Errorf("websocket_uri: %w", err)
 	}
-	if s.cfg.ssl {
-		tlsCfg, err := s.tlsConfig()
+	target := hostPort(u)
+	proxyURL := r.s.resolveProxy(rawURI)
+	if proxyURL == "" {
+		nd := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+		return nd.DialContext(ctx, "tcp", target)
+	}
+	pu, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: %w", err)
+	}
+	switch {
+	case strings.HasPrefix(pu.Scheme, "socks"):
+		// SOCKS proxy: dial the TARGET through the proxy (remote DNS).
+		sd, err := newSocks5Dialer(pu.String())
 		if err != nil {
 			return nil, err
 		}
-		d.TLSClientConfig = tlsCfg
+		return sd.DialContext(ctx, "tcp", target)
+	case pu.Scheme == "http" || pu.Scheme == "https":
+		// HTTP/HTTPS proxy: establish a CONNECT tunnel ourselves, so the TLS
+		// hop to an HTTPS proxy is verified here rather than being handed to
+		// gorilla (which supports only http:// proxies).
+		return connectTunnel(ctx, pu, target)
+	default:
+		return nil, fmt.Errorf("proxy: unsupported scheme %q", pu.Scheme)
 	}
-
-	proxyURL := s.cfg.socks5Proxy
-	if proxyURL == "" {
-		proxyURL = selectEnvProxy(s.cfg.uri)
-	}
-	if proxyURL != "" {
-		u, err := url.Parse(proxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("proxy: %w", err)
-		}
-		switch {
-		case strings.HasPrefix(u.Scheme, "socks"):
-			// SOCKS proxy: dial the TARGET through the proxy. Accept both
-			// the explicit socks5_proxy and an environment socks proxy (the
-			// get_proxy "socks" key, converted to socks5h://).
-			sd, err := newSocks5Dialer(u.String())
-			if err != nil {
-				return nil, err
-			}
-			s.dialBase = sd.DialContext
-		case u.Scheme == "http", u.Scheme == "https":
-			// HTTP proxy: gorilla issues CONNECT through it; the underlying
-			// TCP dial is the direct dialer.
-			d.Proxy = http.ProxyURL(u)
-		default:
-			return nil, fmt.Errorf("proxy: unsupported scheme %q", u.Scheme)
-		}
-	}
-	if s.dialBase == nil {
-		// Direct TCP dial. gorilla's default netDial mirrors this; we install
-		// our own so dial() can capture the raw net.Conn (see netDialWithCapture).
-		nd := &net.Dialer{Timeout: openTimeout, KeepAlive: 30 * time.Second}
-		s.dialBase = nd.DialContext
-	}
-	return d, nil
 }
+
+// hostPort returns the host:port dial target for a ws/wss URI (default port
+// 80/443).
+func hostPort(u *url.URL) string {
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "wss" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// connectTunnel dials an HTTP/HTTPS proxy and issues a CONNECT to target,
+// returning the established tunnel. An https:// proxy is reached over TLS
+// (verified against httpsProxyTLSConfig).
+func connectTunnel(ctx context.Context, proxy *url.URL, target string) (net.Conn, error) {
+	secure := proxy.Scheme == "https"
+	proxyAddr := proxy.Host
+	if proxy.Port() == "" {
+		if secure {
+			proxyAddr += ":443"
+		} else {
+			proxyAddr += ":80"
+		}
+	}
+	nd := &net.Dialer{Timeout: connectTimeout}
+	c, err := nd.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	if secure {
+		cfg := httpsProxyTLSConfig().Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = proxy.Hostname()
+		}
+		tc := tls.Client(c, cfg)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		c = tc
+	}
+	req := &http.Request{
+		Method: "CONNECT",
+		URL:    &url.URL{Opaque: target},
+		Host:   target,
+		Header: http.Header{},
+	}
+	if err := req.Write(c); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_ = c.Close()
+		return nil, fmt.Errorf("proxy CONNECT %s: %s", target, resp.Status)
+	}
+	if br.Buffered() > 0 {
+		return &bufferedConn{Conn: c, r: br}, nil
+	}
+	return c, nil
+}
+
+// bufferedConn preserves any bytes the CONNECT response reader buffered past
+// the header.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 // dialedConn is one established websocket connection plus the RAW net.Conn
 // underneath it. gorilla's Conn.SetWriteDeadline only stores a field and
-// applies it at the START of each frame write, so an in-flight write can only
-// be interrupted by setting the deadline on the underlying net.Conn (item #1):
-// the raw conn is retained for exactly that.
+// applies it at the START of each frame write, so cancellation of a blocked
+// write must close the raw conn (item #1).
 type dialedConn struct {
-	ws  *websocket.Conn
-	raw net.Conn
-}
-
-// netDialWithCapture wraps a base dialer, recording the raw net.Conn it
-// returns so the runner can force I/O deadlines on it.
-func netDialWithCapture(base func(context.Context, string, string) (net.Conn, error), capture *net.Conn) func(context.Context, string, string) (net.Conn, error) {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		c, err := base(ctx, network, addr)
-		if err == nil {
-			*capture = c
-		}
-		return c, err
-	}
+	ws     *websocket.Conn
+	raw    net.Conn
+	pongCh chan string
 }
 
 // envProxyKeys is the get_proxy priority order per URI security
@@ -524,24 +592,30 @@ func selectEnvProxy(rawURI string) string {
 	return ""
 }
 
-// envValue returns the first non-empty of the lowercase then uppercase env
-// var (urllib's getproxies_environment lowercases keys; a lowercase entry
-// wins).
+// envValue returns the effective value of a proxy env var following urllib's
+// getproxies_environment (urllib/request.py): the lowercase key is checked
+// first, and a PRESENT lowercase key wins — including when it is EMPTY, which
+// REMOVES the setting even if the uppercase key is set. Only when the
+// lowercase key is absent does the uppercase key apply (item #3).
 func envValue(key string) string {
-	if v := os.Getenv(key); v != "" {
+	if v, ok := os.LookupEnv(strings.ToLower(key)); ok {
 		return v
 	}
 	return os.Getenv(strings.ToUpper(key))
 }
 
 // hostBypassed reproduces urllib's proxy_bypass_environment for a host:port
-// (urllib/request.py): a no_proxy entry of "*" bypasses everything; an entry
-// may carry host:port; a leading-dot or bare domain matches the host and its
-// subdomains.
+// (urllib/request.py): a no_proxy value that is ENTIRELY "*" bypasses
+// everything (a "*" among other entries does not); an entry may carry
+// host:port; a leading-dot or bare domain matches the host and its subdomains
+// (item #3).
 func hostBypassed(host, port string) bool {
 	noProxy := envValue("no_proxy")
 	if noProxy == "" {
 		return false
+	}
+	if strings.TrimSpace(noProxy) == "*" {
+		return true
 	}
 	hostPort := net.JoinHostPort(host, port)
 	host = strings.ToLower(host)
@@ -549,9 +623,6 @@ func hostBypassed(host, port string) bool {
 		entry = strings.ToLower(strings.TrimSpace(entry))
 		if entry == "" {
 			continue
-		}
-		if entry == "*" {
-			return true
 		}
 		entryHost, entryPort := entry, ""
 		if h, p, err := net.SplitHostPort(entry); err == nil {
@@ -695,6 +766,21 @@ type liveConn struct {
 	raw    net.Conn
 	sendCh chan sendRequest
 	closed chan struct{}
+	// pongCh receives the payloads of inbound pongs; the heartbeat matches
+	// them against the ping it sent (item #5).
+	pongCh    chan string
+	abortOnce sync.Once
+}
+
+// abort irreversibly tears the connection down by closing the RAW socket. A
+// closed socket cannot be re-armed by a later gorilla write, so a blocked
+// write or read returns promptly and shutdown is bounded (item #1).
+func (lc *liveConn) abort() {
+	lc.abortOnce.Do(func() {
+		if lc.raw != nil {
+			_ = lc.raw.Close()
+		}
+	})
 }
 
 type sendRequest struct {
@@ -752,14 +838,14 @@ func (r *runner) run() {
 			continue
 		}
 		established := time.Now()
-		lc := &liveConn{ws: dc.ws, raw: dc.raw, sendCh: make(chan sendRequest), closed: make(chan struct{})}
+		lc := &liveConn{ws: dc.ws, raw: dc.raw, sendCh: make(chan sendRequest), closed: make(chan struct{}), pongCh: dc.pongCh}
 		r.setConnected(lc)
 		r.s.logf("websocket connected to %s", r.s.cfg.uri)
 
 		_ = r.serve(lc)
 		close(lc.closed)
 		r.setDisconnected(lc)
-		r.closeConn(dc.ws)
+		_ = lc.ws.Close()
 		r.s.logf("websocket connection closed after %.0f s", time.Since(established).Seconds())
 
 		if time.Since(established) > stableConnectionReset {
@@ -774,6 +860,12 @@ func (r *runner) run() {
 // dial establishes one connection under connectTimeout, cancelable by stop,
 // following up to maxRedirects supported handshake redirects
 // (websockets/asyncio/client.py:448-559).
+//
+// The dial is phased: preconnect (TCP + any proxy tunnel) runs under the
+// outer connectTimeout, then the HTTP/TLS opening handshake runs under the
+// inner openTimeout (item #8). The proxy is re-resolved per redirect target
+// (item #4), and userinfo is stripped from EVERY dial URL while the logical
+// URI keeps it for Authorization (item #7).
 func (r *runner) dial() (*dialedConn, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -790,36 +882,26 @@ func (r *runner) dial() (*dialedConn, error) {
 	ctx, timeoutCancel := context.WithTimeout(ctx, connectTimeout)
 	defer timeoutCancel()
 
-	uri := stripUserinfo(r.s.cfg.uri)
+	logical := r.s.cfg.uri
 	headers := r.s.headers.Clone()
-	applyBasicAuth(r.s.cfg.uri, headers)
+	applyBasicAuth(logical, headers)
 
 	var lastErr error
 	for attempt := 0; attempt < maxRedirects; attempt++ {
-		var raw net.Conn
-		d := *r.s.dialer
-		d.NetDialContext = netDialWithCapture(r.s.dialBase, &raw)
-		conn, resp, err := d.DialContext(ctx, uri, headers)
+		preconn, err := r.preconnect(ctx, logical)
+		if err != nil {
+			return nil, err
+		}
+		pongCh := make(chan string, 16)
+		conn, resp, err := r.handshake(ctx, logical, headers, preconn, pongCh)
 		if err == nil {
-			if r.s.cfg.websocketCompression == wsCompressionDeflate {
-				conn.EnableWriteCompression(true)
-			}
-			// SetReadLimit bounds the COMPRESSED frame; the decompressed
-			// bound is enforced by drain's bounded reader (item #8).
-			conn.SetReadLimit(inboundLimit)
-			conn.SetPongHandler(func(string) error {
-				return conn.SetReadDeadline(time.Now().Add(readWait()))
-			})
-			if err := conn.SetReadDeadline(time.Now().Add(readWait())); err != nil {
-				_ = conn.Close()
-				return nil, err
-			}
-			return &dialedConn{ws: conn, raw: raw}, nil
+			return &dialedConn{ws: conn, raw: preconn, pongCh: pongCh}, nil
 		}
 		lastErr = err
+		_ = preconn.Close()
 		// A failed handshake returns the HTTP response for a redirect
 		// (gorilla does not follow redirects itself).
-		next, rerr := redirectTarget(uri, resp, r.s.cfg.socks5Proxy != "")
+		next, rerr := redirectTarget(logical, resp, r.s.cfg.socks5Proxy != "")
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
@@ -830,14 +912,54 @@ func (r *runner) dial() (*dialedConn, error) {
 			return nil, lastErr
 		}
 		// Cross-origin redirects drop credentials (websockets:493-510).
-		if crossOrigin(uri, next) {
+		if crossOrigin(logical, next) {
 			headers = stripCredentials(headers)
 		}
 		headers = headers.Clone()
-		uri = next
-		applyBasicAuth(uri, headers)
+		logical = next
+		applyBasicAuth(logical, headers)
 	}
 	return nil, fmt.Errorf("websocket: more than %d redirects", maxRedirects)
+}
+
+// handshake runs the HTTP upgrade (and TLS for wss) over the preconnected
+// socket under the inner openTimeout. gorilla's HandshakeTimeout bounds only
+// this phase because the socket is already connected. The dial URL is the
+// logical URI with userinfo stripped (item #7).
+func (r *runner) handshake(ctx context.Context, logical string, headers http.Header, preconn net.Conn, pongCh chan string) (*websocket.Conn, *http.Response, error) {
+	d := &websocket.Dialer{
+		HandshakeTimeout: openTimeout,
+		TLSClientConfig:  r.s.tlsCfg,
+		NetDialContext: func(context.Context, string, string) (net.Conn, error) {
+			return preconn, nil
+		},
+	}
+	if r.s.cfg.websocketCompression == wsCompressionDeflate {
+		d.EnableCompression = true
+	}
+	conn, resp, err := d.DialContext(ctx, stripUserinfo(logical), headers)
+	if err != nil {
+		return nil, resp, err
+	}
+	if r.s.cfg.websocketCompression == wsCompressionDeflate {
+		conn.EnableWriteCompression(true)
+	}
+	// SetReadLimit bounds the COMPRESSED frame; the decompressed bound is
+	// enforced by drain's bounded reader (item #8). The pong handler feeds the
+	// heartbeat's matching-pong check (item #5).
+	conn.SetReadLimit(inboundLimit)
+	conn.SetPongHandler(func(msg string) error {
+		select {
+		case pongCh <- msg:
+		default:
+		}
+		return conn.SetReadDeadline(time.Now().Add(readWait()))
+	})
+	if err := conn.SetReadDeadline(time.Now().Add(readWait())); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, resp, nil
 }
 
 // readWait is the read deadline window: a ping every pingInterval and a pong
@@ -940,10 +1062,13 @@ func crossOrigin(a, b string) bool {
 }
 
 // serve drains inbound while serializing the outbound requests until the
-// connection dies, the drain fails, or stop fires. On any exit that leaves a
-// write or read blocked, it forces the connection's I/O deadlines to Now so
-// the goroutines unblock and join (item #1: a peer that stops reading must
-// not block shutdown).
+// connection dies, the drain fails, or stop fires.
+//
+// On a normal stop it performs a graceful closing handshake WHILE the drain
+// goroutine is still alive, so the peer's close response can be awaited
+// (item #6). On any other exit, or once the close handshake is done or times
+// out, it force-closes the raw socket (item #1) so every blocked read/write
+// returns and both worker goroutines join.
 func (r *runner) serve(lc *liveConn) error {
 	readerErr := make(chan error, 1)
 	go func() { readerErr <- drain(lc.ws) }()
@@ -954,54 +1079,62 @@ func (r *runner) serve(lc *liveConn) error {
 		defer close(hbDone)
 		r.heartbeat(lc, stopHB)
 	}()
-	defer func() {
-		close(stopHB)
-		<-hbDone
-	}()
 
+	var serveErr error
+	readerJoined := false
+loop:
 	for {
 		select {
 		case <-r.stopCh:
-			cancelConnIO(lc)
-			<-readerErr
-			return errStopped
+			serveErr = errStopped
+			break loop
 		case err := <-readerErr:
-			return err
+			readerJoined = true
+			serveErr = err
+			break loop
 		case req := <-lc.sendCh:
 			if err := writeFrames(lc.ws, req.frames); err != nil {
 				// An ordinary transport failure: Python's async_send would
 				// have caught it and returned False (item #12).
 				req.result <- &transportError{err}
-				cancelConnIO(lc)
-				<-readerErr
-				return err
+				serveErr = err
+				break loop
 			}
 			req.result <- nil
 		}
 	}
+
+	close(stopHB)
+	<-hbDone
+
+	if serveErr == errStopped {
+		// Graceful closing handshake. drain is still reading, so the peer's
+		// close response ends it within closeTimeout (item #6).
+		_ = lc.ws.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+			time.Now().Add(closeTimeout),
+		)
+		select {
+		case <-readerErr:
+			readerJoined = true
+		case <-time.After(closeTimeout):
+		}
+	}
+	// Irreversible teardown: after this no gorilla write can re-arm a
+	// deadline and block shutdown (item #1).
+	lc.abort()
+	if !readerJoined {
+		<-readerErr
+	}
+	return serveErr
 }
 
-// cancelConnIO forces both I/O deadlines to the past so a blocked read or
-// write returns promptly. It sets the deadline on the RAW net.Conn, because
-// gorilla's Conn.SetWriteDeadline only stores a field applied at the start of
-// the next frame write and so cannot interrupt an in-flight write. net.Conn
-// deadlines are safe to set concurrently with an in-flight read/write.
-func cancelConnIO(lc *liveConn) {
-	if lc.raw != nil {
-		_ = lc.raw.SetWriteDeadline(time.Now())
-		_ = lc.raw.SetReadDeadline(time.Now())
-	}
-	_ = lc.ws.SetReadDeadline(time.Now())
-	if lc.raw == nil {
-		_ = lc.ws.SetWriteDeadline(time.Now())
-	}
-}
-
-// heartbeat sends a ping every pingInterval so a silently-dead peer is
-// detected via the read deadline (websockets keepalive default
-// ping_interval=20 s, ping_timeout=20 s). When the ping write fails the
-// connection is dead: unblock the reader/writer so serve returns and the
-// runner reconnects.
+// heartbeat runs websockets' keepalive (ping_interval=20 s, ping_timeout=20 s):
+// it pings every pingInterval and requires a PONG carrying the SAME payload
+// within pingTimeout. Matching the payload (rather than accepting any inbound
+// traffic as proof of life) means a peer that keeps sending data but never
+// pongs is still detected and reconnected (item #5).
 func (r *runner) heartbeat(lc *liveConn, stop chan struct{}) {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
@@ -1014,12 +1147,48 @@ func (r *runner) heartbeat(lc *liveConn, stop chan struct{}) {
 		case <-r.stopCh:
 			return
 		case <-t.C:
-			if err := lc.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
-				cancelConnIO(lc)
-				return
-			}
+		}
+		payload := pingPayload()
+		if err := lc.ws.WriteControl(websocket.PingMessage, payload, time.Now().Add(writeWait)); err != nil {
+			lc.abort()
+			return
+		}
+		if !r.waitPong(lc, payload, stop) {
+			r.s.logf("websocket: no pong within %s; reconnecting", pingTimeout)
+			lc.abort()
+			return
 		}
 	}
+}
+
+// waitPong waits up to pingTimeout for a pong carrying payload. It returns
+// true when the matching pong arrived or the runner is shutting down, and
+// false on a real pong timeout.
+func (r *runner) waitPong(lc *liveConn, payload []byte, stop chan struct{}) bool {
+	timer := time.NewTimer(pingTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-lc.pongCh:
+			if got == string(payload) {
+				return true
+			}
+		case <-timer.C:
+			return false
+		case <-stop:
+			return true
+		case <-r.stopCh:
+			return true
+		}
+	}
+}
+
+// pingPayload returns a fresh 8-byte ping payload so a pong can be matched to
+// its ping.
+func pingPayload() []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, rand.Uint64())
+	return b
 }
 
 // drain reads and discards inbound frames (websocket.py:84-87); its exit
@@ -1056,26 +1225,6 @@ func writeFrames(conn *websocket.Conn, frames [][]byte) error {
 		}
 	}
 	return nil
-}
-
-// closeConn performs the closing handshake: send a close frame, then await
-// the peer's close response within closeTimeout before force-closing and
-// releasing the socket (item #9; websocket.py close_timeout=20, and the
-// inbound reader has already been joined by serve).
-func (r *runner) closeConn(conn *websocket.Conn) {
-	deadline := time.Now().Add(closeTimeout)
-	_ = conn.WriteControl(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		deadline,
-	)
-	_ = conn.SetReadDeadline(deadline)
-	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
-			break
-		}
-	}
-	_ = conn.Close()
 }
 
 func (r *runner) setConnected(lc *liveConn) {
@@ -1163,8 +1312,10 @@ func (r *runner) sleepBackoff() bool {
 	}
 }
 
-// stop asks the runner to exit and waits for it. It unblocks the current
-// connection's I/O so a peer that stopped reading cannot stall shutdown
+// stop asks the runner to exit and waits for it. It unblocks an in-flight
+// write by forcing a write deadline so a peer that stopped reading cannot
+// stall shutdown; the socket stays open so serve can still perform its
+// graceful closing handshake (item #6), and serve force-closes it afterwards
 // (item #1).
 func (r *runner) stop() {
 	r.stopOnce.Do(func() {
@@ -1172,8 +1323,8 @@ func (r *runner) stop() {
 		r.mu.Lock()
 		lc := r.conn
 		r.mu.Unlock()
-		if lc != nil {
-			cancelConnIO(lc)
+		if lc != nil && lc.raw != nil {
+			_ = lc.raw.SetWriteDeadline(time.Now())
 		}
 	})
 	<-r.doneCh
