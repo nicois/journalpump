@@ -21,13 +21,15 @@
 //   - request timing: Do applies an optional per-request context
 //     deadline/cancellation, and the requests-compatible senders use an
 //     INACTIVITY timeout (the deadline resets on every read/write).
-//     InactivityClient applies that timeout per REQUEST, so a reused
-//     keep-alive connection carries the timeout of the request currently in
-//     flight rather than the one that dialed it; IdleTimeoutDialer is the
-//     fixed-dial variant for a sender with a constant session timeout
-//     (logplex). Senders whose Python client uses requests' socket timeout
-//     use one of these so a slow-but-progressing response is not aborted
-//     the way a total deadline would abort it.
+//     InactivityClient applies that timeout per REQUEST and per PHASE, so a
+//     reused keep-alive connection carries the timeout of the request
+//     currently in flight rather than the one that dialed it, and the
+//     response-read deadline is armed only after the request is written
+//     (a progressing upload that outlasts the timeout is not aborted);
+//     IdleTimeoutDialer is the fixed-dial variant for a sender with a
+//     constant session timeout (logplex). Senders whose Python client uses
+//     requests' socket timeout use one of these so a slow-but-progressing
+//     response is not aborted the way a total deadline would abort it.
 //
 // It deliberately provides NO retry hook: retries are owned by the shared
 // sender.Loop (a failed SendMessages retains the batch and retries after
@@ -43,11 +45,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -151,32 +153,44 @@ func IdleTimeoutDialer(fallback time.Duration) func(ctx context.Context, network
 }
 
 // InactivityClient wraps an *http.Client so requests' per-request INACTIVITY
-// timeout is applied at each REQUEST boundary, not once at connection-dial
-// time. net/http resolves a transport's DialContext once per connection and
-// keeps a background readLoop blocked on pooled connections, so a
-// dial-baked deadline leaks across requests: a bulk POST reusing the
-// version/alias connection would inherit the ordinary timeout (and a later
-// ordinary request the bulk timeout), and a pooled read would measure
-// inactivity from before the next request.
+// timeout is applied at each REQUEST boundary and to the correct PHASE, not
+// once at connection-dial time. net/http resolves a transport's DialContext
+// once per connection and keeps a background readLoop blocked on pooled
+// connections, so a dial-baked deadline leaks across requests: a bulk POST
+// reusing the version/alias connection would inherit the ordinary timeout
+// (and a later ordinary request the bulk timeout), and a pooled read would
+// measure inactivity from before the next request.
 //
 // The timeout for the request in flight is carried on its context
-// (WithRequestTimeout). Do copies it to a shared value every wrapped
-// connection consults before each read/write, and re-arms any pooled
-// connection's pending background read, so a reused connection uses the
-// CURRENT request's timeout. Requests must be issued sequentially (the
-// sender.Loop contract): concurrent requests would share one deadline.
+// (WithRequestTimeout). The client tracks, under one mutex:
+//
+//   - the current idle timeout, updated at the request boundary;
+//   - the current PHASE (upload vs response-read). The read deadline is armed
+//     only in the read phase, so a progressing upload that outlasts the
+//     timeout cannot fail before response reading should begin — urllib3 arms
+//     its read timeout only AFTER sending the request;
+//   - the live wrapped connections, so a request boundary re-arms a pooled
+//     connection's PENDING background read (a just-armed deadline must not be
+//     overwritten by a read that already loaded the previous timeout).
+//
+// Every load/install of a deadline happens under the mutex together, so a
+// background read cannot interleave between "read the timeout" and "install
+// the deadline". The actual blocking read/write happens outside the mutex.
+// Requests must be issued sequentially (the sender.Loop contract): concurrent
+// requests would share one deadline.
 type InactivityClient struct {
 	client *http.Client
-	idle   atomic.Int64
-	// conns tracks live wrapped connections so Do can re-arm a pooled
-	// connection's pending background read to the current request's timeout.
-	conns sync.Map // *dynamicIdleConn -> struct{}
+
+	mu      sync.Mutex
+	idle    time.Duration
+	reading bool // response-read phase has begun for the current request
+	conns   map[*dynamicIdleConn]struct{}
 }
 
 // NewInactivityClient builds an InactivityClient with the given transport
 // options, mirroring NewClient (idle pooled connections are bounded at 90 s).
 func NewInactivityClient(opts ClientOptions) *InactivityClient {
-	c := &InactivityClient{}
+	c := &InactivityClient{conns: map[*dynamicIdleConn]struct{}{}}
 	c.client = &http.Client{Transport: &http.Transport{
 		Proxy:           opts.Proxy,
 		TLSClientConfig: opts.TLSClientConfig,
@@ -191,8 +205,15 @@ func NewInactivityClient(opts ClientOptions) *InactivityClient {
 			if err != nil {
 				return nil, err
 			}
-			wrapped := &dynamicIdleConn{Conn: conn, idle: &c.idle, owner: c}
-			c.conns.Store(wrapped, struct{}{})
+			wrapped := &dynamicIdleConn{Conn: conn, owner: c}
+			c.mu.Lock()
+			c.conns[wrapped] = struct{}{}
+			// A connection dialed mid-request (read phase already begun) must
+			// adopt the current read deadline.
+			if c.reading && c.idle > 0 {
+				_ = conn.SetReadDeadline(time.Now().Add(c.idle))
+			}
+			c.mu.Unlock()
 			return wrapped, nil
 		},
 	}}
@@ -202,48 +223,89 @@ func NewInactivityClient(opts ClientOptions) *InactivityClient {
 // Client returns the wrapped *http.Client (for transport inspection in tests).
 func (c *InactivityClient) Client() *http.Client { return c.client }
 
-// Do applies the request's inactivity timeout, then delegates to the wrapped
-// client.
+// Do installs the request's inactivity timeout at this request boundary and
+// delegates to the wrapped client. A RequestTrace arms the read deadline when
+// the request has been fully written (the start of the read phase).
 func (c *InactivityClient) Do(req *http.Request) (*http.Response, error) {
-	if v, ok := req.Context().Value(timeoutKey{}).(time.Duration); ok && v > 0 {
-		c.idle.Store(int64(v))
-		deadline := time.Now().Add(v)
-		c.conns.Range(func(k, _ any) bool {
-			_ = k.(*dynamicIdleConn).SetReadDeadline(deadline)
-			return true
-		})
+	v, ok := req.Context().Value(timeoutKey{}).(time.Duration)
+	if !ok || v <= 0 {
+		return c.client.Do(req)
 	}
+	c.beginRequest(v)
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { c.beginRead() },
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	return c.client.Do(req)
+}
+
+// beginRequest enters the UPLOAD phase for a new request: it installs the
+// request's timeout and CLEARS the read deadline on every connection, so a
+// progressing upload cannot trip a read timeout (request A's read deadline
+// must not run while request B is still uploading), and so a pending pooled
+// read does not retain a stale deadline. The clear+install happen under the
+// mutex so a concurrent wrapped Read/Write cannot overwrite the new state.
+func (c *InactivityClient) beginRequest(idle time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.idle = idle
+	c.reading = false
+	for conn := range c.conns {
+		_ = conn.SetReadDeadline(time.Time{})
+	}
+}
+
+// beginRead enters the RESPONSE-READ phase: it arms the read deadline
+// (inactivity) on every connection, matching urllib3 setting the socket
+// timeout after the request is sent.
+func (c *InactivityClient) beginRead() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reading = true
+	if c.idle <= 0 {
+		return
+	}
+	deadline := time.Now().Add(c.idle)
+	for conn := range c.conns {
+		_ = conn.SetReadDeadline(deadline)
+	}
 }
 
 // CloseIdleConnections releases pooled connections (see Sender.Close).
 func (c *InactivityClient) CloseIdleConnections() { c.client.CloseIdleConnections() }
 
-// dynamicIdleConn applies an inactivity deadline that is re-read from the
-// client's shared value before every operation, so a reused connection uses
-// the current request's timeout.
+// dynamicIdleConn applies the client's current inactivity deadline before
+// every operation. The read deadline is armed ONLY in the read phase, so a
+// progressing upload is never aborted by a read timeout, and every deadline
+// install happens under the owner's mutex so a request-boundary update cannot
+// be overwritten by a read that loaded the previous timeout.
 type dynamicIdleConn struct {
 	net.Conn
-	idle  *atomic.Int64
 	owner *InactivityClient
 }
 
 func (c *dynamicIdleConn) Read(b []byte) (int, error) {
-	if d := time.Duration(c.idle.Load()); d > 0 {
-		_ = c.SetReadDeadline(time.Now().Add(d))
+	c.owner.mu.Lock()
+	if c.owner.reading && c.owner.idle > 0 {
+		_ = c.SetReadDeadline(time.Now().Add(c.owner.idle))
 	}
+	c.owner.mu.Unlock()
 	return c.Conn.Read(b)
 }
 
 func (c *dynamicIdleConn) Write(b []byte) (int, error) {
-	if d := time.Duration(c.idle.Load()); d > 0 {
-		_ = c.SetWriteDeadline(time.Now().Add(d))
+	c.owner.mu.Lock()
+	if c.owner.idle > 0 {
+		_ = c.SetWriteDeadline(time.Now().Add(c.owner.idle))
 	}
+	c.owner.mu.Unlock()
 	return c.Conn.Write(b)
 }
 
 func (c *dynamicIdleConn) Close() error {
-	c.owner.conns.Delete(c)
+	c.owner.mu.Lock()
+	delete(c.owner.conns, c)
+	c.owner.mu.Unlock()
 	return c.Conn.Close()
 }
 

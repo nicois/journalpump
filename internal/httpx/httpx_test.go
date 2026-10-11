@@ -7,11 +7,174 @@ package httpx
 
 import (
 	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
+
+// recordingConn is a net.Conn test double that records deadline installs and
+// can block a Read until released, so request-boundary interleavings are
+// driven deterministically (no sleeps).
+type recordingConn struct {
+	mu          sync.Mutex
+	readDL      []time.Time
+	writeDL     []time.Time
+	readEntered chan struct{}
+	readBlock   chan struct{}
+}
+
+func (c *recordingConn) Read(_ []byte) (int, error) {
+	if c.readEntered != nil {
+		select {
+		case <-c.readEntered:
+		default:
+			close(c.readEntered)
+		}
+	}
+	if c.readBlock != nil {
+		<-c.readBlock
+	}
+	return 0, io.EOF
+}
+
+func (c *recordingConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *recordingConn) Close() error                { return nil }
+
+func (c *recordingConn) LocalAddr() net.Addr  { return connAddr{} }
+func (c *recordingConn) RemoteAddr() net.Addr { return connAddr{} }
+func (c *recordingConn) SetDeadline(t time.Time) error {
+	_ = c.SetReadDeadline(t)
+	return c.SetWriteDeadline(t)
+}
+
+func (c *recordingConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.readDL = append(c.readDL, t)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *recordingConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDL = append(c.writeDL, t)
+	c.mu.Unlock()
+	return nil
+}
+
+type connAddr struct{}
+
+func (connAddr) Network() string { return "fake" }
+func (connAddr) String() string  { return "fake" }
+
+func (c *recordingConn) lastRead() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.readDL) == 0 {
+		return time.Time{}
+	}
+	return c.readDL[len(c.readDL)-1]
+}
+
+func (c *recordingConn) lastWrite() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.writeDL) == 0 {
+		return time.Time{}
+	}
+	return c.writeDL[len(c.writeDL)-1]
+}
+
+func newDeadlineTestClient() (*InactivityClient, *dynamicIdleConn, *recordingConn) {
+	fc := &recordingConn{}
+	c := &InactivityClient{conns: map[*dynamicIdleConn]struct{}{}}
+	conn := &dynamicIdleConn{Conn: fc, owner: c}
+	c.conns[conn] = struct{}{}
+	return c, conn, fc
+}
+
+// TestInactivityClientTimeoutPerPhaseAndBoundary pins review round 3 item 2:
+// the read deadline is armed only in the RESPONSE-READ phase, so a
+// progressing upload that outlasts the timeout is not aborted before
+// response reading begins (urllib3 arms its read timeout after sending), and
+// review round 3 item 1: a request boundary replaces the timeout and clears a
+// pending read deadline rather than letting a stale one survive.
+func TestInactivityClientTimeoutPerPhaseAndBoundary(t *testing.T) {
+	c, conn, fc := newDeadlineTestClient()
+
+	// Upload phase (the bulk POST): NO read deadline; the write deadline is
+	// armed per write.
+	c.beginRequest(300 * time.Millisecond)
+	if got := fc.lastRead(); !got.IsZero() {
+		t.Fatalf("read deadline armed during the upload phase: %v", got)
+	}
+	_, _ = conn.Write([]byte("x"))
+	if got := fc.lastWrite(); got.IsZero() {
+		t.Fatal("write deadline not armed")
+	}
+
+	// Read phase: the read deadline is armed with the current timeout.
+	c.beginRead()
+	_, _ = conn.Read(make([]byte, 1))
+	if d := time.Until(fc.lastRead()); d <= 0 || d > 300*time.Millisecond {
+		t.Fatalf("read deadline = %v, want ~300ms", d)
+	}
+
+	// Next request boundary (an ordinary request): the shorter timeout
+	// replaces the bulk one and the read deadline is cleared for the upload
+	// phase. A plain Read during that phase must not re-arm it.
+	c.beginRequest(150 * time.Millisecond)
+	if got := fc.lastRead(); !got.IsZero() {
+		t.Fatalf("read deadline survived the request boundary: %v", got)
+	}
+	_, _ = conn.Read(make([]byte, 1))
+	if got := fc.lastRead(); !got.IsZero() {
+		t.Fatalf("read deadline armed during the next upload phase: %v", got)
+	}
+	c.beginRead()
+	_, _ = conn.Read(make([]byte, 1))
+	if d := time.Until(fc.lastRead()); d <= 0 || d > 150*time.Millisecond {
+		t.Fatalf("read deadline = %v, want ~150ms (the new timeout, not the old 300ms)", d)
+	}
+}
+
+// TestInactivityClientBoundaryUpdateWithPendingRead pins review round 3 item 1
+// deterministically: a background Read that is already in flight (armed the
+// old timeout and blocked inside the syscall) must NOT overwrite the deadline
+// installed at a new request boundary. The pending read is driven by channels,
+// so the interleaving is fixed rather than timing-dependent.
+func TestInactivityClientBoundaryUpdateWithPendingRead(t *testing.T) {
+	c, conn, fc := newDeadlineTestClient()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	fc.readEntered = entered
+	fc.readBlock = release
+
+	// Bulk request A: read phase, a background read is pending with 300ms.
+	c.beginRequest(300 * time.Millisecond)
+	c.beginRead()
+	done := make(chan struct{})
+	go func() {
+		_, _ = conn.Read(make([]byte, 1))
+		close(done)
+	}()
+	<-entered // the pending read has armed 300ms and is blocked in Conn.Read
+
+	// Request boundary B (ordinary): the upload phase clears the read
+	// deadline. The pending read must not later re-install its stale 300ms.
+	c.beginRequest(150 * time.Millisecond)
+	if got := fc.lastRead(); !got.IsZero() {
+		t.Fatalf("request-boundary deadline overwritten: got %v, want zeroed read deadline", got)
+	}
+	close(release)
+	<-done
+	if got := fc.lastRead(); !got.IsZero() {
+		t.Fatalf("pending read re-armed a stale deadline after the boundary update: %v", got)
+	}
+}
 
 func TestDoReturnsStatusAndBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,5 +296,69 @@ func TestIdleTimeoutDialerAppliesInactivityTimeout(t *testing.T) {
 	}
 	if status != http.StatusOK || string(body) != "abc" {
 		t.Fatalf("status = %d body = %q", status, body)
+	}
+}
+
+// pacedReader yields `chunks` reads of chunkSize bytes, sleeping gap between
+// reads so a request body uploads slowly (total >> the timeout) while every
+// single socket write still completes quickly.
+type pacedReader struct {
+	chunkSize int
+	chunks    int
+	gap       time.Duration
+	read      int
+}
+
+func (p *pacedReader) Read(b []byte) (int, error) {
+	if p.read > 0 {
+		time.Sleep(p.gap)
+	}
+	if p.read >= p.chunks {
+		return 0, io.EOF
+	}
+	p.read++
+	n := p.chunkSize
+	if n > len(b) {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		b[i] = 'a'
+	}
+	return n, nil
+}
+
+func (p *pacedReader) total() int { return p.chunkSize * p.chunks }
+
+// TestInactivityClientProgressingUploadExceedsTimeout pins review round 3
+// item 2: the response-read deadline must not run while the request body is
+// still uploading. The upload here lasts 20×20ms = 400ms (>> the 200ms
+// timeout) yet every single write progresses, and the server answers
+// immediately once the body is received, so the request must succeed.
+func TestInactivityClientProgressingUploadExceedsTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+
+	idle := 200 * time.Millisecond
+	client := NewInactivityClient(ClientOptions{})
+	body := &pacedReader{chunkSize: 1024, chunks: 20, gap: 20 * time.Millisecond}
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = int64(body.total())
+	req = req.WithContext(WithRequestTimeout(context.Background(), idle))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("progressing upload longer than the timeout was aborted: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
 }
