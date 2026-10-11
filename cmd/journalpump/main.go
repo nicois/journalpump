@@ -17,6 +17,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/daemon"
 	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/sender"
+	"github.com/Aiven-Open/journalpump/internal/sender/cloudwatch"
 	"github.com/Aiven-Open/journalpump/internal/sender/elasticsearch"
 	"github.com/Aiven-Open/journalpump/internal/sender/file"
 	"github.com/Aiven-Open/journalpump/internal/sender/kafka"
@@ -163,6 +164,7 @@ func isRegularFile(path string) bool {
 //   - kafka (Task 22)
 //   - elasticsearch, opensearch (Task 23)
 //   - websocket (Task 24)
+//   - aws_cloudwatch (Task 25)
 func registerSenders() {
 	sender.Register("file", file.New)
 	sender.Register("rsyslog", rsyslog.New)
@@ -171,4 +173,5 @@ func registerSenders() {
 	sender.Register("elasticsearch", elasticsearch.NewElasticsearch)
 	sender.Register("opensearch", elasticsearch.NewOpenSearch)
 	sender.Register("websocket", websocket.New)
+	sender.Register("aws_cloudwatch", cloudwatch.New)
 }
