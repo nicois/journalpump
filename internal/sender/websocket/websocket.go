@@ -434,7 +434,9 @@ func (r *runner) preconnect(ctx context.Context, rawURI string) (net.Conn, error
 	target := hostPort(u)
 	proxyURL := r.s.resolveProxy(rawURI)
 	if proxyURL == "" {
-		nd := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+		// The ctx deadline bounds the dial (the caller sets it to the opening
+		// or outer budget as appropriate).
+		nd := &net.Dialer{KeepAlive: 30 * time.Second}
 		return nd.DialContext(ctx, "tcp", target)
 	}
 	pu, err := url.Parse(proxyURL)
@@ -476,7 +478,12 @@ func hostPort(u *url.URL) string {
 
 // connectTunnel dials an HTTP/HTTPS proxy and issues a CONNECT to target,
 // returning the established tunnel. An https:// proxy is reached over TLS
-// (verified against httpsProxyTLSConfig).
+// (verified against httpsProxyTLSConfig). The WHOLE exchange is bounded by the
+// ctx deadline and by an explicit socket deadline, and the connection is
+// closed when ctx is cancelled, so a proxy that withholds its CONNECT response
+// cannot block shutdown (item #2). Proxy URL credentials become an HTTP Basic
+// Proxy-Authorization header (item #3); it is sent only to the proxy and never
+// to the destination.
 func connectTunnel(ctx context.Context, proxy *url.URL, target string) (net.Conn, error) {
 	secure := proxy.Scheme == "https"
 	proxyAddr := proxy.Host
@@ -487,9 +494,21 @@ func connectTunnel(ctx context.Context, proxy *url.URL, target string) (net.Conn
 			proxyAddr += ":80"
 		}
 	}
-	nd := &net.Dialer{Timeout: connectTimeout}
-	c, err := nd.DialContext(ctx, "tcp", proxyAddr)
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
+		return nil, err
+	}
+	raw := c // closed on cancellation; c may be reassigned to the TLS conn below
+	// Abort the exchange if the context is cancelled (e.g. runner stop), and
+	// bound it with an explicit deadline as well.
+	stopWatch := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stopWatch()
+	deadline := time.Now().Add(connectTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := c.SetDeadline(deadline); err != nil {
+		_ = c.Close()
 		return nil, err
 	}
 	if secure {
@@ -504,11 +523,18 @@ func connectTunnel(ctx context.Context, proxy *url.URL, target string) (net.Conn
 		}
 		c = tc
 	}
+	headers := http.Header{}
+	if proxy.User != nil {
+		if pass, ok := proxy.User.Password(); ok {
+			token := base64.StdEncoding.EncodeToString([]byte(proxy.User.Username() + ":" + pass))
+			headers.Set("Proxy-Authorization", "Basic "+token)
+		}
+	}
 	req := &http.Request{
 		Method: "CONNECT",
 		URL:    &url.URL{Opaque: target},
 		Host:   target,
-		Header: http.Header{},
+		Header: headers,
 	}
 	if err := req.Write(c); err != nil {
 		_ = c.Close()
@@ -525,6 +551,9 @@ func connectTunnel(ctx context.Context, proxy *url.URL, target string) (net.Conn
 		_ = c.Close()
 		return nil, fmt.Errorf("proxy CONNECT %s: %s", target, resp.Status)
 	}
+	// Clear the tunnel-exchange deadline; the caller manages I/O deadlines from
+	// here on.
+	_ = c.SetDeadline(time.Time{})
 	if br.Buffered() > 0 {
 		return &bufferedConn{Conn: c, r: br}, nil
 	}
@@ -614,7 +643,9 @@ func hostBypassed(host, port string) bool {
 	if noProxy == "" {
 		return false
 	}
-	if strings.TrimSpace(noProxy) == "*" {
+	// urllib compares the COMPLETE value to "*" (no trimming), so " * " does
+	// NOT bypass an ordinary host (item #5).
+	if noProxy == "*" {
 		return true
 	}
 	hostPort := net.JoinHostPort(host, port)
@@ -857,17 +888,19 @@ func (r *runner) run() {
 	}
 }
 
-// dial establishes one connection under connectTimeout, cancelable by stop,
-// following up to maxRedirects supported handshake redirects
+// dial establishes one connection, cancelable by stop, following up to
+// maxRedirects supported handshake redirects
 // (websockets/asyncio/client.py:448-559).
 //
-// The dial is phased: preconnect (TCP + any proxy tunnel) runs under the
-// outer connectTimeout, then the HTTP/TLS opening handshake runs under the
-// inner openTimeout (item #8). The proxy is re-resolved per redirect target
-// (item #4), and userinfo is stripped from EVERY dial URL while the logical
-// URI keeps it for Authorization (item #7).
+// Phase separation matches Python (item #4): for an EXPLICIT socks5_proxy the
+// preconnection is under the outer connectTimeout (30 s) and only the opening
+// handshake is under openTimeout; otherwise ONE opening deadline (open_timeout,
+// 10 s) covers ordinary TCP, environment-proxy establishment AND the whole
+// redirect sequence. The proxy is re-resolved per redirect target (item #4),
+// and userinfo is stripped from EVERY dial URL while the logical URI keeps it
+// for Authorization (item #7).
 func (r *runner) dial() (*dialedConn, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	outerCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopWatch := make(chan struct{})
 	go func() {
@@ -879,21 +912,51 @@ func (r *runner) dial() (*dialedConn, error) {
 	}()
 	defer close(stopWatch)
 
-	ctx, timeoutCancel := context.WithTimeout(ctx, connectTimeout)
+	outerCtx, timeoutCancel := context.WithTimeout(outerCtx, connectTimeout)
 	defer timeoutCancel()
 
 	logical := r.s.cfg.uri
 	headers := r.s.headers.Clone()
 	applyBasicAuth(logical, headers)
 
+	if r.s.cfg.socks5Proxy != "" {
+		// Explicit SOCKS proxy: the preconnection gets the full outer budget,
+		// then a single opening deadline for the handshake. Redirects are
+		// refused for a preexisting socket (redirectTarget).
+		preconn, err := r.preconnect(outerCtx, logical)
+		if err != nil {
+			return nil, err
+		}
+		openCtx, openCancel := context.WithTimeout(outerCtx, openTimeout)
+		defer openCancel()
+		pongCh := make(chan string, 16)
+		conn, resp, err := r.handshake(openCtx, logical, headers, preconn, pongCh)
+		if err == nil {
+			return &dialedConn{ws: conn, raw: preconn, pongCh: pongCh}, nil
+		}
+		_ = preconn.Close()
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		if _, rerr := redirectTarget(logical, resp, true); rerr != nil {
+			return nil, rerr
+		}
+		return nil, err
+	}
+
+	// Ordinary path: ONE opening deadline across establishment and every
+	// redirect attempt (Python's open_timeout is not restarted per redirect).
+	openCtx, openCancel := context.WithTimeout(outerCtx, openTimeout)
+	defer openCancel()
+
 	var lastErr error
 	for attempt := 0; attempt < maxRedirects; attempt++ {
-		preconn, err := r.preconnect(ctx, logical)
+		preconn, err := r.preconnect(openCtx, logical)
 		if err != nil {
 			return nil, err
 		}
 		pongCh := make(chan string, 16)
-		conn, resp, err := r.handshake(ctx, logical, headers, preconn, pongCh)
+		conn, resp, err := r.handshake(openCtx, logical, headers, preconn, pongCh)
 		if err == nil {
 			return &dialedConn{ws: conn, raw: preconn, pongCh: pongCh}, nil
 		}
@@ -901,7 +964,7 @@ func (r *runner) dial() (*dialedConn, error) {
 		_ = preconn.Close()
 		// A failed handshake returns the HTTP response for a redirect
 		// (gorilla does not follow redirects itself).
-		next, rerr := redirectTarget(logical, resp, r.s.cfg.socks5Proxy != "")
+		next, rerr := redirectTarget(logical, resp, false)
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
@@ -923,13 +986,12 @@ func (r *runner) dial() (*dialedConn, error) {
 }
 
 // handshake runs the HTTP upgrade (and TLS for wss) over the preconnected
-// socket under the inner openTimeout. gorilla's HandshakeTimeout bounds only
-// this phase because the socket is already connected. The dial URL is the
-// logical URI with userinfo stripped (item #7).
+// socket. The OPENING DEADLINE comes from ctx (gorilla's HandshakeTimeout is
+// disabled so a shared/redirect-wide deadline is not restarted per attempt).
+// The dial URL is the logical URI with userinfo stripped (item #7).
 func (r *runner) handshake(ctx context.Context, logical string, headers http.Header, preconn net.Conn, pongCh chan string) (*websocket.Conn, *http.Response, error) {
 	d := &websocket.Dialer{
-		HandshakeTimeout: openTimeout,
-		TLSClientConfig:  r.s.tlsCfg,
+		TLSClientConfig: r.s.tlsCfg,
 		NetDialContext: func(context.Context, string, string) (net.Conn, error) {
 			return preconn, nil
 		},
@@ -1312,20 +1374,35 @@ func (r *runner) sleepBackoff() bool {
 	}
 }
 
-// stop asks the runner to exit and waits for it. It unblocks an in-flight
-// write by forcing a write deadline so a peer that stopped reading cannot
-// stall shutdown; the socket stays open so serve can still perform its
-// graceful closing handshake (item #6), and serve force-closes it afterwards
-// (item #1).
+// stop asks the runner to exit and waits for it. It nudges an in-flight write
+// with a one-shot write deadline so the common case unblocks fast, but that
+// deadline is reversible (gorilla re-arms it at the start of the next frame
+// write), so a watchdog INDEPENDENT of the serve loop irreversibly aborts the
+// connection after closeTimeout even if writeFrames never returns (item #1).
+// The socket stays open long enough for serve to perform its graceful closing
+// handshake in the common case (item #6).
 func (r *runner) stop() {
 	r.stopOnce.Do(func() {
 		close(r.stopCh)
 		r.mu.Lock()
 		lc := r.conn
 		r.mu.Unlock()
-		if lc != nil && lc.raw != nil {
+		if lc == nil {
+			return
+		}
+		if lc.raw != nil {
 			_ = lc.raw.SetWriteDeadline(time.Now())
 		}
+		watchdog := closeTimeout // read on the caller's goroutine, see below
+		go func() {
+			timer := time.NewTimer(watchdog)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				lc.abort()
+			case <-r.doneCh:
+			}
+		}()
 	})
 	<-r.doneCh
 }

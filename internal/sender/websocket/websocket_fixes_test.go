@@ -168,15 +168,23 @@ type fakeSOCKS5 struct {
 	host  string
 	port  uint16
 	ready chan struct{}
+	delay time.Duration
 }
 
 func newFakeSOCKS5(t *testing.T) *fakeSOCKS5 {
+	t.Helper()
+	return newFakeSOCKS5WithDelay(t, 0)
+}
+
+// newFakeSOCKS5WithDelay stalls each accepted connection by delay before
+// negotiating, letting a test observe the preconnection budget.
+func newFakeSOCKS5WithDelay(t *testing.T, delay time.Duration) *fakeSOCKS5 {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeSOCKS5{ln: ln, ready: make(chan struct{})}
+	f := &fakeSOCKS5{ln: ln, ready: make(chan struct{}), delay: delay}
 	go f.serve()
 	t.Cleanup(func() { _ = ln.Close() })
 	return f
@@ -190,6 +198,9 @@ func (f *fakeSOCKS5) serve() {
 		return
 	}
 	defer func() { _ = conn.Close() }()
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
 	buf := make([]byte, 512)
 	// Greeting: VER, NMETHODS, METHODS.
 	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
@@ -731,10 +742,15 @@ func TestSelectEnvProxyUnaffectedByUppercaseLeak(t *testing.T) {
 // --- item #4: the proxy is re-resolved for every redirect target ---
 
 // fakeConnectProxy is a minimal HTTP CONNECT proxy recording tunnel targets.
+// When authUser is set it requires the matching Basic Proxy-Authorization and
+// answers 407 otherwise, recording every credential it saw (item #3).
 type fakeConnectProxy struct {
-	ln      net.Listener
-	mu      sync.Mutex
-	targets []string
+	ln       net.Listener
+	mu       sync.Mutex
+	targets  []string
+	authUser string
+	authPass string
+	authSeen []string
 }
 
 func newFakeConnectProxy(t *testing.T) *fakeConnectProxy {
@@ -750,6 +766,20 @@ func newFakeConnectProxy(t *testing.T) *fakeConnectProxy {
 }
 
 func (p *fakeConnectProxy) url() string { return "http://" + p.ln.Addr().String() }
+
+// withAuth makes the proxy require the given Basic credentials.
+func (p *fakeConnectProxy) withAuth(user, pass string) *fakeConnectProxy {
+	p.authUser, p.authPass = user, pass
+	return p
+}
+
+func (p *fakeConnectProxy) seenAuth() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, len(p.authSeen))
+	copy(out, p.authSeen)
+	return out
+}
 
 func (p *fakeConnectProxy) seen() []string {
 	p.mu.Lock()
@@ -777,9 +807,19 @@ func (p *fakeConnectProxy) handle(c net.Conn) {
 		return
 	}
 	target := req.Host
+	auth := req.Header.Get("Proxy-Authorization")
 	p.mu.Lock()
 	p.targets = append(p.targets, target)
+	p.authSeen = append(p.authSeen, auth)
 	p.mu.Unlock()
+	if p.authUser != "" {
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte(p.authUser+":"+p.authPass))
+		if auth != want {
+			_, _ = c.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n" +
+				"Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n"))
+			return
+		}
+	}
 	up, err := net.DialTimeout("tcp", target, 2*time.Second)
 	if err != nil {
 		_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
@@ -978,6 +1018,310 @@ func TestAbortPreventsWriteRearm(t *testing.T) {
 	_ = lc.ws.Close()
 }
 
+// --- item #1: an independent watchdog bounds shutdown even when stop()'s
+// one-shot write deadline has been cleared by a later gorilla frame write ---
+
+// noWriteDeadlineConn models the post-re-arm state: the underlying socket is
+// left WITHOUT a write deadline, so stop()'s one-shot SetWriteDeadline cannot
+// unblock an in-flight frame write. Only an independent watchdog can.
+type noWriteDeadlineConn struct{ net.Conn }
+
+func (noWriteDeadlineConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestStopWatchdogAbortsBlockedWrite drives the REAL shutdown path
+// (s.Close -> runner.stop -> serve) while serve is blocked inside writeFrames
+// on a peer that never reads and whose write deadline gorilla has cleared. The
+// one-shot deadline stop() sets is ineffective there, so only the watchdog can
+// abort the connection and let Close return.
+func TestStopWatchdogAbortsBlockedWrite(t *testing.T) {
+	withVar(t, &closeTimeout, 300*time.Millisecond)
+	srv := newStalledReadServer(t)
+	s := newTestSender(t, map[string]any{"websocket_uri": srv.url(), "compression": "none"})
+
+	r := newRunner(s)
+	r.dialFn = func() (*dialedConn, error) {
+		raw, err := net.Dial("tcp", srv.ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		wrapped := &noWriteDeadlineConn{Conn: raw}
+		d := &websocket.Dialer{
+			NetDialContext: func(context.Context, string, string) (net.Conn, error) {
+				return wrapped, nil
+			},
+		}
+		ws, _, err := d.DialContext(context.Background(), srv.url(), nil)
+		if err != nil {
+			_ = wrapped.Close()
+			return nil, err
+		}
+		return &dialedConn{ws: ws, raw: wrapped, pongCh: make(chan string, 16)}, nil
+	}
+	s.runnerMu.Lock()
+	s.runner = r
+	s.runnerMu.Unlock()
+	go r.run()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if lc := r.waitConn(waitCtx); lc == nil {
+		waitCancel()
+		t.Fatal("runner never connected")
+	}
+	waitCancel()
+
+	// A frame larger than the socket buffers; the peer never reads, so the
+	// gorilla frame write blocks with no effective deadline.
+	big := make([]byte, 8*1024*1024)
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- s.SendMessages(context.Background(), [][]byte{big}, "") }()
+	time.Sleep(300 * time.Millisecond) // let the frame write block
+
+	start := time.Now()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Fatalf("Close took %v with a deadline-cleared blocked write, want bounded", elapsed)
+	}
+	if elapsed < closeTimeout/2 {
+		t.Fatalf("Close returned in %v: the write was unblocked before the watchdog could act", elapsed)
+	}
+	select {
+	case <-sendDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked send did not return after Close")
+	}
+}
+
+// --- item #2: a proxy that withholds its CONNECT response cannot hang dial ---
+
+// newHijackHoldServer starts an HTTP(S) proxy that reads the CONNECT request
+// (via a hijacked handler) and then holds the socket open without ever
+// answering. Hijacked connections are not tracked by http.Server.Close, so the
+// stall never blocks test cleanup.
+func newHijackHoldServer(t *testing.T, useTLS bool) (string, *x509.Certificate) {
+	t.Helper()
+	hold := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		c, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		<-hold // withhold the CONNECT response until cleanup
+	})
+	var srv *httptest.Server
+	if useTLS {
+		srv = httptest.NewTLSServer(h)
+	} else {
+		srv = httptest.NewServer(h)
+	}
+	t.Cleanup(func() {
+		close(hold)
+		srv.Close()
+	})
+	return srv.Listener.Addr().String(), srv.Certificate()
+}
+
+func TestProxyConnectStalledHTTPIsBounded(t *testing.T) {
+	clearProxyEnv(t)
+	withVar(t, &openTimeout, 300*time.Millisecond)
+	addr, _ := newHijackHoldServer(t, false)
+	t.Setenv("http_proxy", "http://"+addr)
+
+	s := newTestSender(t, map[string]any{"websocket_uri": "ws://example.invalid:9999/pump", "compression": "none"})
+	r := newRunner(s)
+	start := time.Now()
+	if _, err := r.dial(); err == nil {
+		t.Fatal("dial through a stalled HTTP proxy succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("dial took %v with a stalled HTTP proxy, want bounded by the opening deadline", elapsed)
+	}
+}
+
+func TestProxyConnectStalledHTTPSIsBounded(t *testing.T) {
+	clearProxyEnv(t)
+	withVar(t, &openTimeout, 300*time.Millisecond)
+	addr, cert := newHijackHoldServer(t, true)
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	old := httpsProxyTLSConfig
+	httpsProxyTLSConfig = func() *tls.Config {
+		return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	t.Cleanup(func() { httpsProxyTLSConfig = old })
+	t.Setenv("https_proxy", "https://"+addr)
+
+	s := newTestSender(t, map[string]any{"websocket_uri": "wss://example.invalid:9999/pump", "compression": "none"})
+	r := newRunner(s)
+	start := time.Now()
+	if _, err := r.dial(); err == nil {
+		t.Fatal("dial through a stalled HTTPS proxy succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("dial took %v with a stalled HTTPS proxy, want bounded by the opening deadline", elapsed)
+	}
+}
+
+// TestProxyConnectStopCancelsStalled asserts the runner stop signal aborts a
+// tunnel exchange that is still waiting for the CONNECT response.
+func TestProxyConnectStopCancelsStalled(t *testing.T) {
+	clearProxyEnv(t)
+	addr, _ := newHijackHoldServer(t, false)
+	t.Setenv("http_proxy", "http://"+addr)
+
+	s := newTestSender(t, map[string]any{"websocket_uri": "ws://example.invalid:9999/pump", "compression": "none"})
+	r := newRunner(s)
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.dial()
+		done <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // let it reach ReadResponse
+	close(r.stopCh)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("dial succeeded after stop")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("dial did not return after stop: the stalled CONNECT read was not cancelled")
+	}
+}
+
+// --- item #3: CONNECT carries Basic Proxy-Authorization from the proxy URL ---
+
+func TestProxyConnectAuthenticated(t *testing.T) {
+	clearProxyEnv(t)
+	proxy := newFakeConnectProxy(t).withAuth("puser", "ppass")
+	target := newWebsocketTestServer(t)
+	t.Setenv("http_proxy", "http://puser:ppass@"+proxy.ln.Addr().String())
+
+	s := newTestSender(t, map[string]any{"websocket_uri": target.wsURL(), "compression": "none"})
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte("hello")}, ""); err != nil {
+		t.Fatalf("SendMessages through an authenticated proxy: %v", err)
+	}
+	select {
+	case <-target.gotOne:
+	case <-time.After(5 * time.Second):
+		t.Fatal("frame not received through the authenticated proxy")
+	}
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("puser:ppass"))
+	seen := proxy.seenAuth()
+	if len(seen) != 1 || seen[0] != want {
+		t.Fatalf("proxy saw Proxy-Authorization %v, want [%s]", seen, want)
+	}
+	// Credentials must not leak past the proxy on the tunneled handshake.
+	h := target.firstHeaders()
+	if got := h.Get("Proxy-Authorization"); got != "" {
+		t.Errorf("proxy credentials forwarded to the destination: %q", got)
+	}
+	if got := h.Get("Authorization"); got != "" {
+		t.Errorf("unexpected Authorization at the destination: %q", got)
+	}
+}
+
+// --- item #4: phase separation of the ordinary vs explicit-SOCKS paths ---
+
+// TestDialOrdinarySharedOpeningDeadline asserts ONE opening deadline covers
+// establishment AND the whole redirect sequence: a chain of slow redirects
+// followed by a stalled opening fails within openTimeout, not once per hop.
+func TestDialOrdinarySharedOpeningDeadline(t *testing.T) {
+	clearProxyEnv(t)
+	withVar(t, &openTimeout, time.Second)
+
+	stallURL := "ws://" + newStalledOpenServer(t) + "/pump"
+	hop := func(next string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(150 * time.Millisecond)
+			http.Redirect(w, r, next, http.StatusTemporaryRedirect)
+		}))
+	}
+	last := hop(stallURL)
+	defer last.Close()
+	next := "ws" + strings.TrimPrefix(last.URL, "http") + "/pump"
+	for i := 0; i < 3; i++ {
+		s := hop(next)
+		defer s.Close()
+		next = "ws" + strings.TrimPrefix(s.URL, "http") + "/pump"
+	}
+
+	s := newTestSender(t, map[string]any{"websocket_uri": next, "compression": "none"})
+	r := newRunner(s)
+	start := time.Now()
+	if _, err := r.dial(); err == nil {
+		t.Fatal("dial to a stalled opening succeeded")
+	}
+	elapsed := time.Since(start)
+	// One shared deadline: ~openTimeout. A per-redirect restart would add the
+	// ~600 ms of hop delays on top and exceed this bound.
+	if elapsed > 1300*time.Millisecond {
+		t.Fatalf("dial took %v, want a single opening deadline (~%s) across redirects", elapsed, openTimeout)
+	}
+}
+
+// TestExplicitSocksPreconnectUsesOuterBudget asserts the explicit socks5_proxy
+// preconnection sits under the OUTER connectTimeout, not openTimeout: the
+// proxy stalls past openTimeout but within connectTimeout and still connects.
+func TestExplicitSocksPreconnectUsesOuterBudget(t *testing.T) {
+	clearProxyEnv(t)
+	withVar(t, &openTimeout, 150*time.Millisecond)
+	withVar(t, &connectTimeout, 3*time.Second)
+	f := newFakeSOCKS5WithDelay(t, 500*time.Millisecond)
+
+	s := newTestSender(t, map[string]any{
+		"websocket_uri": "ws://example.invalid:9999/pump",
+		"socks5_proxy":  "socks5://" + f.addr(),
+		"compression":   "none",
+	})
+	r := newRunner(s)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	conn, err := r.preconnect(ctx, s.cfg.uri)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("preconnect through explicit SOCKS: %v", err)
+	}
+	_ = conn.Close()
+	if elapsed < 500*time.Millisecond {
+		t.Fatalf("preconnect returned in %v, before the proxy delay", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("preconnect took %v, want within the outer budget", elapsed)
+	}
+}
+
+// --- item #5: a padded no_proxy wildcard is not the whole value ---
+
+func TestNoProxyPaddedWildcardDoesNotBypass(t *testing.T) {
+	clearProxyEnv(t)
+	proxy := newFakeConnectProxy(t)
+	target := newWebsocketTestServer(t)
+	t.Setenv("http_proxy", proxy.url())
+	t.Setenv("no_proxy", " * ") // urllib compares the COMPLETE value to "*", no trimming
+
+	s := newTestSender(t, map[string]any{"websocket_uri": target.wsURL(), "compression": "none"})
+	if err := s.SendMessages(context.Background(), [][]byte{[]byte("hello")}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+	select {
+	case <-target.gotOne:
+	case <-time.After(5 * time.Second):
+		t.Fatal("frame not received")
+	}
+	seen := proxy.seen()
+	if len(seen) != 1 || seen[0] != hostPortOf(t, target.srv.URL) {
+		t.Fatalf("proxy tunnels = %v, want [%s]: a padded wildcard must not bypass", seen, hostPortOf(t, target.srv.URL))
+	}
+}
+
 // --- helpers ---
 
 // newStalledReadServer is a minimal raw-TCP websocket endpoint that completes
@@ -1054,4 +1398,38 @@ func (s *stalledReadServer) handshake(c net.Conn) {
 
 func (s *stalledReadServer) url() string {
 	return "ws://" + s.ln.Addr().String() + "/pump"
+}
+
+// newStalledOpenServer accepts TCP connections and never responds, so the
+// websocket opening handshake blocks until its context deadline.
+func newStalledOpenServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu   sync.Mutex
+		cons []net.Conn
+	)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			cons = append(cons, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, c := range cons {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	})
+	return ln.Addr().String()
 }
