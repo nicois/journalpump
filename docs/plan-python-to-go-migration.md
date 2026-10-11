@@ -642,6 +642,34 @@ B only because rollover/mapping assertions exceed what official Elastic
 tooling covers; fakes assert wire bytes; update parity checklist.
 Depends on: Tasks 13, 11.
 
+#### Shared HTTP helper (coordinator decision 2026-10-11)
+The raw-HTTP senders — logplex (Task 21), elasticsearch/opensearch
+(Task 23) and Google Cloud Logging (Task 26) — share ONE internal HTTP
+client helper instead of each carrying its own client code.
+- **Why**: logplex and ES landed with independent HTTP plumbing and
+  diverged on proxy selection — logplex hand-ports `requests`' proxy
+  semantics, ES uses Go's default `http.ProxyFromEnvironment`. That is an
+  operator-visible difference in proxy routing, not a cosmetic one, so it
+  is fixed by sharing rather than by a third copy at Task 26.
+- **Shape**: the helper owns the common plumbing — `http.Client`
+  construction (TLS/`verify` options, transport), per-request context
+  deadline and cancellation, and retry hooks the sender's `retriable`
+  classifier plugs into. **Proxy SELECTION is a per-sender parameter**,
+  not a helper default: each sender passes the proxy policy that matches
+  its Python HTTP client — `requests` semantics for logplex (incl. its
+  env-var and `no_proxy` handling), the SAME `requests` semantics for ES
+  (verified: ES goes through `journalpump.util.get_requests_session` →
+  `requests.Session`, NOT elasticsearch-py/urllib3), and the google-auth
+  transport's behaviour for GCL at Task 26. A quirk-lock test per sender
+  pins its proxy choice against a proxy-env fixture.
+- **When**: lands as part of CLOSING Task 23 — one builder dispatch
+  extracts the helper and refactors logplex + elasticsearch onto it with
+  no wire-byte change (the Task 11 logplex/ES fixtures and existing
+  httptest suites are the regression gate; the parity doc records the
+  ES proxy-selection fix as a bug fix toward Python, not a deviation).
+  Task 26 then builds on the helper rather than on a fresh client. No
+  task renumbering; cross-review of the refactor diff as usual.
+
 ### Task 24. Websocket sender
 Files: `internal/sender/websocket/`. Single goroutine replacing the
 asyncio-in-thread design; app-level snappy (github.com/golang/snappy) +
@@ -680,7 +708,9 @@ checklist.
 Depends on: Task 13.
 
 ### Task 26. Google Cloud Logging sender
-Files: `internal/sender/gcl/` (logging/v2 with injectable HTTP transport).
+Files: `internal/sender/gcl/` (logging/v2 with injectable HTTP transport;
+the transport is built on the shared HTTP helper from Task 23's closing
+block, with GCL's own proxy-selection parameter).
 Quota logic (250 KiB / 200 KiB truncation, replacement entries), severity
 map, timestamp 26-char+Z, MESSAGE JSON-parse→jsonPayload, `generic_node`,
 logName, optimistic reconnect.
@@ -688,7 +718,7 @@ Tests: official Google Cloud Logging fakes first (thread B), httptest
 against the injected transport where they fall short, porting
 `test/test_google_cloud_logging.py` cases (dummy SA key fixture reused
 from `test/data.py`); update parity checklist.
-Depends on: Task 13.
+Depends on: Task 13, Task 23 (shared HTTP helper).
 
 ## Phase 5 — Packaging, docs, cutover
 
@@ -796,7 +826,9 @@ Depends on: Task 18.
 - 19→20→21 (Phase 2; 21 also needs 11). **Milestone B** after 20:
   journal→rsyslogd byte parity.
 - 22 (needs 12, 13, 14; sub-steps a→f in order, 2026-10-11 client
-  revision) / 23 (needs 11) / 24 (needs 11) parallelizable.
-- 25/26 (Phase 4, parallelizable, need 13).
+  revision) / 23 (needs 11) / 24 (needs 11) parallelizable. Task 23
+  closes with the shared HTTP helper extraction (logplex + ES refactor).
+- 25/26 (Phase 4, parallelizable, need 13; 26 also needs the Task 23
+  shared HTTP helper).
 - 27→28→29→30 (Phase 5). **Milestone C** after 30: installable
   golang-marked packages + full CI parity.
