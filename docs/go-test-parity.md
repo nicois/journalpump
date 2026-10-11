@@ -2373,7 +2373,7 @@ Wire and config:
 - Connection-error logging is deduped by error class (Python compares
   `ex.__class__`): `TestLoadErrorDedupLogging`.
 
-HTTP client (parity, 2026-10-11 review rounds — no §2 deviation remains):
+HTTP client (parity, 2026-10-11/12 review rounds; one sanctioned §2 deviation — the default trust set):
 
 - Timeout: requests' per-request INACTIVITY timeout applied at each REQUEST
   boundary and to the correct PHASE (`httpx.InactivityClient`; the deadline
@@ -2409,29 +2409,25 @@ HTTP client (parity, 2026-10-11 review rounds — no §2 deviation remains):
   over `session.verify` whenever non-empty — even when `ca` is `false`,
   empty, or an explicit path — because the ES sender passes NO per-request
   verify. Otherwise `ca` applies: absent/true → system roots, empty/`false`
-  → verification DISABLED, a path → CA FILE or DIRECTORY. A DIRECTORY is an
-  OpenSSL capath, so only HASHED entries (`<hash>.n`) contribute trust, in
-  line with OpenSSL (an un-hashed `*.pem` is IGNORED, not silently trusted)
-  (`TestHTTPClientCAResolution`: env-overrides-false/empty/explicit,
-  hashed directory trusted, un-hashed sibling cert NOT trusted, missing path
-  and certificate-less directory rejected; HTTPS via generated self-signed
-  certs).
-- Default trust store: NOT a divergence for the supported deployment. The
-  RPM `python3-requests` pulls RPM `python3-certifi`, whose `certifi.where()`
-  is `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`; Go's
-  `x509.SystemCertPool` reads the same OS bundle (via
-  `/etc/pki/tls/certs/ca-bundle.crt`, a symlink to it), so Python and Go
-  trust the SAME CAs. The bundled Mozilla certifi set would differ only for
-  a non-RPM (pip) install, which is not the supported deployment.
-- OPEN, escalated to the USER (round 3 items 3/4 — NOT implemented pending the
-  ruling): (a) CA-DIRECTORY SUBJECT-HASH semantics — the Go port currently
-  loads every OpenSSL-hashed entry (`<hash>.n`) into one pool, whereas OpenSSL
-  capath looks up `<hash>.n` by the SUBJECT hash of the chain being verified;
-  whether to reproduce that per-subject bucketing (or accept the broader
-  hashed set) is an operator-visible decision. (b) DEFAULT TRUST-SET BREADTH —
-  whether the default (no `ca`, no `*_CA_BUNDLE`) trust sources should be
-  restricted to match certifi's file exactly rather than the full
-  `x509.SystemCertPool`. Do NOT change either until the user rules.
+  → verification DISABLED, a path → CA FILE. A CA DIRECTORY is REFUSED at
+  load (fail closed, user decision 2026-10-12): OpenSSL capath selects
+  entries by the SUBJECT HASH of the chain being verified, and reproducing
+  that faithfully is not cheap, so the config errors clearly rather than
+  silently trusting every hashed-looking file (which would broaden trust
+  beyond OpenSSL). `TestHTTPClientCAResolution`: env-overrides-false/empty/
+  explicit, a bundle file trusted, a CA directory rejected (including via
+  `REQUESTS_CA_BUNDLE`), missing path rejected; HTTPS via generated
+  self-signed certs.
+- SANCTIONED §2 deviation (user decision 2026-10-12) — DEFAULT TRUST SET:
+  with `ca` absent/true and no `*_CA_BUNDLE`, Go uses `x509.SystemCertPool`,
+  which loads certificate DIRECTORIES and honors `SSL_CERT_FILE`/`SSL_CERT_DIR`;
+  requests instead uses certifi's single bundle. In the reference RPM
+  deployment both resolve to the same CA file (RPM `python3-certifi`'s
+  `certifi.where()` is `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
+  which Go's system pool also reads via `/etc/pki/tls/certs/ca-bundle.crt`, a
+  symlink to it), so the trust sets AGREE there; but for other deployments
+  (deb, pip) the effective sets can differ. The user approved keeping Go's
+  system-store behavior and documenting this rather than restricting it.
 - `stats.unexpected_exception` is reproduced for the connect
   (`es_pump_init_es_client`), create (`es_pump_create_index_and_mappings`)
   and delete (`es_pump_check_indices`) paths, via the pump statsd client
