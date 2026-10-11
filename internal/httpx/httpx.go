@@ -19,12 +19,15 @@
 //     elasticsearch-py/urllib3). GCL, whose Python client is
 //     google-cloud-logging, will be parameterized separately.
 //   - request timing: Do applies an optional per-request context
-//     deadline/cancellation, and IdleTimeoutDialer gives a connection
-//     requests' INACTIVITY-timeout semantics (the deadline resets on
-//     every read/write). Senders whose Python client uses requests'
-//     socket timeout (logplex, elasticsearch/opensearch) use the
-//     inactivity dialer so a slow-but-progressing response is not
-//     aborted the way a total deadline would abort it.
+//     deadline/cancellation, and the requests-compatible senders use an
+//     INACTIVITY timeout (the deadline resets on every read/write).
+//     InactivityClient applies that timeout per REQUEST, so a reused
+//     keep-alive connection carries the timeout of the request currently in
+//     flight rather than the one that dialed it; IdleTimeoutDialer is the
+//     fixed-dial variant for a sender with a constant session timeout
+//     (logplex). Senders whose Python client uses requests' socket timeout
+//     use one of these so a slow-but-progressing response is not aborted
+//     the way a total deadline would abort it.
 //
 // It deliberately provides NO retry hook: retries are owned by the shared
 // sender.Loop (a failed SendMessages retains the batch and retries after
@@ -43,6 +46,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,16 +92,17 @@ func NewClient(opts ClientOptions) *http.Client {
 }
 
 // timeoutKey carries a per-request inactivity timeout through the request
-// context to the dialer installed by IdleTimeoutDialer (net/http passes the
-// request context to Transport.DialContext).
+// context to the dialer installed by IdleTimeoutDialer and to
+// InactivityClient.Do (net/http passes the request context to
+// Transport.DialContext, and httpx.Do builds the request with this context).
 type timeoutKey struct{}
 
 // WithRequestTimeout records the per-request inactivity timeout for the
-// dialer built by IdleTimeoutDialer. requests applies its timeout per
-// request; net/http resolves the dial once per connection, so the value
-// present when a connection is dialed fixes that connection's inactivity
-// timeout. A non-positive timeout leaves the context unchanged (the dialer's
-// fallback applies).
+// client built by InactivityClient (per request, including reused
+// connections) or, for the fixed-dial IdleTimeoutDialer, the value present
+// when a connection is dialed. A non-positive timeout leaves the context
+// unchanged (InactivityClient keeps the previous value; the dialer's fallback
+// applies).
 func WithRequestTimeout(ctx context.Context, timeout time.Duration) context.Context {
 	if timeout <= 0 {
 		return ctx
@@ -142,6 +148,103 @@ func IdleTimeoutDialer(fallback time.Duration) func(ctx context.Context, network
 		}
 		return &IdleTimeoutConn{Conn: conn, idle: idle}, nil
 	}
+}
+
+// InactivityClient wraps an *http.Client so requests' per-request INACTIVITY
+// timeout is applied at each REQUEST boundary, not once at connection-dial
+// time. net/http resolves a transport's DialContext once per connection and
+// keeps a background readLoop blocked on pooled connections, so a
+// dial-baked deadline leaks across requests: a bulk POST reusing the
+// version/alias connection would inherit the ordinary timeout (and a later
+// ordinary request the bulk timeout), and a pooled read would measure
+// inactivity from before the next request.
+//
+// The timeout for the request in flight is carried on its context
+// (WithRequestTimeout). Do copies it to a shared value every wrapped
+// connection consults before each read/write, and re-arms any pooled
+// connection's pending background read, so a reused connection uses the
+// CURRENT request's timeout. Requests must be issued sequentially (the
+// sender.Loop contract): concurrent requests would share one deadline.
+type InactivityClient struct {
+	client *http.Client
+	idle   atomic.Int64
+	// conns tracks live wrapped connections so Do can re-arm a pooled
+	// connection's pending background read to the current request's timeout.
+	conns sync.Map // *dynamicIdleConn -> struct{}
+}
+
+// NewInactivityClient builds an InactivityClient with the given transport
+// options, mirroring NewClient (idle pooled connections are bounded at 90 s).
+func NewInactivityClient(opts ClientOptions) *InactivityClient {
+	c := &InactivityClient{}
+	c.client = &http.Client{Transport: &http.Transport{
+		Proxy:           opts.Proxy,
+		TLSClientConfig: opts.TLSClientConfig,
+		IdleConnTimeout: 90 * time.Second,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var idle time.Duration
+			if v, ok := ctx.Value(timeoutKey{}).(time.Duration); ok && v > 0 {
+				idle = v
+			}
+			dialer := &net.Dialer{Timeout: idle}
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			wrapped := &dynamicIdleConn{Conn: conn, idle: &c.idle, owner: c}
+			c.conns.Store(wrapped, struct{}{})
+			return wrapped, nil
+		},
+	}}
+	return c
+}
+
+// Client returns the wrapped *http.Client (for transport inspection in tests).
+func (c *InactivityClient) Client() *http.Client { return c.client }
+
+// Do applies the request's inactivity timeout, then delegates to the wrapped
+// client.
+func (c *InactivityClient) Do(req *http.Request) (*http.Response, error) {
+	if v, ok := req.Context().Value(timeoutKey{}).(time.Duration); ok && v > 0 {
+		c.idle.Store(int64(v))
+		deadline := time.Now().Add(v)
+		c.conns.Range(func(k, _ any) bool {
+			_ = k.(*dynamicIdleConn).SetReadDeadline(deadline)
+			return true
+		})
+	}
+	return c.client.Do(req)
+}
+
+// CloseIdleConnections releases pooled connections (see Sender.Close).
+func (c *InactivityClient) CloseIdleConnections() { c.client.CloseIdleConnections() }
+
+// dynamicIdleConn applies an inactivity deadline that is re-read from the
+// client's shared value before every operation, so a reused connection uses
+// the current request's timeout.
+type dynamicIdleConn struct {
+	net.Conn
+	idle  *atomic.Int64
+	owner *InactivityClient
+}
+
+func (c *dynamicIdleConn) Read(b []byte) (int, error) {
+	if d := time.Duration(c.idle.Load()); d > 0 {
+		_ = c.SetReadDeadline(time.Now().Add(d))
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *dynamicIdleConn) Write(b []byte) (int, error) {
+	if d := time.Duration(c.idle.Load()); d > 0 {
+		_ = c.SetWriteDeadline(time.Now().Add(d))
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *dynamicIdleConn) Close() error {
+	c.owner.conns.Delete(c)
+	return c.Conn.Close()
 }
 
 // Do runs one HTTP request under a per-request deadline (when timeout >

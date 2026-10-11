@@ -22,12 +22,16 @@
 // <prefix>-YYYY-MM-DD indices while more than index_days_max exist.
 //
 // The HTTP client is requests-faithful: the timeout is an INACTIVITY
-// timeout (httpx.IdleTimeoutDialer), the CA resolution mirrors
-// session.verify (a bundle FILE or DIRECTORY, an empty string disables
-// verification, REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE are honored), and the
-// stats.unexpected_exception emissions of the connect/create/delete paths
-// are reproduced. The sender implements io.Closer so the daemon's retire
-// path releases its idle keep-alive connections.
+// timeout applied PER REQUEST, including on reused keep-alive connections
+// (httpx.InactivityClient), so the bulk POST's 2× timeout never leaks onto a
+// reused ordinary connection and vice versa. The CA resolution mirrors
+// requests' merge_environment_settings + merge_setting precedence
+// (REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE WIN over session.verify, even when ca is
+// false, empty, or an explicit path; a directory is an OpenSSL capath, so
+// only hashed entries are trusted; an empty/false ca disables verification),
+// and the stats.unexpected_exception emissions of the connect/create/delete
+// paths are reproduced. The sender implements io.Closer so the daemon's
+// retire path releases its idle keep-alive connections.
 package elasticsearch
 
 import (
@@ -42,6 +46,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -152,19 +157,18 @@ func configFrom(raw map[string]any, st senderType) (config, error) {
 		if !ok {
 			return config{}, fmt.Errorf("%s_timeout: %v is not a number", st, v)
 		}
-		// requests substitutes the session default whenever a per-request
-		// timeout is FALSY, so a ZERO timeout means the 60 s default, not "no
-		// timeout". A negative value is truthy and is passed to requests, which
-		// raises "the timeout cannot be set to a value less than or equal to 0";
-		// reject it at load instead of leaving the deadline unlimited.
-		switch {
-		case seconds < 0:
-			return config{}, fmt.Errorf("%s_timeout: %v cannot be set to a value less than 0", st, seconds)
-		case seconds == 0:
-			cfg.requestTimeout = defaultRequestTimeout
-		default:
-			cfg.requestTimeout = time.Duration(seconds * float64(time.Second))
+		// get_requests_session(timeout=X) installs a TimeoutAdapter whose
+		// fallback IS X; the ES sender never passes a per-request timeout for
+		// the version/alias/PUT requests, so the adapter substitutes X and
+		// requests REJECTS a non-positive value ("the timeout cannot be set to
+		// a value less than or equal to 0"). This differs from logplex, whose
+		// session default is a real 60 s. Reject zero and negative at load
+		// (strict-at-load) instead of silently substituting 60 s or leaving
+		// the deadline unlimited.
+		if seconds <= 0 {
+			return config{}, fmt.Errorf("%s_timeout: %v cannot be set to a value less than or equal to 0", st, seconds)
 		}
+		cfg.requestTimeout = time.Duration(seconds * float64(time.Second))
 	}
 	if v, present := raw[string(st)+"_index_prefix"]; present {
 		s, ok := v.(string)
@@ -299,7 +303,7 @@ func newSender(args sender.ConstructorArgs, st senderType) (sender.Instance, err
 		}
 		interval = time.Duration(seconds * float64(time.Second))
 	}
-	client, err := newHTTPClient(cfg.ca, cfg.requestTimeout)
+	client, err := newHTTPClient(cfg.ca)
 	if err != nil {
 		return sender.Instance{}, err
 	}
@@ -334,13 +338,15 @@ type discardLogger struct{}
 func (discardLogger) Printf(string, ...any) {}
 
 // newHTTPClient builds the shared httpx client for the configured `ca`
-// value (Python session.verify = config.get("ca", True)). Proxy selection is
-// the requests-compatible strategy, because the Python ES/OpenSearch sender
-// talks to the server through requests
-// (journalpump.util.get_requests_session), not elasticsearch-py/urllib3.
-// The dial hook is requests' inactivity timeout, so a slow-but-progressing
-// response is not aborted by a total deadline.
-func newHTTPClient(ca any, requestTimeout time.Duration) (*http.Client, error) {
+// value (Python session.verify = config.get("ca", True), with requests'
+// environment-bundle precedence). Proxy selection is the requests-compatible
+// strategy, because the Python ES/OpenSearch sender talks to the server
+// through requests (journalpump.util.get_requests_session), not
+// elasticsearch-py/urllib3. The client is an InactivityClient, which applies
+// the per-request inactivity timeout (WithRequestTimeout in do) at each
+// request boundary, so a slow-but-progressing response is not aborted and a
+// reused connection uses the current request's timeout.
+func newHTTPClient(ca any) (*httpx.InactivityClient, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	bundle, insecure, err := resolveVerify(ca)
 	if err != nil {
@@ -355,29 +361,38 @@ func newHTTPClient(ca any, requestTimeout time.Duration) (*http.Client, error) {
 		}
 		tlsCfg.RootCAs = pool
 	}
-	return httpx.NewClient(httpx.ClientOptions{
+	return httpx.NewInactivityClient(httpx.ClientOptions{
 		Proxy:           httpx.RequestsProxy,
 		TLSClientConfig: tlsCfg,
-		DialContext:     httpx.IdleTimeoutDialer(requestTimeout),
 	}), nil
 }
 
 // resolveVerify maps Python's session.verify to a CA bundle path and an
-// insecure flag, requests-compatibly:
+// insecure flag, reproducing requests' merge_environment_settings +
+// merge_setting precedence. The ES sender sets Session.verify and passes NO
+// per-request verify, so the per-request verify reaching
+// merge_environment_settings is None — which makes requests consult
+// REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE, and the resulting non-empty string
+// then WINS over Session.verify in merge_setting. Therefore the environment
+// bundle takes precedence even when `ca` is false, empty, or an explicit
+// path:
 //
-//   - absent / true  → the CA bundle named by REQUESTS_CA_BUNDLE, else
-//     CURL_CA_BUNDLE, else the system roots (empty path);
-//   - false          → verification DISABLED;
-//   - "" (empty)     → verification DISABLED (requests treats a falsy verify
-//     as no verification);
-//   - another string → a CA bundle FILE, or a DIRECTORY of PEM files.
+//   - REQUESTS_CA_BUNDLE, else CURL_CA_BUNDLE, when non-empty → that bundle
+//     (FILE or DIRECTORY), regardless of `ca`;
+//   - otherwise `ca` is used: absent / true → the system roots (empty path);
+//     false → verification DISABLED; "" → DISABLED (requests treats a falsy
+//     verify as no verification); another string → a CA bundle FILE, or a
+//     DIRECTORY of OpenSSL-hashed PEM entries.
 func resolveVerify(ca any) (bundle string, insecure bool, err error) {
+	if env := caBundleFromEnv(); env != "" {
+		return env, false, nil
+	}
 	switch v := ca.(type) {
 	case nil:
-		return caBundleFromEnv(), false, nil
+		return "", false, nil
 	case bool:
 		if v {
-			return caBundleFromEnv(), false, nil
+			return "", false, nil
 		}
 		return "", true, nil
 	case string:
@@ -400,9 +415,19 @@ func caBundleFromEnv() string {
 	return os.Getenv("CURL_CA_BUNDLE")
 }
 
-// loadCertPool builds a cert pool from a CA bundle path: a single PEM file,
-// or a directory whose (regular) files are read as PEM bundles (urllib3
-// accepts an OpenSSL CA directory).
+// hashedCAPathEntry matches an OpenSSL HASHED CA-directory file name
+// (c_rehash output): eight hex digits forming the subject hash, a dot, and a
+// numeric suffix (e.g. "9d66eef0.0"). OpenSSL's capath loads ONLY such
+// entries (it looks up <hash>.n by the subject of the chain being verified),
+// so a directory of ordinary "*.pem" files contributes NO trust there.
+var hashedCAPathEntry = regexp.MustCompile(`^[0-9a-fA-F]{8}\.[0-9]+$`)
+
+// loadCertPool builds a cert pool from a CA bundle path: a single PEM FILE,
+// or a DIRECTORY used as an OpenSSL capath. For a directory only
+// OpenSSL-HASHED entries (see hashedCAPathEntry) are read — requests passes a
+// directory verify through as ca_cert_dir, and OpenSSL then selects hashed
+// entries, so reading every PEM would broaden trust beyond requests
+// (e.g. accepting an un-hashed server.pem OpenSSL would never load).
 func loadCertPool(path string) (*x509.CertPool, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -416,7 +441,7 @@ func loadCertPool(path string) (*x509.CertPool, error) {
 			return nil, fmt.Errorf("ca: %w", err)
 		}
 		for _, entry := range entries {
-			if entry.IsDir() {
+			if entry.IsDir() || !hashedCAPathEntry.MatchString(entry.Name()) {
 				continue
 			}
 			pem, err := os.ReadFile(filepath.Join(path, entry.Name()))
@@ -792,10 +817,11 @@ func (s *Sender) deleteIndex(ctx context.Context, indexName string) error {
 }
 
 // do runs one HTTP request and returns the status and the fully-read body.
-// The timeout is requests' INACTIVITY timeout (carried to the dial hook via
-// WithRequestTimeout), not a total deadline, so a slow-but-progressing
-// response is not aborted. httpx.Do is called with a zero deadline: the
-// idle-timeout connection governs the request.
+// The timeout is requests' INACTIVITY timeout, applied to the request in
+// flight by the InactivityClient (carried via WithRequestTimeout), not a
+// total deadline, so a slow-but-progressing response is not aborted.
+// httpx.Do is called with a zero deadline: the per-request inactivity
+// timeout governs the request.
 func (s *Sender) do(ctx context.Context, method, url string, body []byte, headers map[string]string, timeout time.Duration) (int, []byte, error) {
 	return httpx.Do(httpx.WithRequestTimeout(ctx, timeout), s.client, method, url, body, headers, 0)
 }

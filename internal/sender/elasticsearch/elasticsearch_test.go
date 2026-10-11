@@ -8,12 +8,18 @@ package elasticsearch
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Aiven-Open/journalpump/internal/httpx"
 	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
@@ -659,13 +666,13 @@ func TestMaintenanceDeletesOldestIndices(t *testing.T) {
 // is journalpump.util.get_requests_session → requests), not Go's
 // http.ProxyFromEnvironment.
 func TestHTTPClientUsesRequestsProxySemantics(t *testing.T) {
-	client, err := newHTTPClient(nil, defaultRequestTimeout)
+	client, err := newHTTPClient(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, ok := client.Transport.(*http.Transport)
+	tr, ok := client.Client().Transport.(*http.Transport)
 	if !ok || tr.Proxy == nil {
-		t.Fatalf("transport.Proxy not installed: %T", client.Transport)
+		t.Fatalf("transport.Proxy not installed: %T", client.Client().Transport)
 	}
 	t.Setenv("http_proxy", "http://proxy.example:8080")
 	t.Setenv("no_proxy", "")
@@ -765,41 +772,46 @@ func TestFixtureStructuralParity(t *testing.T) {
 	}
 }
 
-// --- response timeout parity (review item 1) -------------------------------
+// --- response timeout parity (review items 1) -------------------------------
 
-func TestTimeoutZeroFallsBackAndNegativeRejected(t *testing.T) {
+// TestZeroAndNegativeTimeoutRejected pins that ES/OpenSearch REJECT a
+// non-positive timeout at load. Unlike logplex (a real 60 s session default),
+// get_requests_session(timeout=X) installs a TimeoutAdapter whose fallback IS
+// X, and requests rejects a non-positive connect timeout — so zero must NOT
+// silently become 60 s. Both the config loader and the constructors reject it.
+func TestZeroAndNegativeTimeoutRejected(t *testing.T) {
 	for _, st := range []senderType{elasticsearch, opensearch} {
-		zero, err := configFrom(map[string]any{
+		for _, bad := range []any{0, -1, -1.5} {
+			_, err := configFrom(map[string]any{
+				string(st) + "_url":     "http://aaa",
+				string(st) + "_timeout": bad,
+			}, st)
+			if err == nil || !strings.Contains(err.Error(), "less than or equal to 0") {
+				t.Errorf("%s: timeout %v err = %v, want a load-time rejection", st, bad, err)
+			}
+
+			args := sender.ConstructorArgs{Config: map[string]any{
+				string(st) + "_url":     "http://aaa",
+				string(st) + "_timeout": bad,
+			}}
+			var cerr error
+			if st == elasticsearch {
+				_, cerr = NewElasticsearch(args)
+			} else {
+				_, cerr = NewOpenSearch(args)
+			}
+			if cerr == nil {
+				t.Errorf("%s: constructor accepted timeout %v", st, bad)
+			}
+		}
+
+		// A positive value is still accepted and kept.
+		ok, err := configFrom(map[string]any{
 			string(st) + "_url":     "http://aaa",
-			string(st) + "_timeout": 0,
+			string(st) + "_timeout": 0.5,
 		}, st)
-		if err != nil {
-			t.Fatalf("%s: zero timeout: %v", st, err)
-		}
-		if zero.requestTimeout != defaultRequestTimeout {
-			t.Errorf("%s: zero timeout = %v, want the 60s default", st, zero.requestTimeout)
-		}
-
-		if _, err := configFrom(map[string]any{
-			string(st) + "_url":     "http://aaa",
-			string(st) + "_timeout": -1,
-		}, st); err == nil || !strings.Contains(err.Error(), "less than 0") {
-			t.Errorf("%s: negative timeout err = %v, want a load-time rejection", st, err)
-		}
-
-		// The constructors reject it too (both output types).
-		args := sender.ConstructorArgs{Config: map[string]any{
-			string(st) + "_url":     "http://aaa",
-			string(st) + "_timeout": -1,
-		}}
-		var cerr error
-		if st == elasticsearch {
-			_, cerr = NewElasticsearch(args)
-		} else {
-			_, cerr = NewOpenSearch(args)
-		}
-		if cerr == nil {
-			t.Errorf("%s: constructor accepted a negative timeout", st)
+		if err != nil || ok.requestTimeout != 500*time.Millisecond {
+			t.Errorf("%s: positive timeout = %v, %v", st, ok.requestTimeout, err)
 		}
 	}
 }
@@ -863,7 +875,7 @@ func TestLoopContinuesAfterNegativeDaysMaxMaintenance(t *testing.T) {
 	}
 }
 
-// --- CA resolution (review item 3) -----------------------------------------
+// --- CA resolution (review items 3 and 4) ----------------------------------
 
 func writeCertPEM(t *testing.T, dir, name string, cert *x509.Certificate) string {
 	t.Helper()
@@ -875,9 +887,9 @@ func writeCertPEM(t *testing.T, dir, name string, cert *x509.Certificate) string
 	return path
 }
 
-func clientGets(t *testing.T, client *http.Client, url string) error {
+func clientGets(t *testing.T, client *httpx.InactivityClient, url string) error {
 	t.Helper()
-	resp, err := client.Get(url)
+	resp, err := client.Client().Get(url)
 	if err != nil {
 		return err
 	}
@@ -886,28 +898,76 @@ func clientGets(t *testing.T, client *http.Client, url string) error {
 	return nil
 }
 
-func TestHTTPClientCAResolution(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+// newTLSServerWithCert starts a TLS test server using a freshly generated
+// self-signed certificate (httptest's default cert is a shared hardcoded one,
+// so two httptest servers would present identical certs) and returns the
+// server and its leaf certificate.
+func newTLSServerWithCert(t *testing.T) (*httptest.Server, *x509.Certificate) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		DNSNames:              []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok")
 	}))
-	defer srv.Close()
-	cert := srv.Certificate()
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv, leaf
+}
+
+// TestHTTPClientCAResolution covers requests' merge_environment_settings +
+// merge_setting precedence (the env bundle WINS over session.verify) and
+// OpenSSL capath hashed-directory selection.
+func TestHTTPClientCAResolution(t *testing.T) {
+	srv, cert := newTLSServerWithCert(t)
 	dir := t.TempDir()
 	certFile := writeCertPEM(t, dir, "ca.pem", cert)
-	certDir := t.TempDir()
-	writeCertPEM(t, certDir, "server.pem", cert)
+	// A capath directory: OpenSSL loads ONLY hashed entries (<hash>.n).
+	hashedDir := t.TempDir()
+	writeCertPEM(t, hashedDir, "9d66eef0.0", cert)
 
+	// With no environment override, these verify against the TLS server.
 	for _, tc := range []struct {
 		name string
 		ca   any
 		env  map[string]string
 	}{
-		{"ca-false-disables", false, nil},
-		{"empty-string-disables", "", nil},
 		{"ca-file", certFile, nil},
-		{"ca-directory", certDir, nil},
+		{"ca-hashed-directory", hashedDir, nil},
 		{"requests-ca-bundle-env", true, map[string]string{"REQUESTS_CA_BUNDLE": certFile}},
 		{"curl-ca-bundle-env", true, map[string]string{"CURL_CA_BUNDLE": certFile}},
+		// The env bundle WINS over session.verify, even when ca is false, "" or
+		// an explicit (wrong) path — requests consults the env because the
+		// per-request verify is None, then merge_setting keeps the env string.
+		{"env-overrides-false", false, map[string]string{"REQUESTS_CA_BUNDLE": certFile}},
+		{"env-overrides-empty", "", map[string]string{"REQUESTS_CA_BUNDLE": certFile}},
+		{"env-overrides-explicit-path", filepath.Join(dir, "nope.pem"), map[string]string{"REQUESTS_CA_BUNDLE": certFile}},
+		{"requests-bundle-wins-over-curl", true, map[string]string{
+			"REQUESTS_CA_BUNDLE": certFile,
+			"CURL_CA_BUNDLE":     filepath.Join(dir, "nope.pem"),
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("REQUESTS_CA_BUNDLE", "")
@@ -915,7 +975,7 @@ func TestHTTPClientCAResolution(t *testing.T) {
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}
-			client, err := newHTTPClient(tc.ca, defaultRequestTimeout)
+			client, err := newHTTPClient(tc.ca)
 			if err != nil {
 				t.Fatalf("newHTTPClient(%v): %v", tc.ca, err)
 			}
@@ -925,11 +985,64 @@ func TestHTTPClientCAResolution(t *testing.T) {
 		})
 	}
 
-	if _, err := newHTTPClient(filepath.Join(dir, "nope.pem"), defaultRequestTimeout); err == nil {
+	// ca=false/"" disable verification when no env bundle is set.
+	for _, tc := range []struct {
+		name string
+		ca   any
+	}{
+		{"ca-false-disables", false},
+		{"empty-string-disables", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("REQUESTS_CA_BUNDLE", "")
+			t.Setenv("CURL_CA_BUNDLE", "")
+			client, err := newHTTPClient(tc.ca)
+			if err != nil {
+				t.Fatalf("newHTTPClient(%v): %v", tc.ca, err)
+			}
+			// A server with an untrusted cert is accepted because verification
+			// is off.
+			if err := clientGets(t, client, srv.URL); err != nil {
+				t.Fatalf("insecure client rejected %v: %v", srv.URL, err)
+			}
+		})
+	}
+
+	// An UN-HASHED PEM in a capath directory must NOT contribute trust:
+	// OpenSSL never loads it. Write a second server's cert as plain server.pem
+	// next to the hashed entry for server srv; the client must verify srv but
+	// REJECT the second server.
+	t.Run("unhased-entry-ignored", func(t *testing.T) {
+		t.Setenv("REQUESTS_CA_BUNDLE", "")
+		t.Setenv("CURL_CA_BUNDLE", "")
+		other, otherCert := newTLSServerWithCert(t)
+		mixed := t.TempDir()
+		writeCertPEM(t, mixed, "9d66eef0.0", cert)      // hashed: server srv
+		writeCertPEM(t, mixed, "server.pem", otherCert) // un-hashed: must be ignored
+
+		client, err := newHTTPClient(mixed)
+		if err != nil {
+			t.Fatalf("newHTTPClient(mixed): %v", err)
+		}
+		if err := clientGets(t, client, srv.URL); err != nil {
+			t.Fatalf("hashed entry must be trusted: %v", err)
+		}
+		if err := clientGets(t, client, other.URL); err == nil {
+			t.Fatal("un-hashed PEM in a capath directory must NOT be trusted")
+		}
+	})
+
+	t.Setenv("REQUESTS_CA_BUNDLE", "")
+	t.Setenv("CURL_CA_BUNDLE", "")
+	if _, err := newHTTPClient(filepath.Join(dir, "nope.pem")); err == nil {
 		t.Error("newHTTPClient accepted a missing CA path")
 	}
-	emptyDir := t.TempDir()
-	if _, err := newHTTPClient(emptyDir, defaultRequestTimeout); err == nil {
+	unhasedDir := t.TempDir()
+	writeCertPEM(t, unhasedDir, "server.pem", cert)
+	if _, err := newHTTPClient(unhasedDir); err == nil {
+		t.Error("newHTTPClient accepted a CA directory with only un-hashed entries")
+	}
+	if _, err := newHTTPClient(t.TempDir()); err == nil {
 		t.Error("newHTTPClient accepted a CA directory with no certificates")
 	}
 }
@@ -1125,41 +1238,89 @@ func TestCloseReleasesIdleConnections(t *testing.T) {
 
 var _ io.Closer = (*Sender)(nil)
 
-// --- bulk item errors (review item 8) --------------------------------------
+// --- per-request inactivity timeout (review item 2) ------------------------
 
-// TestSlowBulkResponseWithinTimeout checks the timeout is requests'
-// INACTIVITY timeout, not a total deadline: the bulk body streams over a
-// total longer than the (2×) configured timeout, but every gap between reads
-// is shorter, so the send succeeds.
-func TestSlowBulkResponseWithinTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/journalpump-2019-10-07/_bulk" {
-			w.WriteHeader(http.StatusOK)
-			flusher := w.(http.Flusher)
-			for _, chunk := range []string{"{", "}", ""} {
-				_, _ = io.WriteString(w, chunk)
-				flusher.Flush()
-				time.Sleep(120 * time.Millisecond)
+// writeSlowResponse writes body in two halves around a mid-response gap, so
+// the time between two reads exceeds the low timeout while the total is not a
+// single deadline.
+func writeSlowResponse(w http.ResponseWriter, body string, gap time.Duration) {
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	half := len(body) / 2
+	_, _ = io.WriteString(w, body[:half])
+	flusher.Flush()
+	time.Sleep(gap)
+	_, _ = io.WriteString(w, body[half:])
+	flusher.Flush()
+}
+
+// TestInactivityTimeoutPerRequestOnReusedConnection pins review item 2: the
+// inactivity timeout is applied at each REQUEST boundary, not baked at dial
+// time. With opensearch_timeout=0.15 the ordinary timeout is 0.15 s and the
+// bulk timeout 0.3 s; the server keeps ONE keep-alive connection and stalls
+// 0.2 s mid-response, which lies BETWEEN the two limits. So a bulk reusing
+// the version/alias connection must keep its 0.3 s, and a later ordinary
+// request on the same connection must fall back to 0.15 s.
+func TestInactivityTimeoutPerRequestOnReusedConnection(t *testing.T) {
+	var newConns int32
+	var slowAlias atomic.Bool
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/":
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, `{"version": {"number": "1.2.4"}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/_aliases":
+			if slowAlias.Load() {
+				writeSlowResponse(w, `{"a": {}}`, 200*time.Millisecond)
+				return
 			}
-			return
+			_, _ = io.WriteString(w, "{}")
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost:
+			writeSlowResponse(w, `{"errors": false}`, 200*time.Millisecond)
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(handler))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			atomic.AddInt32(&newConns, 1)
+		}
+	}
+	srv.Start()
 	defer srv.Close()
 
 	inst, err := NewOpenSearch(sender.ConstructorArgs{Config: map[string]any{
 		"opensearch_url":     srv.URL,
-		"opensearch_timeout": 0.15, // bulk timeout = 0.3s < the 0.36s total
+		"opensearch_timeout": 0.15, // ordinary 0.15 s, bulk 0.3 s
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := inst.Transport.(*Sender)
-	s.indices[defaultIndexPrefix+"-2019-10-07"] = struct{}{}
 
+	// Send #1: loadIndices (version + aliases) dials ONE connection; the PUT
+	// and the 0.2 s-stalled bulk REUSE it. The bulk must use its own 0.3 s,
+	// not the 0.15 s of the request that dialed the connection.
 	msg := []byte(`{"MESSAGE": "hi", "timestamp": "2019-10-07 14:00:00"}`)
 	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
-		t.Fatalf("inactivity timeout aborted a progressing bulk response: %v", err)
+		t.Fatalf("bulk on a reused connection used the ordinary timeout: %v", err)
+	}
+	if got := atomic.LoadInt32(&newConns); got != 1 {
+		t.Fatalf("connections = %d, want 1 (the client must reuse keep-alive)", got)
+	}
+
+	// Send #2: an ORDINARY request (maintenance alias census) on the SAME
+	// reused connection must use the ordinary 0.15 s — the bulk's 0.3 s that
+	// ran last must not stick — so the 0.2 s stall fails it.
+	slowAlias.Store(true)
+	if err := s.MaintenanceOperations(context.Background()); err == nil {
+		t.Fatal("ordinary request reused the bulk timeout (0.3 s stuck on the connection)")
+	}
+	if got := atomic.LoadInt32(&newConns); got != 1 {
+		t.Fatalf("connections = %d, want 1 (maintenance must reuse the keep-alive)", got)
 	}
 }
 
