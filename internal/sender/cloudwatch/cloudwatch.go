@@ -38,6 +38,25 @@ const defaultMaxSendInterval = 0.3
 // maxInitTries is aws_cloudwatch.py:8's MAX_INIT_TRIES.
 const maxInitTries = 3
 
+// CloudWatch PutLogEvents API limits (correctness guard, NOT reproduced
+// from Python). Python's size-based slicing
+// (base.py:get_and_send_messages, `batch_size >= max_batch_size`) packs
+// batches up to 1 MiB with NO event-count cap, so a stream of tiny entries
+// can produce a request the API rejects (10,000 events per PutLogEvents,
+// 1 MiB per request). The Go sender chunks the batch and never builds a
+// request the API would reject — a sanctioned correct-the-Python bug fix
+// (charter §2). maxEventsPerRequest is the documented API limit; the size
+// bound mirrors the framework's 1 MiB slicing limit.
+const (
+	maxEventsPerRequest = 10000
+	maxRequestBytes     = 1048576
+)
+
+// perEventOverhead approximates the serialized per-event byte cost
+// (timestamp + structural JSON) used by the size guard, matching the
+// framework's message_overhead accounting.
+const perEventOverhead = 26
+
 // Fixed error codes the init path special-cases (aws_cloudwatch.py:51,64,93).
 const (
 	codeAlreadyExists = "ResourceAlreadyExistsException"
@@ -256,35 +275,69 @@ func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) err
 		}
 		events = append(events, ev)
 	}
-	token := ""
-	if s.nextSequenceToken != nil {
-		token = *s.nextSequenceToken
-	}
-	next, status, err := s.logs.PutLogEvents(ctx, s.group, s.stream, token, events)
-	if err != nil {
-		// aws_cloudwatch.py:122-129 / 130-135: mark disconnected, log, emit
-		// unexpected_exception, back off and re-init. Under the shared loop the
-		// backoff and reconnect are the loop's job on the returned error (it
-		// marks disconnected and backs off once, then the retry re-inits
-		// because connected is false), so the sender only emits the metric and
-		// clears connected here. A re-init failure is surfaced instead.
-		s.setConnected(false, err)
-		s.logSendError(err)
-		s.unexpected(err)
-		if initErr := s.initLogGroup(ctx); initErr != nil {
-			return initErr
+	// Correctness guard (NOT Python): never build a PutLogEvents request the
+	// API rejects. Chunk by the 10,000-event and 1 MiB limits, chaining the
+	// sequence token across chunks. An event that alone exceeds the size
+	// bound becomes its own chunk (it cannot be made smaller).
+	chunks := chunkEvents(events)
+	for _, chunk := range chunks {
+		token := ""
+		if s.nextSequenceToken != nil {
+			token = *s.nextSequenceToken
 		}
-		return err
-	}
-	if status >= 200 && status < 300 {
+		next, status, err := s.logs.PutLogEvents(ctx, s.group, s.stream, token, chunk)
+		if err != nil {
+			// aws_cloudwatch.py:120-135: mark disconnected, log, emit
+			// unexpected_exception, BACK OFF, then re-init — and only then
+			// return False. The backoff happens HERE, before the re-init, so
+			// the sender wraps the error in sender.BackoffError to tell the
+			// shared loop not to wait a second time after the return. A
+			// re-init failure is reported separately and does NOT replace the
+			// put failure, which stays the returned cause.
+			s.setConnected(false, err)
+			s.logSendError(err)
+			s.unexpected(err)
+			s.backoffNow(ctx)
+			if initErr := s.initLogGroup(ctx); initErr != nil {
+				s.logErrorf("AWS CloudWatch re-initialization after a failed put also failed: %v", initErr)
+			}
+			return &sender.BackoffError{Err: err}
+		}
+		if status < 200 || status >= 300 {
+			// A non-2xx status without an error is not expected from the SDK,
+			// but Python would fall through and return False.
+			return fmt.Errorf("cloudwatch: put_log_events returned status %d", status)
+		}
 		s.nextSequenceToken = &next
-		// The loop calls mark_sent on a nil return (Python mark_sent at
-		// aws_cloudwatch.py:138).
-		return nil
 	}
-	// A non-2xx status without an error is not expected from the SDK, but
-	// Python would fall through and return False.
-	return fmt.Errorf("cloudwatch: put_log_events returned status %d", status)
+	// Python's mark_sent (base.py:220-224) calls mark_connected, so a
+	// successful delivery connects the sender even when the init describe
+	// did not find the stream. Sync the local gate so the next batch does
+	// not re-init (the shared loop's markSent already handles its own state).
+	s.connected = true
+	return nil
+}
+
+// chunkEvents splits events into PutLogEvents requests under the API's
+// 10,000-event and 1 MiB limits (correctness guard; see the constants).
+func chunkEvents(events []logEvent) [][]logEvent {
+	var chunks [][]logEvent
+	var current []logEvent
+	var size int
+	for _, ev := range events {
+		evSize := len(ev.Message) + perEventOverhead
+		if len(current) > 0 && (len(current) >= maxEventsPerRequest || size+evSize > maxRequestBytes) {
+			chunks = append(chunks, current)
+			current = nil
+			size = 0
+		}
+		current = append(current, ev)
+		size += evSize
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
 }
 
 // event builds one log event from a raw JSON message line
@@ -309,33 +362,70 @@ func (s *Sender) event(msg []byte) (logEvent, error) {
 }
 
 // timestamp ports `int((message.get("REALTIME_TIMESTAMP") or time.time()) *
-// 1000.0)`: a missing/falsy value falls back to the wall clock, and a
-// non-numeric truthy value fails like Python's TypeError.
+// 1000.0)`. Python truthiness decides the fallback: None/false/0/0.0/""/
+// []/{} fall back to the wall clock; True is the integer 1; a non-empty
+// string/list/dict is truthy but not a number, so `* 1000.0` raises
+// TypeError.
 func (s *Sender) timestamp(value any) (int64, error) {
 	var seconds float64
 	switch v := value.(type) {
 	case nil:
-		seconds = float64(s.now().UnixNano()) / 1e9
+		seconds = s.wallClock()
+	case bool:
+		if v {
+			seconds = 1
+		} else {
+			seconds = s.wallClock()
+		}
 	case json.Number:
 		f, err := v.Float64()
 		if err != nil {
 			return 0, fmt.Errorf("cloudwatch: REALTIME_TIMESTAMP: %w", err)
 		}
 		if f == 0 {
-			seconds = float64(s.now().UnixNano()) / 1e9
+			seconds = s.wallClock()
 		} else {
 			seconds = f
 		}
 	case float64:
 		if v == 0 {
-			seconds = float64(s.now().UnixNano()) / 1e9
+			seconds = s.wallClock()
 		} else {
 			seconds = v
+		}
+	case float32:
+		if v == 0 {
+			seconds = s.wallClock()
+		} else {
+			seconds = float64(v)
+		}
+	case string:
+		if v == "" {
+			seconds = s.wallClock()
+		} else {
+			return 0, fmt.Errorf("cloudwatch: REALTIME_TIMESTAMP %q is not a number", v)
+		}
+	case []any:
+		if len(v) == 0 {
+			seconds = s.wallClock()
+		} else {
+			return 0, errors.New("cloudwatch: REALTIME_TIMESTAMP is a non-empty list, not a number")
+		}
+	case map[string]any:
+		if len(v) == 0 {
+			seconds = s.wallClock()
+		} else {
+			return 0, errors.New("cloudwatch: REALTIME_TIMESTAMP is a non-empty object, not a number")
 		}
 	default:
 		return 0, fmt.Errorf("cloudwatch: REALTIME_TIMESTAMP %v is not a number", value)
 	}
 	return int64(math.Trunc(seconds * 1000.0)), nil
+}
+
+// wallClock renders the current time as float seconds (Python time.time()).
+func (s *Sender) wallClock() float64 {
+	return float64(s.now().UnixNano()) / 1e9
 }
 
 // initLogGroup ports aws_cloudwatch.py:36-101: up to MAX_INIT_TRIES attempts
@@ -457,7 +547,7 @@ func (s *Sender) backoffNow(ctx context.Context) {
 func (s *Sender) logSendError(err error) {
 	var api *apiError
 	if errors.As(err, &api) {
-		s.logErrorf("Error sending events %r: %r", api.Code, api.Message)
+		s.logErrorf("Error sending events %q: %q", api.Code, api.Message)
 		return
 	}
 	s.logErrorf("Unexpected exception during send to AWS CloudWatch: %v", err)

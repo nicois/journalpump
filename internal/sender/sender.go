@@ -178,6 +178,27 @@ func (e *InitializationError) Error() string {
 // Unwrap exposes the wrapped cause.
 func (e *InitializationError) Unwrap() error { return e.Err }
 
+// BackoffError marks a SendMessages error whose transport ALREADY waited
+// out the shared jittered backoff before returning it — Python senders
+// that call self._backoff() INSIDE send_messages (the CloudWatch put
+// failure path). The loop's drain skips its own backoffSleep for such an
+// error, so the wait happens exactly once and BEFORE the sender's
+// reinitialization, matching Python's ordering (aws_cloudwatch.py:128-129:
+// mark_disconnected, log, stats, _backoff, _init_log_group) rather than
+// the loop's post-return wait. Classification still sees through Unwrap.
+type BackoffError struct{ Err error }
+
+// Error implements error.
+func (e *BackoffError) Error() string {
+	if e.Err == nil {
+		return "sender error (backoff already performed)"
+	}
+	return e.Err.Error()
+}
+
+// Unwrap exposes the wrapped cause.
+func (e *BackoffError) Unwrap() error { return e.Err }
+
 // defaultClassifier routes like the generic Python sender path: every
 // error retries with backoff except InitializationError.
 type defaultClassifier struct{}
@@ -512,7 +533,14 @@ func (l *Loop) drain(ctx context.Context) {
 		if err := l.transport.SendMessages(ctx, bodies, cursor); err != nil {
 			l.failBatch(err)
 			l.hold(items)
-			l.backoffSleep(ctx)
+			// A transport that performed the shared backoff itself (Python
+			// send_messages calling self._backoff() before re-init) must not
+			// make the loop wait a second time, and that wait must not fall
+			// AFTER the re-init — see BackoffError.
+			var backedOff *BackoffError
+			if !errors.As(err, &backedOff) {
+				l.backoffSleep(ctx)
+			}
 			return
 		}
 		l.markSent(batch)
