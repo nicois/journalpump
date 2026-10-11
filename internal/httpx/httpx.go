@@ -23,13 +23,17 @@
 //     INACTIVITY timeout (the deadline resets on every read/write).
 //     InactivityClient applies that timeout per REQUEST and per PHASE, so a
 //     reused keep-alive connection carries the timeout of the request
-//     currently in flight rather than the one that dialed it, and the
-//     response-read deadline is armed only after the request is written
-//     (a progressing upload that outlasts the timeout is not aborted);
-//     IdleTimeoutDialer is the fixed-dial variant for a sender with a
-//     constant session timeout (logplex). Senders whose Python client uses
-//     requests' socket timeout use one of these so a slow-but-progressing
-//     response is not aborted the way a total deadline would abort it.
+//     currently in flight rather than the one that dialed it. Connection
+//     establishment (dial plus TLS handshake) is bounded by its own phase,
+//     the response-read deadline is armed only after the request is written
+//     (a progressing upload that outlasts the timeout is not aborted), and
+//     the phase is reset for EVERY request attempt, so a redirected upload
+//     re-enters the upload phase rather than inheriting the previous
+//     attempt's read deadline; IdleTimeoutDialer is the fixed-dial variant
+//     for a sender with a constant session timeout (logplex). Senders whose
+//     Python client uses requests' socket timeout use one of these so a
+//     slow-but-progressing response is not aborted the way a total deadline
+//     would abort it.
 //
 // It deliberately provides NO retry hook: retries are owned by the shared
 // sender.Loop (a failed SendMessages retains the batch and retries after
@@ -165,13 +169,22 @@ func IdleTimeoutDialer(fallback time.Duration) func(ctx context.Context, network
 // (WithRequestTimeout). The client tracks, under one mutex:
 //
 //   - the current idle timeout, updated at the request boundary;
-//   - the current PHASE (upload vs response-read). The read deadline is armed
-//     only in the read phase, so a progressing upload that outlasts the
-//     timeout cannot fail before response reading should begin — urllib3 arms
-//     its read timeout only AFTER sending the request;
+//   - the current PHASE (connect, upload, or response-read). The read
+//     deadline is armed while establishing the connection (dial plus TLS
+//     handshake) so a peer that accepts TCP but never answers the handshake
+//     is bounded, kept armed during response reading (matching urllib3 arming
+//     its read timeout only AFTER sending the request), and NOT armed during
+//     the upload, so a progressing upload that outlasts the timeout cannot
+//     fail before response reading should begin;
 //   - the live wrapped connections, so a request boundary re-arms a pooled
 //     connection's PENDING background read (a just-armed deadline must not be
 //     overwritten by a read that already loaded the previous timeout).
+//
+// The phase is reset for EVERY request attempt through the httptrace hooks
+// (GotConn enters the upload phase, WroteRequest enters the read phase), not
+// once per Client.Do: a redirect issues additional attempts that would
+// otherwise carry the first attempt's read phase into a redirected (possibly
+// long) upload.
 //
 // Every load/install of a deadline happens under the mutex together, so a
 // background read cannot interleave between "read the timeout" and "install
@@ -181,11 +194,23 @@ func IdleTimeoutDialer(fallback time.Duration) func(ctx context.Context, network
 type InactivityClient struct {
 	client *http.Client
 
-	mu      sync.Mutex
-	idle    time.Duration
-	reading bool // response-read phase has begun for the current request
-	conns   map[*dynamicIdleConn]struct{}
+	mu    sync.Mutex
+	idle  time.Duration
+	phase connPhase
+	conns map[*dynamicIdleConn]struct{}
 }
+
+// connPhase is the phase of the request attempt currently in flight. The read
+// deadline is armed in phaseConnect (connection establishment) and phaseRead
+// (response reading) but NOT in phaseUpload, where a progressing request body
+// may legitimately outlast the inactivity timeout.
+type connPhase int
+
+const (
+	phaseConnect connPhase = iota
+	phaseUpload
+	phaseRead
+)
 
 // NewInactivityClient builds an InactivityClient with the given transport
 // options, mirroring NewClient (idle pooled connections are bounded at 90 s).
@@ -208,10 +233,14 @@ func NewInactivityClient(opts ClientOptions) *InactivityClient {
 			wrapped := &dynamicIdleConn{Conn: conn, owner: c}
 			c.mu.Lock()
 			c.conns[wrapped] = struct{}{}
-			// A connection dialed mid-request (read phase already begun) must
-			// adopt the current read deadline.
-			if c.reading && c.idle > 0 {
-				_ = conn.SetReadDeadline(time.Now().Add(c.idle))
+			// Bound connection establishment: a freshly dialed connection may
+			// still be mid TLS handshake, whose reads happen before GotConn
+			// (and thus before any WroteRequest). Arm the read deadline now so
+			// a peer that accepts TCP but never answers the handshake cannot
+			// stall the request; GotConn clears it when the connection is
+			// ready and the upload phase begins.
+			if idle > 0 {
+				_ = conn.SetReadDeadline(time.Now().Add(idle))
 			}
 			c.mu.Unlock()
 			return wrapped, nil
@@ -224,8 +253,11 @@ func NewInactivityClient(opts ClientOptions) *InactivityClient {
 func (c *InactivityClient) Client() *http.Client { return c.client }
 
 // Do installs the request's inactivity timeout at this request boundary and
-// delegates to the wrapped client. A RequestTrace arms the read deadline when
-// the request has been fully written (the start of the read phase).
+// delegates to the wrapped client. The httptrace hooks re-enter the upload
+// phase for EVERY actual request attempt (GotConn) and arm the read deadline
+// when an attempt has been fully written (WroteRequest), so a redirect
+// re-enters the upload phase instead of inheriting the first attempt's read
+// phase.
 func (c *InactivityClient) Do(req *http.Request) (*http.Response, error) {
 	v, ok := req.Context().Value(timeoutKey{}).(time.Duration)
 	if !ok || v <= 0 {
@@ -233,26 +265,36 @@ func (c *InactivityClient) Do(req *http.Request) (*http.Response, error) {
 	}
 	c.beginRequest(v)
 	trace := &httptrace.ClientTrace{
+		GotConn:      func(httptrace.GotConnInfo) { c.beginUpload() },
 		WroteRequest: func(httptrace.WroteRequestInfo) { c.beginRead() },
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	return c.client.Do(req)
 }
 
-// beginRequest enters the UPLOAD phase for a new request: it installs the
+// beginRequest enters the CONNECT phase for a new request: it installs the
 // request's timeout and CLEARS the read deadline on every connection, so a
-// progressing upload cannot trip a read timeout (request A's read deadline
-// must not run while request B is still uploading), and so a pending pooled
-// read does not retain a stale deadline. The clear+install happen under the
-// mutex so a concurrent wrapped Read/Write cannot overwrite the new state.
+// pending pooled read does not retain a stale deadline. The clear+install
+// happen under the mutex so a concurrent wrapped Read/Write cannot overwrite
+// the new state.
 func (c *InactivityClient) beginRequest(idle time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.idle = idle
-	c.reading = false
-	for conn := range c.conns {
-		_ = conn.SetReadDeadline(time.Time{})
-	}
+	c.phase = phaseConnect
+	c.clearReadDeadlines()
+}
+
+// beginUpload enters the UPLOAD phase once a connection has been acquired for
+// a request attempt (GotConn, which fires for every attempt including a
+// redirect). It clears any read deadline armed for connection establishment
+// and any left over from a previous attempt, so a progressing upload is never
+// aborted by a read timeout.
+func (c *InactivityClient) beginUpload() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.phase = phaseUpload
+	c.clearReadDeadlines()
 }
 
 // beginRead enters the RESPONSE-READ phase: it arms the read deadline
@@ -261,13 +303,21 @@ func (c *InactivityClient) beginRequest(idle time.Duration) {
 func (c *InactivityClient) beginRead() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.reading = true
+	c.phase = phaseRead
 	if c.idle <= 0 {
 		return
 	}
 	deadline := time.Now().Add(c.idle)
 	for conn := range c.conns {
 		_ = conn.SetReadDeadline(deadline)
+	}
+}
+
+// clearReadDeadlines zeroes the read deadline on every live connection. The
+// caller must hold c.mu.
+func (c *InactivityClient) clearReadDeadlines() {
+	for conn := range c.conns {
+		_ = conn.SetReadDeadline(time.Time{})
 	}
 }
 
@@ -286,7 +336,7 @@ type dynamicIdleConn struct {
 
 func (c *dynamicIdleConn) Read(b []byte) (int, error) {
 	c.owner.mu.Lock()
-	if c.owner.reading && c.owner.idle > 0 {
+	if c.owner.phase == phaseRead && c.owner.idle > 0 {
 		_ = c.SetReadDeadline(time.Now().Add(c.owner.idle))
 	}
 	c.owner.mu.Unlock()

@@ -7,6 +7,7 @@ package httpx
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -108,6 +109,7 @@ func TestInactivityClientTimeoutPerPhaseAndBoundary(t *testing.T) {
 	// Upload phase (the bulk POST): NO read deadline; the write deadline is
 	// armed per write.
 	c.beginRequest(300 * time.Millisecond)
+	c.beginUpload()
 	if got := fc.lastRead(); !got.IsZero() {
 		t.Fatalf("read deadline armed during the upload phase: %v", got)
 	}
@@ -127,6 +129,7 @@ func TestInactivityClientTimeoutPerPhaseAndBoundary(t *testing.T) {
 	// replaces the bulk one and the read deadline is cleared for the upload
 	// phase. A plain Read during that phase must not re-arm it.
 	c.beginRequest(150 * time.Millisecond)
+	c.beginUpload()
 	if got := fc.lastRead(); !got.IsZero() {
 		t.Fatalf("read deadline survived the request boundary: %v", got)
 	}
@@ -356,6 +359,115 @@ func TestInactivityClientProgressingUploadExceedsTimeout(t *testing.T) {
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("progressing upload longer than the timeout was aborted: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+// TestInactivityClientStalledTLSHandshake pins review round 4 item 1:
+// connection establishment (dial plus TLS handshake) is its own timeout
+// phase. A peer that accepts TCP but never completes the TLS handshake must
+// be bounded by the inactivity timeout, even though WroteRequest cannot fire
+// before the handshake finishes.
+func TestInactivityClientStalledTLSHandshake(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	var (
+		mu   sync.Mutex
+		held []net.Conn
+	)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, conn)
+			mu.Unlock()
+			// Never read or write: the TLS handshake never completes.
+		}
+	}()
+	defer func() {
+		mu.Lock()
+		for _, c := range held {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	}()
+
+	client := NewInactivityClient(ClientOptions{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // the handshake never completes
+	})
+	idle := 200 * time.Millisecond
+	req, err := http.NewRequest(http.MethodGet, "https://"+ln.Addr().String()+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(WithRequestTimeout(context.Background(), idle))
+
+	done := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled TLS handshake returned no error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stalled TLS handshake was not bounded by the inactivity timeout")
+	}
+}
+
+// TestInactivityClientRedirectedUploadExceedsTimeout pins review round 4 item
+// 2: Do begins the request once, but a 307 redirect issues a second request
+// attempt internally. The per-attempt GotConn/WroteRequest hooks must reset
+// the read phase for that attempt, so the redirected upload is not aborted by
+// the previous attempt's read deadline. Both the initial and the redirected
+// upload last 20x20ms = 400ms (>> the 200ms timeout).
+func TestInactivityClientRedirectedUploadExceedsTimeout(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	idle := 200 * time.Millisecond
+	client := NewInactivityClient(ClientOptions{})
+
+	const chunkSize, chunks = 1024, 20
+	newBody := func() io.ReadCloser {
+		return io.NopCloser(&pacedReader{chunkSize: chunkSize, chunks: chunks, gap: 20 * time.Millisecond})
+	}
+	req, err := http.NewRequest(http.MethodPost, redirector.URL, newBody())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = chunkSize * chunks
+	req.GetBody = func() (io.ReadCloser, error) { return newBody(), nil }
+	req = req.WithContext(WithRequestTimeout(context.Background(), idle))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("redirected upload longer than the timeout was aborted: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
