@@ -1687,8 +1687,15 @@ Fixture assertion at the HTTP boundary (review round 2):
 ## Task 22 — kafka sender (spec §5, D4/D5)
 
 `internal/sender/kafka` ports `journalpump/senders/kafka_sender.py` on
-IBM/sarama (D5) and is registered as output_type `kafka`. socks5-kafka
-(D4) is retained. It is the counterpart of the Python `KafkaSender`.
+github.com/twmb/franz-go (kgo + kadm + pkg/sasl) — D5 revised 2026-10-11
+from IBM/sarama by user decision (`docs/assess-kafka-client.md`) — and is
+registered as output_type `kafka`. socks5-kafka (D4) is retained. It is
+the counterpart of the Python `KafkaSender`.
+
+The review rounds 1–4 recorded below are the sarama-era history; the
+franz-go rewrite (review round 5, at the end of this section) supersedes
+every sarama-specific statement in them. The verdict-bearing run for the
+current implementation is the round-5 recorded execution.
 
 Config mapping (config validation outcomes identical to Python;
 `test/unit/senders/test_kafka_sender.py` ported):
@@ -1709,51 +1716,48 @@ Config mapping (config validation outcomes identical to Python;
   be downgraded without an operator-visible error (item B4). SASL
   defaults `sasl_mechanism` to PLAIN and requires both
   `sasl_plain_username` and `sasl_plain_password` (else the Python
-  ValueError text); SCRAM-SHA-256/512 are wired to real
-  `github.com/xdg-go/scram` clients via `SCRAMClientGeneratorFunc` —
-  sarama rejects a SCRAM config without one (item B5).
-  `TestClientConfig*`, `TestValidSecurityProtocols`,
-  `TestSCRAMConfigValidates` and `TestSCRAMClientAuthenticates` pin
-  these.
+  ValueError text); PLAIN and SCRAM-SHA-256/512 map onto franz-go's
+  built-in `pkg/sasl/plain` and `pkg/sasl/scram` mechanisms (`saslOption`)
+  — the hand-written `scram.go` is deleted (item B5).
+  `TestClientConfig*`, `TestValidSecurityProtocols` and
+  `TestSaslMechanisms` pin these.
 - `kafka_address` accepts kafka-python's forms (`collect_hosts`): a
   comma-separated string or a list, hostnames without a port default to
   9092, and IPv6 literals (bracketed or bare) are preserved (item B6).
   A malformed entry is an error (`TestClientConfigBootstrapAddressForms`,
   `...RejectsBadBootstrapAddress`).
 - `kafka_api_version` accepts kafka-python's syntax: `"auto"`/unset means
-  broker detection, and any dotted tuple is accepted with the missing
-  components zero-padded (`"2.5"` → 2.5.0, `"0.10.2"` → 0.10.2.0), not
-  rejected by sarama's stricter parser (item D10). An unset/auto version
-  is detected from the broker's ApiVersions response before connecting
-  (`detectBrokerVersion`/`inferKafkaVersion`, a port of kafka-python's
-  `_infer_broker_version_from_api_versions`), because sarama's
-  `ApiVersionsRequest` is fire-and-forget and leaves the default 2.1.0
-  version in place (item D11). `TestNormalizeKafkaVersion`,
-  `TestInferKafkaVersion`, `TestBuildSaramaConfigDetectsVersion` pin it.
-- Retry/timeout defaults: `Metadata.Retry.Backoff` is the 100 ms
-  `retry_backoff_ms` — sarama's metadata retry is NOT the reconnect
-  backoff, which is a separate per-broker connection-layer delay (see the
-  C7 bullet); collapsing the two would double the reconnect delay.
-  `Producer.Timeout` is the 30 s `request_timeout_ms`: sarama transmits it
-  in Produce requests as the broker-side ack timeout, and `Net.Read`/
-  `WriteTimeout` does not correct that wire value, so it does NOT encode
-  the 120 s `delivery_timeout_ms`. The delivery deadline is enforced
-  client-side in `sendBatch` (see the C7 bullet). `Producer.Retry.Backoff`
-  is the 100 ms `retry_backoff_ms`. `Producer.Retry.Max` is BOUNDED
-  (`producerRetryMax`), not kafka-python's effectively-unlimited default:
-  sarama allocates `Retry.Max+1` `partitionRetryState` entries per
-  partition on the first message to it. Pinned by
-  `TestSaramaConfigRetryTimeouts` and `TestProducerRetryMaxIsBounded`.
-- Producer config adds `linger_ms = 500` and the compression choice.
-  The deployment pins snappy (python-snappy present, zstandard absent —
-  Task 12 fixture notes): `sarama.CompressionSnappy`. Python prefers
-  zstd when `zstandard` is importable, but the deployment lacks it;
-  sarama would support zstd too, so the codec is pinned to the deployed
-  behavior and the zstd-preference fact is recorded rather than
-  reproduced (charter §2/thread A8).
-- `socks5_proxy` maps onto sarama's `Net.Proxy` with an
-  `golang.org/x/net/proxy` SOCKS5 dialer (`socks5Dialer`); an invalid
-  scheme is rejected at config build. Scheme resolution matches
+  broker negotiation, and any dotted tuple is accepted with the missing
+  components zero-padded (`"2.5"` → 2.5.0, `"0.10.2"` → 0.10.2), plus a
+  tolerated trailing zero (item D10). A normalized version maps to a
+  `kgo.MaxVersions(kversion.VX_Y_Z())` cap; unset/auto leaves franz-go to
+  negotiate per connection. franz-go no longer needs—and the code no
+  longer performs—broker version inference: the drop of kafka-python's
+  pre-0.10 legacy probe is an operator-visible §2 deviation (supported
+  brokers are 0.10.0+, auto-negotiated; see review round 5).
+  `TestNormalizeKafkaVersion` and `TestMaxVersionsFor` pin it.
+- Retry/timeout defaults map onto franz-go options: `ProduceRequestTimeout`
+  is the 30 s `request_timeout_ms` (the broker-side ack timeout franz-go
+  puts on Produce requests); `RecordDeliveryTimeout` is the 120 s
+  `delivery_timeout_ms` (a separate client-side bound); `RecordRetries` is
+  the BOUNDED `producerRetryMax` (20), not kafka-python's effectively
+  unlimited default; `RetryBackoffFn` is a fixed 100 ms `retry_backoff_ms`
+  so a retry sleep cannot delay the cancellation check beyond a few
+  hundred ms. franz-go retries internally, so the reconnect-backoff
+  plumbing is gone. Pinned by `TestProducerSemanticsConstants` and the
+  `kgo.NewClient` construction test.
+- Producer config adds `linger_ms = 500` (`ProducerLinger`) and the
+  compression choice. The deployment pins snappy (python-snappy present,
+  zstandard absent — Task 12 fixture notes): `kgo.SnappyCompression`,
+  whose default output is a RAW snappy block — the same framing the
+  kafka-python consumer reads (verified by the interop systest). Python
+  prefers zstd when `zstandard` is importable, but the deployment lacks
+  it, so the codec is pinned to the deployed behavior and the
+  zstd-preference fact is recorded rather than reproduced (charter
+  §2/thread A8). `TestProducerConfigCompressionSnappy` pins it.
+- `socks5_proxy` wires the `golang.org/x/net/proxy` SOCKS5 dialer into
+  franz-go's `kgo.Dialer` (whose signature carries the request context);
+  an invalid scheme is rejected at config build. Scheme resolution matches
   kafka-python: `socks5` resolves the broker name LOCALLY and hands the
   proxy an IP, `socks5h` defers the name to the proxy (x/net resolves
   remotely in both cases, so a local resolver is layered in for socks5),
@@ -1761,76 +1765,74 @@ Config mapping (config validation outcomes identical to Python;
   black-holed proxy cannot stall shutdown/reload (item C8).
   `TestProducerConfigWithSocks5Proxy` / `WithoutSocks5Proxy` /
   `InvalidSocks5Proxy`, `TestSocks5ResolvesLocally`,
-  `TestTimeoutDialerBoundsHandshake` and `TestSocks5DialerHasTimeout`
+  `TestSocks5BoundsStalledHandshake` and `TestSocks5DialerHasTimeout`
   pin it.
 
 Send path (thread A7):
 
-- One `sarama.SyncProducer.SendMessages(batch)` per shared-loop flush
-  replaces kafka-python's produce-per-message + `flush()` +
-  `future.get(timeout=1)` dance; the synchronous call already blocks for
-  every broker ack, so the Python per-future timeout collapses into it.
-  The delivered payload bytes / key / partition are identical. A nil
-  return lets the shared loop advance the cursor to the batch's last
-  cursor (ack-then-advance — the same contract as Python's
-  mark_sent-after-flush).
+- One `kgo.Client.ProduceSync(ctx, batch)` per shared-loop flush replaces
+  kafka-python's produce-per-message + `flush()` + `future.get(timeout=1)`
+  dance; the synchronous call already blocks for every broker ack, so the
+  Python per-future timeout collapses into it. The delivered payload bytes
+  / key / partition are identical. A nil return lets the shared loop
+  advance the cursor to the batch's last cursor (ack-then-advance — the
+  same contract as Python's mark_sent-after-flush).
 - The partitioner is a port of kafka-python's `DefaultPartitioner`
-  (`murmur2Partitioner`): a nil key picks a random partition, otherwise
+  (`murmur2Partitioner`, implementing `kgo.Partitioner`/
+  `kgo.TopicPartitioner`): a nil key picks a random partition, otherwise
   `murmur2(key) & 0x7fffffff % len(all_partitions)` with kafka-python's
-  exact murmur2 (seed 0x9747b28c, LE blocks, cumulative tail). sarama's
-  own ReferenceHash and FNV partitioners use a different seed/algorithm
-  and would route a fixed key to a different partition (review item A1).
-  `TestMurmur2MatchesKafkaPython` pins the digest vectors and
-  `TestPartitionerMatchesKafkaPythonDefaultPartitioner` pins the
-  placement for multiple keys × partition counts.
-- `Producer.RequiredAcks = WaitForLocal` (kafka-python's default
-  `acks=1`).
+  exact murmur2 (seed 0x9747b28c, LE blocks, cumulative tail). franz-go's
+  default for unkeyed records is sticky-per-batch (Java semantics), not
+  random, so the port is kept to preserve Python's `random.choice`
+  (review item A1). `TestMurmur2MatchesKafkaPython` pins the digest
+  vectors and `TestPartitionerMatchesKafkaPythonDefaultPartitioner` pins
+  the placement for multiple keys × partition counts.
+- `kgo.RequiredAcks(kgo.LeaderAck())` with a companion
+  `kgo.DisableIdempotentWrite()` — franz-go only permits acks != all with
+  the idempotent producer disabled (kafka-python's default `acks=1`). The
+  pairing is validated at client construction.
 - `Retriable` classifies a send error against the COMPLETE kafka-python
-  retriable errno set (item A3): the KErrors kafka-python marks
-  retriable, plus the numeric codes sarama has no named constant for
-  (100, 103, 106, 122, 123), the client-side `sarama.ErrOutOfBrokers`/
-  `ErrNotConnected`/`ErrControllerNotAvailable`/`ErrIncompleteResponse`/
-  `ErrInsufficientData`, and timeouts, EOF, ECONNREFUSED/ECONNRESET/EPIPE
-  → silent retriable; everything else → the unexpected-exception path.
-  `BrokerNotAvailable` and `RebalanceInProgress` are NOT retriable (§
-  kafka-python's retriable table), while `ReplicaNotAvailable`,
-  `NotController`, `ListenerNotFound`, `ThrottlingQuotaExceeded` etc. are
-  (item A3). A `sarama.ProducerErrors` batch is retriable only when EVERY
-  cause is, individually, so a mixed batch takes the permanent path with
-  its causes preserved (item A2). `TestRetriableClassification`,
-  `TestRetriableKErrorMapping` and `TestRetriableClientErrors` pin the
-  positive AND negative cases.
-- `New` does NOT write sarama's package-level `Logger`: sarama already
-  defaults to a discarding logger (`log.New(io.Discard, …)`), which IS
-  the Python "silence kafka logging" behavior, and every constructor
-  writing the shared global races other clients (item C9).
-  `TestNewDoesNotMutateSaramaLogger` and `TestConcurrentConstruction`
-  pin it.
-- The connect/topic-create/send paths are cancellation-aware end to end
-  (`runCancellable` plus a context-aware construction chain):
-  - Construction (version probes, metadata, DNS, SOCKS) receives the
-    caller's context. The tracking dialer records every connection and is
-    force-closed the moment the context ends, so a stalled handshake is
-    TERMINATED rather than waiting out each inner timeout.
-    `TestConnectProducerCancellationTerminatesMetadata` cancels a blocked
-    metadata handshake against a silent broker WITHOUT releasing it by hand.
+  retriable errno set (item A3). franz-go exposes structured errors
+  (`*kerr.Error` with a `Code`), so the classification is an explicit
+  numeric table (`retriableCode`) that keeps kafka-python's set — the
+  KErrors it marks retriable plus the numeric codes older clients had no
+  named constant for (100, 103, 106, 122, 123) — while deliberately NOT
+  following `kerr.Retriable` where it diverges: `BrokerNotAvailable` (8)
+  and `RebalanceInProgress` (27) are NOT retriable in kafka-python. The
+  client-side `kgo.ErrClientClosed`/`ErrRecordTimeout`/`ErrRecordRetries`,
+  context cancellation, timeouts, EOF, ECONNREFUSED/ECONNRESET/EPIPE are
+  retriable; everything else is the unexpected-exception path. A
+  `sendErrors` batch is retriable only when EVERY cause is, individually,
+  so a mixed batch takes the permanent path with its causes preserved
+  (item A2). `TestRetriableClassification`, `TestRetriableKErrorMapping`
+  and `TestRetriableNetworkErrors` pin the positive AND negative cases.
+- `New` does NOT install a franz-go package-level logger: franz-go
+  defaults to a discarding logger, which IS the Python "silence kafka
+  logging" behavior, and a constructor writing a shared global would race
+  other clients (item C9). `TestConcurrentConstruction` (run under -race)
+  pins the no-global-write contract.
+- The connect/topic-create/send paths are cancellation-aware end to end —
+  genuinely ctx-driven, with no socket-force-close workaround:
+  - Construction (metadata, DNS, SOCKS) receives the caller's context.
+    franz-go's dials take it; a metadata request already in flight to a
+    stalled broker is aborted by `cl.Close()` (the documented franz-go
+    lever), so a stalled handshake is TERMINATED rather than waiting out
+    each inner timeout. `TestConnectProducerCancellationTerminatesMetadata`
+    cancels a blocked metadata handshake against a silent broker (REAL
+    franz-go client) WITHOUT releasing it by hand.
   - A send is bounded by the client-side delivery deadline; on deadline or
-    cancellation the connections are closed, which fails the in-flight
-    produce promptly, BEFORE the worker is joined; sarama's subsequent
-    retry loop is uninterruptible, so the call returns within the sarama
-    floor (see "Sarama limitation" below), then the producer is closed.
-    Tested against a REAL sarama SyncProducer pointed at a broker
-    that answers metadata but stalls Produce
-    (`TestSendDeliveryDeadlineAbortsRealStalledProduce`,
-    `TestSendCancellationAbortsRealStalledProduce`); a fake whose Close
-    releases the send would not exercise the abortive path.
-  - `Close` aborts the producer's outstanding network operations and JOINS
-    the worker it owns before returning; there is no timer
-    (`TestCloseAbortsAndJoinsWithoutTimer`). The join is bounded by the
-    same sarama floor, not by a deadline.
+    cancellation `sendBatch` closes the batch's client, which fails the
+    buffered/in-flight records promptly, and JOINS the worker before
+    returning. `TestSendDeliveryDeadlineAbortsStalledProduce` and
+    `TestSendCancellationAbortsStalledProduce` pin it through the producer
+    seam (a produce that blocks until Close, mirroring `kgo.Client.Close`).
+  - `Close` closes the client (closing every connection and failing
+    buffered records) and JOINS nothing on a timer; it returns promptly
+    (`TestCloseAbortsAndJoinsWithoutTimer`).
   `TestEnsureProducerRespectsCancellation` and
-  `TestMaybeCreateTopicRespectsCancellation` cover the late-client cleanup;
-  `TestSendMessagesCancelledContext` covers the pre-dial short-circuit.
+  `TestMaybeCreateTopicRespectsCancellation` cover the cancelled-connect
+  path; `TestSendMessagesCancelledContext` covers the pre-dial
+  short-circuit.
 - Connect runs inside `SendMessages` (Python's `_init_kafka`), reports
   the connected transition through the `sender.ConnectionReporter` seam
   so the loop resets the shared backoff exponent, and a failure returns
@@ -1855,61 +1857,61 @@ Send path (thread A7):
   cursor — the file sender alone is the durable (disk-buffered) sink
   (`TestSourceNotDurableReporter`).
 
-Sarama limitation — shutdown and cancellation latency floor (this is a
-PROPERTY OF THE LIBRARY, not a defect to engineer around):
+Cancellation is genuinely ctx-driven end to end (franz-go is context-aware;
+the sarama-era tracking dialer and version-inference probe are gone):
 
-- IBM/sarama v1.45.2 is not context-aware. No producer/client API takes a
-  `context.Context` (only `ConsumerGroup.Consume` does); broker dials use
-  the context-less `dialer.Dial` (`sarama/broker.go:203`); every
-  retry/backoff is an uninterruptible `time.Sleep`
-  (`async_producer.go:627,667`, `client.go:961,1156`);
-  `SyncProducer.SendMessages` blocks with no abort path; and
-  `AsyncProducer.Close`/`Client.Close` drain rather than abort. The only
-  lever sarama exposes is to close the underlying `net.Conn` from outside,
-  which is what the tracking dialer does (`dialer.go`; `abort()`).
-- Closing the connection fails the in-flight I/O promptly, but sarama then
-  runs its retry loop with uninterruptible sleeps. So `SendMessages` (and
-  `Close`) return within a FLOOR of roughly
-  `Producer.Retry.Max × Producer.Retry.Backoff` (`producerRetryMax` =
-  20 × 100 ms = 2 s) plus the metadata path
-  (`Metadata.Retry.Max` 10 × 100 ms = 1 s), i.e. ~3 s — NOT "at once".
-  The round-3 tests assert ≤ 5 s, consistent with that floor. "Immediate"
-  cancellation was never attainable with this library; a bounded,
-  few-second return is.
-- Bounded shutdown therefore does NOT depend on the sender being perfectly
-  abortive. The supervisor caps its join at `senderJoinHardStop` (30 s =
-  the larger of 10 s and one `request_timeout_ms`) and proceeds with
-  finalize/state-save/exit if a sender is still draining
-  (`internal/daemon/pump.go`; charter deviation, operator-visible). This is
-  what keeps process shutdown bounded regardless of the sarama floor. A
-  further finding of the form "sarama still sleeps/retries after the socket
-  is closed" is answered by this bound, not by more code.
+- `kgo.Client` dials, producer, and `kadm` admin requests all take the
+  caller's `context.Context`. There is no context-less dial hook and no
+  socket-force-close workaround.
+- The one franz-go sharp edge (verified empirically and documented in the
+  code): `kgo.Client.Ping(ctx)` does NOT abort an in-flight request to a
+  broker that accepted the TCP connection but never answers, even after the
+  context is cancelled. The documented lever is `cl.Close()`, which closes
+  the connections and fails buffered/in-flight records. `doWithClose`
+  closes the client on `ctx.Done` and then joins, so construction (metadata)
+  and admin (topic-create) abort promptly:
+  `TestConnectProducerCancellationTerminatesMetadata` is the REAL-client
+  proof against a silent broker.
+- `Close` calls `cl.Close()` (closing every connection and failing buffered
+  records) and returns immediately — no timer, no drain
+  (`TestCloseAbortsAndJoinsWithoutTimer`).
+- The `sendErrors` aggregate preserves the franz-go per-record causes
+  (`errors.Is`/`As`, rendered text) so the retriable classification sees
+  each cause.
 
-Unit tests use the maintained sarama mocks
-(`github.com/IBM/sarama/mocks`) behind a `producer`/`admin` seam
-(thread B): `TestSendMessagesSuccess` checks the topic/key/value of each
-`*sarama.ProducerMessage`, `TestSendMessagesWithoutKey` the nil-key
-case, `TestSendMessagesFailureDropsProducer` the teardown, and
+Bounded shutdown is retained as DEFENCE IN DEPTH, not as a workaround for a
+library floor. The supervisor still caps its join at `senderJoinHardStop`
+(30 s = the larger of 10 s and one `request_timeout_ms`) and proceeds with
+finalize/state-save/exit if a sender is still draining
+(`internal/daemon/pump.go`; charter deviation, operator-visible). franz-go
+aborts in-flight work on cancellation, so the bound rarely engages; it is
+kept so a future regression cannot wedge process shutdown.
+
+Unit tests use a `producer`/`admin` seam (a recording producer and a fake
+admin), not library mocks: `TestSendMessagesSuccess` checks the
+topic/key/value of each batch handed to the producer,
+`TestSendMessagesWithoutKey` the nil-key case,
+`TestSendMessagesFailureDropsProducer` the teardown, and
 `TestEnsureProducerReportsConnected` the `ConnectionReporter` wiring.
 `loop_test.go` drives the same path through the REAL `sender.Loop` with a
 recording producer: exact ordered payload bytes/key/topic, a delayed ack,
-a retriable `ProducerErrors` batch (teardown + resend + cursor advances
-only on success) and a mixed-cause batch (permanent path, whole-batch
-resend, `TopicAlreadyExists` re-init tolerated) (review item E14). The
-fake holds acknowledgements on an explicit gate so the tests inspect the
-loop state WHILE an ack is pending and DURING failure/retry, not only
-after recovery: the delayed-ack test asserts `sent.count == 0` and a nil
-sent cursor with the ack outstanding; the retry test parks the retry's
-reconnect and asserts the failed batch's cause is in the health ring and
-the status is `disconnected` mid-retry (items 7/9). The mixed-cause test
-requires exactly two admin initialization attempts (initial connect +
-reconnect), not merely `> 0`, so a skipped topic-create re-init cannot
-pass by accident (item 9).
+a retriable batch (teardown + resend + cursor advances only on success) and
+a mixed-cause batch (permanent path, whole-batch resend, `TopicAlreadyExists`
+re-init tolerated) (review item E14). The fake holds acknowledgements on an
+explicit gate so the tests inspect the loop state WHILE an ack is pending
+and DURING failure/retry, not only after recovery: the delayed-ack test
+asserts `sent.count == 0` and a nil sent cursor with the ack outstanding;
+the retry test parks the retry's reconnect and asserts the failed batch's
+cause is in the health ring and the status is `disconnected` mid-retry
+(items 7/9). The mixed-cause test requires exactly two admin initialization
+attempts (initial connect + reconnect), not merely `> 0`, so a skipped
+topic-create re-init cannot pass by accident (item 9).
 
 systest: `systest-go/kafka_e2e_test.go` drives the real binary against a
 real Kafka 4.0 KRaft broker and asserts the Task 12 fixture ground truth
 (payload bytes, key, partition, sent count/cursor) for the auto-create and
-the admin-create/keyed scenarios, consuming with a sarama consumer.
+the admin-create/keyed scenarios, consuming with a franz-go (`kgo`)
+consumer.
 `TestKafkaPythonConsumerInterop` is the committed snappy interop
 regression: it produces the keyed scenario and reads it back with the
 DEPLOYED kafka-python client (the committed
@@ -2127,9 +2129,82 @@ Recorded divergences / open items for adjudication:
   (generic path), while sarama's no-brokers error is retriable. Edge
   case, not exercised by the ported tests.
 - snappy interop verdict (spec risk 10, charter §2/D5): RESOLVED — no
-  deviation. sarama's `CompressionSnappy` output is consumable by
+  deviation. The client's `SnappyCompression` output is consumable by
   kafka-python, now pinned by the committed
   `TestKafkaPythonConsumerInterop` (review item E15) instead of evidence
   alone: the Go sender (built with `-race -tags systest`) produces the
   Task 12 keyed scenario to a fresh 2-partition topic and the
   kafka-python consumer reads the fixture payloads/key/partition back.
+
+Review round 5 (user-directed client switch): REPLACE IBM/sarama with
+`github.com/twmb/franz-go` (`kgo` + `kadm`). Basis: the read-only
+assessment `docs/assess-kafka-client.md`. This is a DIRECT REWRITE, no
+spike; every round-1–4 statement about sarama above is superseded here.
+The framework contract is unchanged: `sender.Sender` /
+`SendMessages(ctx, …)` / `sender.Loop` are untouched and all kafka
+specifics stay inside `internal/sender/kafka`.
+
+What franz-go handles NATIVELY (work deleted from our side):
+
+- Context-awareness everywhere. `kgo.Client` dials, the producer
+  (`ProduceSync(ctx, …)`), and `kadm` admin requests all take the caller's
+  `context.Context`. The sarama-era tracking dialer (recording every
+  `net.Conn` for external force-close) and its whole force-close
+  machinery (`dialer.go`, `abort()`) are DELETED. The `Net.Proxy.Enable`
+  dialer-hook abuse is gone; SOCKS is a plain `kgo.Dialer` that takes the
+  request context (`socks5.go`).
+- Version negotiation. `kgo.MaxVersions` sets an explicit API-version
+  ceiling; unset, franz-go auto-negotiates. The sarama-era
+  version-inference probe (ApiVersions parsing, pre-0.10 ListGroups /
+  FindCoordinator fallbacks, the SASL-off bootstrap probe, the
+  SASLHandshake-version fallback) is DELETED together with `scram.go`;
+  SASL PLAIN/SCRAM now come from `github.com/twmb/franz-go/pkg/sasl`.
+- Topic creation tolerance. `kadm.CreateTopic` returns a structured
+  `kerr.TopicAlreadyExists`, classified as non-retriable/benign by our
+  `sendErrors` path — the same re-init tolerance the sarama code
+  hand-rolled is now just an error-code check.
+- Retriable classification. franz-go returns structured `*kerr.Error`
+  values; `Retriable` maps their `Code` through an explicit numeric table
+  that keeps kafka-python's `KAFKA_CONN_ERRORS` parity (e.g.
+  `BrokerNotAvailable`=8 is NOT retriable even though kerr flags it so),
+  replacing the sarama `KError` retriable table.
+
+What we still add on top of franz-go:
+
+- `doWithClose`: the documented franz-go lever for the one gap found
+  empirically — `cl.Ping(ctx)` does not abort an in-flight request to a
+  broker that accepted the TCP connection but never answers, even after
+  ctx cancel. `doWithClose` runs the call in a goroutine and calls
+  `cl.Close()` on `ctx.Done`, then joins. Used for construction
+  (metadata) and admin (topic-create).
+- The client-side delivery deadline (`sendBatch` goroutine +
+  `deliveryDeadline`) distinct from the broker-side
+  `ProduceRequestTimeout`, mirroring kafka-python's `delivery_timeout_ms`
+  / `request_timeout_ms` split.
+- The murmur2 partitioner ported onto the franz-go
+  `Partitioner`/`TopicPartitioner` interfaces (`partitioner.go`).
+- The bounded supervisor join (`waitSendersBounded`) is KEPT, now as
+  defence in depth rather than a sarama-floor workaround (see above).
+- The custom SOCKS5 dialer (`socks5.go`, still `socks5h` semantics) and
+  the reconnect-backoff semantics (`RetryBackoffFn` fixed at
+  `reconnect_backoff_ms`; franz-go re-dials internally, so the sarama-era
+  per-address `backoffDialer` jitter tracker is not carried over).
+
+Operator-visible deviation recorded in charter §2: dropping pre-0.10
+broker version inference. The sender supports brokers 0.10.0+ (version
+auto-negotiated, or pinned explicitly via `kafka_api_version` →
+`kgo.MaxVersions`); pre-0.10 brokers are no longer probed. The intended
+deployment (charter D5 / spec: apache/kafka 4.0) is unaffected.
+
+Verification (all UNCACHED + a real broker):
+
+- `go test -race -count=1 ./...` — PASS (all packages).
+- `golangci-lint run ./...` — 0 issues.
+- `JOURNALPUMP_BIN=go python -m pytest -q systest/` — 38 passed.
+- `python -m pytest -q test/` — 160 passed.
+- `make systest-go-kafka` (podman apache/kafka:4.0.0 KRaft, `-race
+  -count=1 -tags systest -v`) — PASS: `TestKafkaSenderEndToEnd`
+  (`auto-create` requires `kgo.AllowAutoTopicCreation`, ON by default in
+  sarama, OFF by default in franz-go) and `TestKafkaPythonConsumerInterop`
+  (snappy round-trip read back by the deployed kafka-python client).
+- Code commit `0b73164` (docs in a follow-up commit).
