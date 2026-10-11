@@ -17,6 +17,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/daemon"
 	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/sender"
+	"github.com/Aiven-Open/journalpump/internal/sender/elasticsearch"
 	"github.com/Aiven-Open/journalpump/internal/sender/file"
 	"github.com/Aiven-Open/journalpump/internal/sender/kafka"
 	"github.com/Aiven-Open/journalpump/internal/sender/logplex"
@@ -159,9 +160,12 @@ func isRegularFile(path string) bool {
 //   - rsyslog (Task 20)
 //   - logplex (Task 21)
 //   - kafka (Task 22)
+//   - elasticsearch, opensearch (Task 23)
 func registerSenders() {
 	sender.Register("file", file.New)
 	sender.Register("rsyslog", rsyslog.New)
 	sender.Register("logplex", logplex.New)
 	sender.Register("kafka", kafka.New)
+	sender.Register("elasticsearch", elasticsearch.NewElasticsearch)
+	sender.Register("opensearch", elasticsearch.NewOpenSearch)
 }
