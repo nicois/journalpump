@@ -938,15 +938,12 @@ func newTLSServerWithCert(t *testing.T) (*httptest.Server, *x509.Certificate) {
 }
 
 // TestHTTPClientCAResolution covers requests' merge_environment_settings +
-// merge_setting precedence (the env bundle WINS over session.verify) and
-// OpenSSL capath hashed-directory selection.
+// merge_setting precedence (the env bundle WINS over session.verify) and the
+// fail-closed refusal of a CA DIRECTORY (user decision 2026-10-12).
 func TestHTTPClientCAResolution(t *testing.T) {
 	srv, cert := newTLSServerWithCert(t)
 	dir := t.TempDir()
 	certFile := writeCertPEM(t, dir, "ca.pem", cert)
-	// A capath directory: OpenSSL loads ONLY hashed entries (<hash>.n).
-	hashedDir := t.TempDir()
-	writeCertPEM(t, hashedDir, "9d66eef0.0", cert)
 
 	// With no environment override, these verify against the TLS server.
 	for _, tc := range []struct {
@@ -955,7 +952,6 @@ func TestHTTPClientCAResolution(t *testing.T) {
 		env  map[string]string
 	}{
 		{"ca-file", certFile, nil},
-		{"ca-hashed-directory", hashedDir, nil},
 		{"requests-ca-bundle-env", true, map[string]string{"REQUESTS_CA_BUNDLE": certFile}},
 		{"curl-ca-bundle-env", true, map[string]string{"CURL_CA_BUNDLE": certFile}},
 		// The env bundle WINS over session.verify, even when ca is false, "" or
@@ -1008,27 +1004,29 @@ func TestHTTPClientCAResolution(t *testing.T) {
 		})
 	}
 
-	// An UN-HASHED PEM in a capath directory must NOT contribute trust:
-	// OpenSSL never loads it. Write a second server's cert as plain server.pem
-	// next to the hashed entry for server srv; the client must verify srv but
-	// REJECT the second server.
-	t.Run("unhased-entry-ignored", func(t *testing.T) {
+	// A CA DIRECTORY is refused at load (fail closed): trusting every
+	// hashed-looking file would broaden trust beyond OpenSSL's subject-hash
+	// capath lookup, so the config is rejected instead.
+	t.Run("ca-directory-rejected", func(t *testing.T) {
 		t.Setenv("REQUESTS_CA_BUNDLE", "")
 		t.Setenv("CURL_CA_BUNDLE", "")
-		other, otherCert := newTLSServerWithCert(t)
-		mixed := t.TempDir()
-		writeCertPEM(t, mixed, "9d66eef0.0", cert)      // hashed: server srv
-		writeCertPEM(t, mixed, "server.pem", otherCert) // un-hashed: must be ignored
+		hashedDir := t.TempDir()
+		writeCertPEM(t, hashedDir, "9d66eef0.0", cert) // even a hashed entry is refused
+		_, err := newHTTPClient(hashedDir)
+		if err == nil {
+			t.Fatal("newHTTPClient accepted a CA directory")
+		}
+		if !strings.Contains(err.Error(), "directory") || !strings.Contains(err.Error(), "unsupported") {
+			t.Fatalf("directory rejection message = %q, want a clear 'unsupported directory' error", err)
+		}
+	})
 
-		client, err := newHTTPClient(mixed)
-		if err != nil {
-			t.Fatalf("newHTTPClient(mixed): %v", err)
-		}
-		if err := clientGets(t, client, srv.URL); err != nil {
-			t.Fatalf("hashed entry must be trusted: %v", err)
-		}
-		if err := clientGets(t, client, other.URL); err == nil {
-			t.Fatal("un-hashed PEM in a capath directory must NOT be trusted")
+	// A CA directory reached through an environment bundle is refused too.
+	t.Run("ca-directory-env-rejected", func(t *testing.T) {
+		t.Setenv("CURL_CA_BUNDLE", "")
+		t.Setenv("REQUESTS_CA_BUNDLE", t.TempDir())
+		if _, err := newHTTPClient(true); err == nil || !strings.Contains(err.Error(), "directory") {
+			t.Fatalf("env CA directory err = %v, want a directory rejection", err)
 		}
 	})
 
@@ -1036,11 +1034,6 @@ func TestHTTPClientCAResolution(t *testing.T) {
 	t.Setenv("CURL_CA_BUNDLE", "")
 	if _, err := newHTTPClient(filepath.Join(dir, "nope.pem")); err == nil {
 		t.Error("newHTTPClient accepted a missing CA path")
-	}
-	unhasedDir := t.TempDir()
-	writeCertPEM(t, unhasedDir, "server.pem", cert)
-	if _, err := newHTTPClient(unhasedDir); err == nil {
-		t.Error("newHTTPClient accepted a CA directory with only un-hashed entries")
 	}
 	if _, err := newHTTPClient(t.TempDir()); err == nil {
 		t.Error("newHTTPClient accepted a CA directory with no certificates")

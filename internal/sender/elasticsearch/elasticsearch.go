@@ -27,8 +27,8 @@
 // reused ordinary connection and vice versa. The CA resolution mirrors
 // requests' merge_environment_settings + merge_setting precedence
 // (REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE WIN over session.verify, even when ca is
-// false, empty, or an explicit path; a directory is an OpenSSL capath, so
-// only hashed entries are trusted; an empty/false ca disables verification),
+// false, empty, or an explicit path; an empty/false ca disables verification;
+// a CA DIRECTORY is refused at load — fail closed, user decision 2026-10-12),
 // and the stats.unexpected_exception emissions of the connect/create/delete
 // paths are reproduced. The sender implements io.Closer so the daemon's
 // retire path releases its idle keep-alive connections.
@@ -45,8 +45,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -381,8 +379,8 @@ func newHTTPClient(ca any) (*httpx.InactivityClient, error) {
 //     (FILE or DIRECTORY), regardless of `ca`;
 //   - otherwise `ca` is used: absent / true → the system roots (empty path);
 //     false → verification DISABLED; "" → DISABLED (requests treats a falsy
-//     verify as no verification); another string → a CA bundle FILE, or a
-//     DIRECTORY of OpenSSL-hashed PEM entries.
+//     verify as no verification); another string → a CA bundle FILE (a
+//     DIRECTORY is refused at load — fail closed, user decision 2026-10-12).
 func resolveVerify(ca any) (bundle string, insecure bool, err error) {
 	if env := caBundleFromEnv(); env != "" {
 		return env, false, nil
@@ -415,51 +413,30 @@ func caBundleFromEnv() string {
 	return os.Getenv("CURL_CA_BUNDLE")
 }
 
-// hashedCAPathEntry matches an OpenSSL HASHED CA-directory file name
-// (c_rehash output): eight hex digits forming the subject hash, a dot, and a
-// numeric suffix (e.g. "9d66eef0.0"). OpenSSL's capath loads ONLY such
-// entries (it looks up <hash>.n by the subject of the chain being verified),
-// so a directory of ordinary "*.pem" files contributes NO trust there.
-var hashedCAPathEntry = regexp.MustCompile(`^[0-9a-fA-F]{8}\.[0-9]+$`)
-
-// loadCertPool builds a cert pool from a CA bundle path: a single PEM FILE,
-// or a DIRECTORY used as an OpenSSL capath. For a directory only
-// OpenSSL-HASHED entries (see hashedCAPathEntry) are read — requests passes a
-// directory verify through as ca_cert_dir, and OpenSSL then selects hashed
-// entries, so reading every PEM would broaden trust beyond requests
-// (e.g. accepting an un-hashed server.pem OpenSSL would never load).
+// loadCertPool builds a cert pool from a CA bundle FILE. A DIRECTORY is
+// REFUSED (fail closed, user decision 2026-10-12): requests passes a
+// directory verify to OpenSSL as a capath, whose entries are selected by the
+// SUBJECT HASH of the chain being verified (plus collision-sequence
+// numbering), and reproducing that faithfully is not cheap; silently trusting
+// every hashed-looking file would instead broaden trust beyond OpenSSL.
+// Refusing the configuration never trusts more than Python would — it just
+// refuses the config.
 func loadCertPool(path string) (*x509.CertPool, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("ca: %w", err)
 	}
-	pool := x509.NewCertPool()
-	var added bool
 	if info.IsDir() {
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			return nil, fmt.Errorf("ca: %w", err)
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || !hashedCAPathEntry.MatchString(entry.Name()) {
-				continue
-			}
-			pem, err := os.ReadFile(filepath.Join(path, entry.Name()))
-			if err != nil {
-				return nil, fmt.Errorf("ca: %w", err)
-			}
-			if pool.AppendCertsFromPEM(pem) {
-				added = true
-			}
-		}
-	} else {
-		pem, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("ca: %w", err)
-		}
-		added = pool.AppendCertsFromPEM(pem)
+		return nil, fmt.Errorf(
+			"ca: a CA directory path is unsupported (OpenSSL capath subject-hash selection cannot be reproduced faithfully); use a CA bundle file or the system store: %q", path,
+		)
 	}
-	if !added {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("ca: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if added := pool.AppendCertsFromPEM(pem); !added {
 		return nil, fmt.Errorf("ca: %q contains no PEM certificates", path)
 	}
 	return pool, nil
