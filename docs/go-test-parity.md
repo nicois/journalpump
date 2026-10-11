@@ -2376,15 +2376,29 @@ Wire and config:
 HTTP client (parity, 2026-10-11 review rounds — no §2 deviation remains):
 
 - Timeout: requests' per-request INACTIVITY timeout applied at each REQUEST
-  boundary (`httpx.InactivityClient`; the deadline resets on every
-  read/write), NOT a total context deadline and NOT fixed at dial time — a
-  slow-but-progressing response is not aborted, and a reused keep-alive
-  connection carries the CURRENT request's timeout rather than the one that
-  dialed it. The bulk request uses 2× the configured timeout (Python's
+  boundary and to the correct PHASE (`httpx.InactivityClient`; the deadline
+  resets on every read/write), NOT a total context deadline and NOT fixed at
+  dial time — a reused keep-alive connection carries the CURRENT request's
+  timeout rather than the one that dialed it, and the response-read deadline
+  is armed only AFTER the request is written (via an httptrace
+  `WroteRequest` hook), so a progressing upload whose TOTAL outlasts the
+  timeout is not aborted before reading should begin (urllib3 arms its read
+  timeout after sending). All timeout/deadline updates for the current
+  request are serialized under one mutex, so a background read that already
+  loaded the previous timeout cannot overwrite a deadline installed at a new
+  request boundary. The bulk request uses 2× the configured timeout (Python's
   `timeout=request_timeout*2`); an ordinary request reusing a connection a
-  bulk just used does NOT inherit the bulk's 2× (`TestInactivityTimeoutPerRequestOnReusedConnection`,
-  ordinary→bulk→ordinary with gaps that distinguish 0.15 s from 0.3 s, on a
-  single counted keep-alive connection). A configured non-positive
+  bulk just used does NOT inherit the bulk's 2×
+  (`TestInactivityTimeoutPerRequestOnReusedConnection`, ordinary→bulk→ordinary
+  with gaps that distinguish 0.15 s from 0.3 s, on a single counted
+  keep-alive connection). The phase/boundary rules are pinned
+  deterministically (channel-driven, no timing reliance) by
+  `TestInactivityClientTimeoutPerPhaseAndBoundary` (upload arms no read
+  deadline; the read phase arms the current timeout; a new boundary replaces
+  it) and `TestInactivityClientBoundaryUpdateWithPendingRead` (a pending
+  background read cannot overwrite the new boundary deadline), and end-to-end
+  by `TestInactivityClientProgressingUploadExceedsTimeout` (a 400 ms paced
+  upload under a 200 ms timeout succeeds). A configured non-positive
   `*_timeout` (zero AND negative) is REJECTED at load, matching requests
   (`get_requests_session` installs a `TimeoutAdapter` whose fallback IS the
   configured value, which requests rejects when non-positive); this differs
@@ -2409,6 +2423,15 @@ HTTP client (parity, 2026-10-11 review rounds — no §2 deviation remains):
   `/etc/pki/tls/certs/ca-bundle.crt`, a symlink to it), so Python and Go
   trust the SAME CAs. The bundled Mozilla certifi set would differ only for
   a non-RPM (pip) install, which is not the supported deployment.
+- OPEN, escalated to the USER (round 3 items 3/4 — NOT implemented pending the
+  ruling): (a) CA-DIRECTORY SUBJECT-HASH semantics — the Go port currently
+  loads every OpenSSL-hashed entry (`<hash>.n`) into one pool, whereas OpenSSL
+  capath looks up `<hash>.n` by the SUBJECT hash of the chain being verified;
+  whether to reproduce that per-subject bucketing (or accept the broader
+  hashed set) is an operator-visible decision. (b) DEFAULT TRUST-SET BREADTH —
+  whether the default (no `ca`, no `*_CA_BUNDLE`) trust sources should be
+  restricted to match certifi's file exactly rather than the full
+  `x509.SystemCertPool`. Do NOT change either until the user rules.
 - `stats.unexpected_exception` is reproduced for the connect
   (`es_pump_init_es_client`), create (`es_pump_create_index_and_mappings`)
   and delete (`es_pump_check_indices`) paths, via the pump statsd client
