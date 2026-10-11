@@ -2240,12 +2240,13 @@ stay inside `internal/sender/kafka` plus one shutdown refinement.
    socks5+TLS option set.
 2. Per-broker reconnect backoff restored. `reconnect.go` reproduces
    kafka-python `BrokerConnection`'s scheduling per broker ADDRESS
-   (1s→10s, ±20% jitter, measured from the attempt START, reset after a
-   complete connection) on the kgo dialer; `dial.go` records the dial
-   outcome (connected/failed) and enforces the interval ctx-aware before
-   dialing. `reconnect_test.go` pins remaining-interval accounting,
-   measurement from attempt start, growth/cap/reset, per-address
-   isolation and ctx-honoring.
+   (1s→10s, ±20% jitter, measured from the attempt START) on the kgo
+   dialer, which enforces the interval ctx-aware before dialing.
+   `reconnect_test.go` pins remaining-interval accounting, measurement
+   from attempt start, growth/cap/reset, per-address isolation and
+   ctx-honoring. (Round 7 moved success/failure accounting off the dialer
+   onto franz-go's complete-connection hook and corrected the interval
+   sequence — see below.)
 3. Broker-version floor is strict-at-load. `New` rejects a
    `kafka_api_version` below 0.10.0 (and non-string values) when the
    configuration is loaded; the version constructor table starts at
@@ -2281,3 +2282,36 @@ Verification (all UNCACHED + a real broker):
 - `python -m pytest -q test/` — 160 passed.
 - `make systest-go-kafka` (podman apache/kafka:4.0.0 KRaft, `-race
   -count=1 -tags systest -v`) — PASS.
+
+Review round 7 (confirmation of round 6; verdict changes-required, 2 majors
++ 1 minor). All fixed, still inside `internal/sender/kafka`.
+
+1. Success/failure accounting moved to the COMPLETE-connection outcome.
+   The dialer no longer resets the reconnect history on a TCP/TLS success:
+   `brokerConnectHook` (`dial.go`) implements `kgo.HookBrokerConnect` and
+   resets/grows the backoff from franz-go's per-ATTEMPT outcome, which
+   fires only after ApiVersions and any SASL flow with `err` set on
+   failure. `clientOpts` installs the hook alongside the dialer
+   (`kgo.WithHooks`). Proof: `TestDialerTCPOnlySuccessDoesNotResetBackoff`
+   (a real TCP success leaves the failure count intact),
+   `TestBrokerConnectHookDrivesCompleteOutcome` (post-connect failures
+   grow, a complete connection resets), and the real-client
+   `TestRealClientIncompleteConnectionCountsAsFailure` (a real kgo client
+   against a broker that accepts TCP but never answers records failures and
+   does not reset) and `TestRealClientCompleteConnectionResetsBackoff`
+   (a real kgo client against a fully-negotiating fake broker resets).
+2. The connect+TLS attempt is bounded by the dialer's OWN deadline.
+   `kafkaDialer.DialContext` wraps the caller context with
+   `context.WithTimeout(d.timeout)` (default 10s) for BOTH the connect and
+   the `HandshakeContext`, so a broker that accepts TCP but never completes
+   TLS cannot stall initialization even when the caller supplies no
+   deadline. Proof: `TestTLSHandshakeBoundedWithoutCallerCancel` (direct)
+   and `TestTLSHandshakeBoundedThroughProxy` (SOCKS5 path), both against a
+   listener that reads but never completes the handshake and with no caller
+   cancellation.
+3. Interval scheduled before it grows. `reconnect.go` tracks a consecutive
+   FAILURE count and derives the next interval (`intervalFor`), so the
+   actual waits are 1s, 2s, 4s, 8s, 10s — the first retry no longer doubles
+   the initial 1s before its first use.
+   `TestReconnectBackoffActualWaitsGrowFromBase` observes the waits on the
+   virtual clock (not just the stored value).
