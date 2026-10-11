@@ -27,6 +27,7 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/reader"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 	senderfile "github.com/Aiven-Open/journalpump/internal/sender/file"
+	senderkafka "github.com/Aiven-Open/journalpump/internal/sender/kafka"
 	"github.com/Aiven-Open/journalpump/internal/state"
 )
 
@@ -186,6 +187,9 @@ func registerFakeSenders() {
 		// retire path can be exercised against the real Discarder
 		// (CloseDiscarding) implementation.
 		sender.Register("file", senderfile.New)
+		// kafka is the production sender registered so version-floor
+		// load/reload tests exercise the real constructor path.
+		sender.Register("kafka", senderkafka.New)
 	})
 }
 
@@ -673,6 +677,86 @@ func TestWriteLimitsAllSendersFailed(t *testing.T) {
 	}
 	if got := rt.writeLimitBytes(); got != 0 {
 		t.Errorf("writeLimitBytes = %d, want 0", got)
+	}
+}
+
+// TestSenderKafkaPre010RejectedAtLoadAndReload locks item 3 at the daemon
+// level: a kafka sender configured below the 0.10.0 floor is rejected when its
+// configuration is loaded (initialize_senders, strict-at-load), counted as a
+// failed sender and never made live; and because senders are re-initialized on
+// every reader recreation, a reload that recreates the reader rejects it again
+// rather than accepting it late. The 0.10.0 floor itself is accepted.
+func TestSenderKafkaPre010RejectedAtLoadAndReload(t *testing.T) {
+	registerFakeSenders()
+	overrideReopener(t)
+	readerBlob := func(topic, version string) string {
+		return fmt.Sprintf(`{"readers":{"r":{"senders":{"s":{"output_type":"kafka","kafka_address":"127.0.0.1:9092","kafka_topic":%q,"kafka_api_version":%q}}}}}`, topic, version)
+	}
+
+	// Floor acceptance at the daemon wiring: 0.10.0 constructs.
+	okCtor, err := sender.Lookup("kafka")
+	if err != nil {
+		t.Fatalf("Lookup(kafka): %v", err)
+	}
+	if _, err := okCtor(sender.ConstructorArgs{Name: "ok", Config: map[string]any{
+		"kafka_address":     "127.0.0.1:9092",
+		"kafka_topic":       "t",
+		"kafka_api_version": "0.10.0",
+	}}); err != nil {
+		t.Fatalf("0.10.0 sender construct: %v, want acceptance", err)
+	}
+
+	log := &captureLog{}
+	initial := decodeConfig(t, readerBlob("old", "0.9.0"))
+	p, err := NewPump(initial, PumpDeps{Log: log})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel := startReaderGroup(p)
+	defer cancel()
+	t.Cleanup(func() { retireAll(p) })
+
+	// Startup: the pre-0.10 version is rejected during sender loading.
+	p.readers[0].initSenders()
+	if p.readers[0].failedSenders != 1 {
+		t.Fatalf("startup failedSenders = %d, want 1", p.readers[0].failedSenders)
+	}
+	if len(p.senders) != 0 {
+		t.Fatalf("startup live senders = %d, want 0", len(p.senders))
+	}
+	if !log.contains(`Sender "s" failed to initialize`) || !log.contains("minimum 0.10.0") {
+		t.Errorf("startup rejection not logged with the floor; got %v", log.lines)
+	}
+
+	// Reload with a changed readers blob recreates the reader; the same
+	// invalid version must be rejected again, not accepted late.
+	updated := decodeConfig(t, readerBlob("new", "0.9.0"))
+	if err := p.handleNewConfig(updated); err != nil {
+		t.Fatalf("handleNewConfig: %v", err)
+	}
+	if len(p.readers) != 1 {
+		t.Fatalf("readers = %d, want 1", len(p.readers))
+	}
+	// The replacement reader opens asynchronously and initializes its
+	// senders at the tail of get_reader; wait for that attempt to land.
+	// failedSenders is written under rt.mu by the reader goroutine.
+	failedSenders := func(rt *ReaderRuntime) int {
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		return rt.failedSenders
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for failedSenders(p.readers[0]) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if failedSenders(p.readers[0]) != 1 {
+		t.Fatalf("reload failedSenders = %d, want 1", failedSenders(p.readers[0]))
+	}
+	p.senderMu.Lock()
+	liveSenders := len(p.senders)
+	p.senderMu.Unlock()
+	if liveSenders != 0 {
+		t.Fatalf("reload live senders = %d, want 0", liveSenders)
 	}
 }
 
@@ -1427,6 +1511,77 @@ func (c *closeableTransport) Close() error {
 	return nil
 }
 
+// blockingCleanupTransport models a transport whose send AND cleanup both stay
+// blocked: Finalize and Close record the call and then block until released.
+// Used to prove shutdown EXCLUDES a still-draining sender from synchronous
+// cleanup (item 5) rather than wedging on it.
+type blockingCleanupTransport struct {
+	fakeTransport
+	block          chan struct{}
+	finalizeCalled bool
+	closeCalled    bool
+}
+
+func (b *blockingCleanupTransport) Finalize() error {
+	b.finalizeCalled = true
+	<-b.block
+	return nil
+}
+
+func (b *blockingCleanupTransport) Close() error {
+	b.closeCalled = true
+	<-b.block
+	return nil
+}
+
+// TestShutdownSkipsCleanupForDrainingSender locks item 5: a sender that has
+// not joined within the bound is excluded from the synchronous Finalize/Close
+// cleanup, so a transport whose send AND close both stay blocked cannot wedge
+// shutdown. The bounded join proceeds, state is saved, and the process exits.
+func TestShutdownSkipsCleanupForDrainingSender(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testPumpConfig(map[string]config.ReaderConfig{"r": fakeReaderConfig(nil)})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfg.JSONStateFilePath = statePath
+		p, _ := newTestRuntime(t, cfg, &captureLog{})
+		p.statePath = statePath
+
+		// The sender group never finishes, forcing the hard stop.
+		release := make(chan struct{})
+		p.senderGroup.Go(func() error { <-release; return nil })
+		t.Cleanup(func() { close(release) })
+
+		transport := &blockingCleanupTransport{block: make(chan struct{})}
+		t.Cleanup(func() { close(transport.block) })
+		entry := &senderEntry{
+			name:   "kafka",
+			cancel: func() {},
+			done:   make(chan struct{}), // never closed → still draining
+			inst:   sender.Instance{Transport: transport},
+		}
+		p.senderMu.Lock()
+		p.senders["r"] = []*senderEntry{entry}
+		p.senderMu.Unlock()
+
+		done := make(chan error, 1)
+		go func() { done <- p.shutdown(func() {}, func() error { return nil }) }()
+		select {
+		case <-done:
+		case <-time.After(2 * senderJoinHardStop):
+			t.Fatal("shutdown did not return; a blocked transport wedged it")
+		}
+		if transport.finalizeCalled {
+			t.Error("Finalize was called on a sender that did not join within the bound")
+		}
+		if transport.closeCalled {
+			t.Error("Close was called on a sender that did not join within the bound")
+		}
+		if _, statErr := os.Stat(statePath); statErr != nil {
+			t.Errorf("state not saved despite the draining sender: %v", statErr)
+		}
+	})
+}
+
 // TestShutdownCleanupDespiteNotifyError locks the cleanup guarantee: a
 // STOPPING notification failure is returned as Run's result but never
 // skips sender cancellation, state save, or transport closure.
@@ -1487,11 +1642,15 @@ func TestWaitSendersBoundedProceedsAfterHardStop(t *testing.T) {
 		live := []liveSender{{reader: "r", entry: entry}}
 
 		start := time.Now()
-		if err := p.waitSendersBounded(live); err != nil {
+		draining, err := p.waitSendersBounded(live)
+		if err != nil {
 			t.Fatalf("waitSendersBounded err = %v, want nil (proceed at the hard stop)", err)
 		}
 		if elapsed := time.Since(start); elapsed < senderJoinHardStop {
 			t.Fatalf("returned after %v, want the %v hard stop", elapsed, senderJoinHardStop)
+		}
+		if !draining[entry] {
+			t.Error("the still-draining sender was not reported, so shutdown would synchronously Finalize/Close it")
 		}
 		if !log.containsError("still draining") || !log.containsError("kafka") {
 			t.Errorf("hard-stop warning missing or did not name the sender; lines = %v", log.lines)
@@ -1513,8 +1672,12 @@ func TestWaitSendersBoundedJoinsCleanlyWhenSendersFinish(t *testing.T) {
 		p.senderGroup.Go(func() error { return nil })
 
 		entry := &senderEntry{name: "kafka", done: done}
-		if err := p.waitSendersBounded([]liveSender{{reader: "r", entry: entry}}); err != nil {
+		draining, err := p.waitSendersBounded([]liveSender{{reader: "r", entry: entry}})
+		if err != nil {
 			t.Fatalf("waitSendersBounded err = %v, want nil", err)
+		}
+		if len(draining) != 0 {
+			t.Errorf("draining = %v, want empty on the clean path", draining)
 		}
 		if log.containsError("still draining") {
 			t.Errorf("unexpected hard-stop warning on the clean path; lines = %v", log.lines)

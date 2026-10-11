@@ -468,7 +468,8 @@ func TestProducerConfigInheritsClientConfig(t *testing.T) {
 
 // TestNormalizeKafkaVersion covers the kafka-python accepted syntax
 // (review item D10): "auto" (and empty) mean broker negotiation, "X.Y" and
-// "X.Y.Z" are zero-padded, and a trailing zero component is tolerated.
+// "X.Y.Z" are zero-padded, a trailing zero component is tolerated, and the
+// 0.10.0 floor is enforced (item 3: pre-0.10 versions are rejected).
 func TestNormalizeKafkaVersion(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -476,6 +477,7 @@ func TestNormalizeKafkaVersion(t *testing.T) {
 	}{
 		{"2.5.0", "2.5.0"},
 		{"2.5", "2.5.0"},
+		{"0.10.0", "0.10.0"},
 		{"0.10.2", "0.10.2"},
 		{"0.10.2.0", "0.10.2"},
 		{"0.10", "0.10.0"},
@@ -497,10 +499,45 @@ func TestNormalizeKafkaVersion(t *testing.T) {
 			t.Errorf("normalizeKafkaVersion(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
-	for _, bad := range []string{"not-a-version", "2.x", "a.b.c", "9.9.9", "2.5.0.1"} {
+	for _, bad := range []string{
+		"not-a-version", "2.x", "a.b.c", "9.9.9", "2.5.0.1",
+		// Below the 0.10.0 floor.
+		"0.9.0", "0.9", "0.8.2", "0.8.0", "0.0.1",
+	} {
 		if _, err := normalizeKafkaVersion(bad); err == nil {
 			t.Errorf("normalizeKafkaVersion(%q): want error", bad)
 		}
+	}
+}
+
+// TestNewRejectsPreKafka010AtLoad: a pre-0.10 kafka_api_version must fail
+// CONSTRUCTION (startup and reload both call New), not surface lazily on the
+// first send (review item 3, spec §6.1(c)). The 0.10.0 floor is accepted.
+func TestNewRejectsPreKafka010AtLoad(t *testing.T) {
+	for _, bad := range []string{"0.8.2", "0.9.0", "0.9"} {
+		raw := baseConfig()
+		raw["kafka_api_version"] = bad
+		if _, err := New(sender.ConstructorArgs{Name: "test-sender", Config: raw}); err == nil {
+			t.Errorf("New with kafka_api_version=%q: want a load-time error, got nil", bad)
+		}
+	}
+	// The floor and above are accepted at load.
+	for _, good := range []string{"0.10.0", "0.10", "2.5.0", "auto"} {
+		raw := baseConfig()
+		raw["kafka_api_version"] = good
+		if _, err := New(sender.ConstructorArgs{Name: "test-sender", Config: raw}); err != nil {
+			t.Errorf("New with kafka_api_version=%q: %v", good, err)
+		}
+	}
+}
+
+// TestNewRejectsNonStringAPIVersionAtLoad: a present non-string version is a
+// load-time error too.
+func TestNewRejectsNonStringAPIVersionAtLoad(t *testing.T) {
+	raw := baseConfig()
+	raw["kafka_api_version"] = 25
+	if _, err := New(sender.ConstructorArgs{Name: "test-sender", Config: raw}); err == nil {
+		t.Fatal("New with a numeric kafka_api_version: want a load-time error, got nil")
 	}
 }
 

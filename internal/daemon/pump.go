@@ -1483,12 +1483,18 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 	for _, l := range live {
 		l.entry.cancel()
 	}
-	senderErr := p.waitSendersBounded(live)
+	draining, senderErr := p.waitSendersBounded(live)
 
 	// Finalize buffered transports BEFORE the final state save: the
 	// bytes a sender buffered (e.g. the file sender's BufferedWriter)
 	// are only durable once flushed here. A failed flush is surfaced
 	// and the affected sender's sent cursor is rolled back below.
+	//
+	// A sender that did not join within the bound is EXCLUDED from this
+	// synchronous cleanup (item 5): both Finalize and Close can block, and
+	// blocking shutdown on a stuck transport would defeat the bounded join.
+	// The process proceeds to save state and exit with that sender's
+	// persisted cursor at its flushed boundary (the sanctioned §2 deviation).
 	var flushErr error
 	type flushFailure struct {
 		reader string
@@ -1496,6 +1502,10 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 	}
 	var flushFailures []flushFailure
 	for _, l := range live {
+		if draining[l.entry] {
+			// Already named in the bounded-join warning; skip its cleanup.
+			continue
+		}
 		finalizer, ok := l.entry.inst.Transport.(sender.Finalizer)
 		if !ok {
 			continue
@@ -1528,6 +1538,11 @@ func (p *Pump) shutdown(cancelReaders context.CancelFunc, waitReaders func() err
 		p.logError("Saving state at shutdown failed: %v", err)
 	}
 	for _, l := range live {
+		if draining[l.entry] {
+			// Do not synchronously Close a transport whose Close may block;
+			// the block would defeat the bounded join. Let the process exit.
+			continue
+		}
 		if closer, ok := l.entry.inst.Transport.(io.Closer); ok {
 			_ = closer.Close()
 		}
@@ -1596,28 +1611,32 @@ type liveSender struct {
 
 // waitSendersBounded waits for the sender group to finish, but no longer
 // than senderJoinHardStop. On timeout it logs which senders are still
-// draining and returns so the supervisor can finalize, save state and exit
-// (see senderJoinHardStop).
-func (p *Pump) waitSendersBounded(live []liveSender) error {
+// draining, returns the SET of senders that did not join so the supervisor
+// can exclude them from the synchronous finalize/close cleanup (item 5: a
+// transport whose send AND close both block must not wedge shutdown), and
+// returns so the supervisor can save state and exit (see senderJoinHardStop).
+func (p *Pump) waitSendersBounded(live []liveSender) (map[*senderEntry]bool, error) {
 	done := make(chan error, 1)
 	go func() { done <- p.senderGroup.Wait() }()
 	timer := time.NewTimer(senderJoinHardStop)
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		return err
+		return nil, err
 	case <-timer.C:
-		draining := make([]string, 0, len(live))
+		draining := make(map[*senderEntry]bool, len(live))
+		names := make([]string, 0, len(live))
 		for _, l := range live {
 			select {
 			case <-l.entry.done:
 			default:
-				draining = append(draining, l.entry.name)
+				draining[l.entry] = true
+				names = append(names, l.entry.name)
 			}
 		}
-		sort.Strings(draining)
-		p.logError("Sender shutdown exceeded %s; proceeding with shutdown while these senders are still draining: %s", senderJoinHardStop, strings.Join(draining, ", "))
-		return nil
+		sort.Strings(names)
+		p.logError("Sender shutdown exceeded %s; proceeding with shutdown while these senders are still draining: %s", senderJoinHardStop, strings.Join(names, ", "))
+		return draining, nil
 	}
 }
 

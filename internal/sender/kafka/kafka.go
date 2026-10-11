@@ -209,6 +209,20 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	if !ok {
 		return sender.Instance{}, fmt.Errorf("kafka_topic: %v is not a string", rawTopic)
 	}
+	// Strict-at-load version validation (spec §6.1(c), review item 3): a
+	// pre-0.10 kafka_api_version is rejected here, at construction, so a bad
+	// config fails startup and reload instead of surfacing on the first send.
+	// The rest of the transport config stays deferred (Python parses it in
+	// _generate_producer_config on first use), so only the version is eager.
+	if v, present := args.Config["kafka_api_version"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return sender.Instance{}, fmt.Errorf("kafka_api_version: %v is not a string", v)
+		}
+		if _, err := normalizeKafkaVersion(s); err != nil {
+			return sender.Instance{}, err
+		}
+	}
 	s := &Sender{
 		rawConfig:  args.Config,
 		senderName: args.Name,
@@ -350,7 +364,10 @@ func resolveProducerConfig(raw map[string]any) (producerConfig, error) {
 
 // clientOpts projects the resolved config onto franz-go options common to
 // the producer and the admin client: seed brokers, the version pin, the
-// dialer (SOCKS5 when configured), TLS and SASL.
+// dialer (SOCKS5 + per-broker reconnect backoff + TLS when configured) and
+// SASL. TLS is folded into the dialer rather than set via kgo.DialTLSConfig,
+// which franz-go forbids alongside a custom Dialer (item 1) — otherwise a
+// SOCKS5+TLS config would silently drop TLS.
 func (pc producerConfig) clientOpts() ([]kgo.Opt, error) {
 	opts := []kgo.Opt{kgo.SeedBrokers(pc.brokers...)}
 	if pc.apiVersion != "" {
@@ -360,21 +377,11 @@ func (pc producerConfig) clientOpts() ([]kgo.Opt, error) {
 		}
 		opts = append(opts, kgo.MaxVersions(versions))
 	}
-	if pc.socks5Proxy != "" {
-		d, err := socks5Dialer(pc.socks5Proxy)
-		if err != nil {
-			return nil, err
-		}
-		opts = append(opts, kgo.Dialer(d.DialContext))
+	d, err := pc.newDialer()
+	if err != nil {
+		return nil, err
 	}
-	switch pc.securityProtocol {
-	case "SSL", "SASL_SSL":
-		tlsCfg, err := buildTLSConfig(pc)
-		if err != nil {
-			return nil, err
-		}
-		opts = append(opts, kgo.DialTLSConfig(tlsCfg))
-	}
+	opts = append(opts, kgo.Dialer(d.DialContext))
 	if pc.securityProtocol == "SASL_PLAINTEXT" || pc.securityProtocol == "SASL_SSL" {
 		mech, err := saslOption(pc)
 		if err != nil {
@@ -982,12 +989,11 @@ func validSecurityProtocol(name string) bool {
 // franz-go kversion constructor for that release. These are the broker
 // versions our kafka_api_version pin can name; "auto" (an empty normalized
 // value) instead lets franz-go negotiate via ApiVersions on every
-// connection.
+// connection. The map starts at the 0.10.0 FLOOR: pre-0.10 brokers are not
+// supported (the version-inference probes were dropped; charter §2
+// deviation), and normalizeKafkaVersion rejects anything below it at
+// configuration load.
 var versionCtors = map[string]func() *kversion.Versions{
-	"0.8.0":  kversion.V0_8_0,
-	"0.8.1":  kversion.V0_8_1,
-	"0.8.2":  kversion.V0_8_2,
-	"0.9.0":  kversion.V0_9_0,
 	"0.10.0": kversion.V0_10_0,
 	"0.10.1": kversion.V0_10_1,
 	"0.10.2": kversion.V0_10_2,
@@ -1063,6 +1069,10 @@ func normalizeKafkaVersion(s string) (string, error) {
 		nums = append(nums, 0)
 	}
 	normalized := fmt.Sprintf("%d.%d.%d", nums[0], nums[1], nums[2])
+	// Strict-at-load floor (review item 3): pre-0.10 brokers are unsupported.
+	if nums[0] == 0 && nums[1] < 10 {
+		return "", fmt.Errorf("kafka_api_version: %q is not a supported version (minimum 0.10.0)", s)
+	}
 	if _, ok := versionCtors[normalized]; !ok {
 		return "", fmt.Errorf("kafka_api_version: %q is not a valid version", s)
 	}
