@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -800,4 +801,38 @@ func readerNames(readers []*ReaderRuntime) []string {
 // quote renders a path as a JSON string literal.
 func quote(s string) string {
 	return `"` + strings.ReplaceAll(s, `\`, `\\`) + `"`
+}
+
+// closeOnlyTransport is an io.Closer that is NOT a Discarder, so retireReader
+// takes its io.Closer branch (the ES sender's shape: no buffered output to
+// discard, but idle HTTP connections to release).
+type closeOnlyTransport struct {
+	*fakeTransport
+	closes int32
+}
+
+func (t *closeOnlyTransport) Close() error {
+	atomic.AddInt32(&t.closes, 1)
+	return nil
+}
+
+// TestRetireReaderClosesCloserTransport locks that retiring a sender on reload
+// releases io.Closer transports (the ES sender closes its idle connections).
+func TestRetireReaderClosesCloserTransport(t *testing.T) {
+	registerFakeSenders()
+	p, err := NewPump(decodeConfig(t, `{"readers":{"r1":{"senders":{"s":{"output_type":"fake"}}}}}`), PumpDeps{Log: &captureLog{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &closeOnlyTransport{fakeTransport: &fakeTransport{}}
+	p.senderMu.Lock()
+	p.senders["r1"] = []*senderEntry{{name: "s", cancel: func() {}, inst: sender.Instance{Transport: tr}}}
+	p.senderMu.Unlock()
+
+	if err := p.retireReader(&ReaderRuntime{name: "r1"}); err != nil {
+		t.Fatalf("retireReader: %v", err)
+	}
+	if got := atomic.LoadInt32(&tr.closes); got != 1 {
+		t.Fatalf("Close calls = %d, want 1", got)
+	}
 }

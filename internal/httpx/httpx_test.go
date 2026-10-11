@@ -108,3 +108,30 @@ func TestNewClientInstallsProxySelector(t *testing.T) {
 		t.Fatal("transport.Proxy not set")
 	}
 }
+
+// TestIdleTimeoutDialerAppliesInactivityTimeout proves the timeout is an
+// inactivity timeout, not a total deadline: the response body streams over a
+// total longer than the timeout, but no single gap between reads exceeds it,
+// so the request succeeds.
+func TestIdleTimeoutDialerAppliesInactivityTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		flusher := w.(http.Flusher)
+		for _, chunk := range []string{"a", "b", "c"} {
+			_, _ = w.Write([]byte(chunk))
+			flusher.Flush()
+			time.Sleep(120 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	idle := 200 * time.Millisecond
+	client := NewClient(ClientOptions{DialContext: IdleTimeoutDialer(idle)})
+	ctx := WithRequestTimeout(context.Background(), idle)
+	status, body, err := Do(ctx, client, http.MethodGet, srv.URL, nil, nil, 0)
+	if err != nil {
+		t.Fatalf("inactivity timeout aborted a progressing response: %v", err)
+	}
+	if status != http.StatusOK || string(body) != "abc" {
+		t.Fatalf("status = %d body = %q", status, body)
+	}
+}

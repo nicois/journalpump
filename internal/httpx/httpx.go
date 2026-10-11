@@ -18,8 +18,13 @@
 //     journalpump.util.get_requests_session, also requests — NOT
 //     elasticsearch-py/urllib3). GCL, whose Python client is
 //     google-cloud-logging, will be parameterized separately.
-//   - per-request context deadline/cancellation (Do), so a stalled peer
-//     fails the call instead of hanging the sender goroutine.
+//   - request timing: Do applies an optional per-request context
+//     deadline/cancellation, and IdleTimeoutDialer gives a connection
+//     requests' INACTIVITY-timeout semantics (the deadline resets on
+//     every read/write). Senders whose Python client uses requests'
+//     socket timeout (logplex, elasticsearch/opensearch) use the
+//     inactivity dialer so a slow-but-progressing response is not
+//     aborted the way a total deadline would abort it.
 //
 // It deliberately provides NO retry hook: retries are owned by the shared
 // sender.Loop (a failed SendMessages retains the batch and retries after
@@ -66,14 +71,77 @@ type ClientOptions struct {
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
-// NewClient builds an *http.Client with the given transport options.
+// NewClient builds an *http.Client with the given transport options. The
+// transport bounds idle pooled connections (IdleConnTimeout = 90 s,
+// net/http's DefaultTransport value) so a long-lived client cannot
+// accumulate sockets/goroutines indefinitely; callers still release them
+// eagerly via CloseIdleConnections.
 func NewClient(opts ClientOptions) *http.Client {
 	transport := &http.Transport{
 		Proxy:           opts.Proxy,
 		TLSClientConfig: opts.TLSClientConfig,
 		DialContext:     opts.DialContext,
+		IdleConnTimeout: 90 * time.Second,
 	}
 	return &http.Client{Transport: transport}
+}
+
+// timeoutKey carries a per-request inactivity timeout through the request
+// context to the dialer installed by IdleTimeoutDialer (net/http passes the
+// request context to Transport.DialContext).
+type timeoutKey struct{}
+
+// WithRequestTimeout records the per-request inactivity timeout for the
+// dialer built by IdleTimeoutDialer. requests applies its timeout per
+// request; net/http resolves the dial once per connection, so the value
+// present when a connection is dialed fixes that connection's inactivity
+// timeout. A non-positive timeout leaves the context unchanged (the dialer's
+// fallback applies).
+func WithRequestTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	if timeout <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, timeoutKey{}, timeout)
+}
+
+// IdleTimeoutConn applies an INACTIVITY deadline: the read/write deadline is
+// reset before every operation, so a stalled peer trips the timeout while a
+// slow-but-progressing transfer does not — requests' socket-timeout
+// semantics, not a single total request deadline.
+type IdleTimeoutConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+// Read resets the read deadline, then reads.
+func (c *IdleTimeoutConn) Read(b []byte) (int, error) {
+	_ = c.SetReadDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(b)
+}
+
+// Write resets the write deadline, then writes.
+func (c *IdleTimeoutConn) Write(b []byte) (int, error) {
+	_ = c.SetWriteDeadline(time.Now().Add(c.idle))
+	return c.Conn.Write(b)
+}
+
+// IdleTimeoutDialer returns a Transport.DialContext that dials with
+// `fallback` as the connect timeout and wraps each connection with an
+// inactivity deadline. A per-request timeout recorded by WithRequestTimeout
+// overrides the fallback for connections dialed by that request.
+func IdleTimeoutDialer(fallback time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		idle := fallback
+		if v, ok := ctx.Value(timeoutKey{}).(time.Duration); ok && v > 0 {
+			idle = v
+		}
+		dialer := &net.Dialer{Timeout: idle}
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &IdleTimeoutConn{Conn: conn, idle: idle}, nil
+	}
 }
 
 // Do runs one HTTP request under a per-request deadline (when timeout >

@@ -6,11 +6,15 @@
 package elasticsearch
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,9 +22,11 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Aiven-Open/journalpump/internal/journaldlog"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
 
@@ -73,6 +79,7 @@ type captureServer struct {
 	putStatus    int
 	putBody      string
 	bulkStatus   int
+	bulkBody     string
 	deleteStatus int
 }
 
@@ -111,6 +118,9 @@ func (c *captureServer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.Method == http.MethodPost:
 		w.WriteHeader(c.bulkStatus)
+		if c.bulkBody != "" {
+			_, _ = io.WriteString(w, c.bulkBody)
+		}
 	case r.Method == http.MethodDelete:
 		w.WriteHeader(c.deleteStatus)
 	default:
@@ -481,13 +491,19 @@ func TestBulkBodyAndHeaders(t *testing.T) {
 func TestBulkStatusCodeIgnored(t *testing.T) {
 	srv := newCaptureServer(t)
 	srv.bulkStatus = http.StatusInternalServerError
-	s := newTestSender(t, opensearch, srv.URL, discardLogger{})
+	log := &recordingLogger{}
+	s := newTestSender(t, opensearch, srv.URL, log)
 	today := time.Now().UTC().Format("2006-01-02")
 	s.indices[defaultIndexPrefix+"-"+today] = struct{}{}
 
 	msg := []byte(`{"MESSAGE": "hi", "timestamp": "` + today + `T00:00:00"}`)
 	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
 		t.Fatalf("bulk 500 should still succeed, got %v", err)
+	}
+	// Python logs the informational result and its success flag from the
+	// status, without enforcing it (item 9).
+	if !log.has("Sent 1 log events successfully: false") {
+		t.Errorf("missing informational bulk result: %v", log.lines)
 	}
 }
 
@@ -643,7 +659,7 @@ func TestMaintenanceDeletesOldestIndices(t *testing.T) {
 // is journalpump.util.get_requests_session → requests), not Go's
 // http.ProxyFromEnvironment.
 func TestHTTPClientUsesRequestsProxySemantics(t *testing.T) {
-	client, err := newHTTPClient(nil)
+	client, err := newHTTPClient(nil, defaultRequestTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,5 +762,450 @@ func TestFixtureStructuralParity(t *testing.T) {
 				t.Errorf("%s[%d]: payload = %s, want %s", indexName, i, got, want)
 			}
 		}
+	}
+}
+
+// --- response timeout parity (review item 1) -------------------------------
+
+func TestTimeoutZeroFallsBackAndNegativeRejected(t *testing.T) {
+	for _, st := range []senderType{elasticsearch, opensearch} {
+		zero, err := configFrom(map[string]any{
+			string(st) + "_url":     "http://aaa",
+			string(st) + "_timeout": 0,
+		}, st)
+		if err != nil {
+			t.Fatalf("%s: zero timeout: %v", st, err)
+		}
+		if zero.requestTimeout != defaultRequestTimeout {
+			t.Errorf("%s: zero timeout = %v, want the 60s default", st, zero.requestTimeout)
+		}
+
+		if _, err := configFrom(map[string]any{
+			string(st) + "_url":     "http://aaa",
+			string(st) + "_timeout": -1,
+		}, st); err == nil || !strings.Contains(err.Error(), "less than 0") {
+			t.Errorf("%s: negative timeout err = %v, want a load-time rejection", st, err)
+		}
+
+		// The constructors reject it too (both output types).
+		args := sender.ConstructorArgs{Config: map[string]any{
+			string(st) + "_url":     "http://aaa",
+			string(st) + "_timeout": -1,
+		}}
+		var cerr error
+		if st == elasticsearch {
+			_, cerr = NewElasticsearch(args)
+		} else {
+			_, cerr = NewOpenSearch(args)
+		}
+		if cerr == nil {
+			t.Errorf("%s: constructor accepted a negative timeout", st)
+		}
+	}
+}
+
+// --- maintenance exhaustion (review item 2) --------------------------------
+
+func TestMaintenanceNegativeDaysMaxReturnsErrorNotPanic(t *testing.T) {
+	srv := newCaptureServer(t)
+	srv.aliasJSON = `{"journalpump-2021-01-01": {}, "journalpump-2021-01-02": {}}`
+	s := newTestSender(t, opensearch, srv.URL, discardLogger{})
+	s.cfg.indexLifetimeInDays = -1
+
+	if err := s.MaintenanceOperations(context.Background()); err == nil {
+		t.Fatal("exhausted index list with negative index_days_max must return an error, not panic")
+	}
+	// Python deletes every matching index before the IndexError.
+	for _, idx := range []string{"journalpump-2021-01-01", "journalpump-2021-01-02"} {
+		if len(srv.requestsWith(http.MethodDelete, "/"+idx)) != 1 {
+			t.Errorf("expected DELETE %s", idx)
+		}
+	}
+}
+
+// TestLoopContinuesAfterNegativeDaysMaxMaintenance drives the sender through
+// the REAL sender.Loop: the exhausted-list maintenance error is caught by the
+// loop, so a subsequent batch still sends (Python's IndexError is swallowed by
+// the maintenance caller).
+func TestLoopContinuesAfterNegativeDaysMaxMaintenance(t *testing.T) {
+	srv := newCaptureServer(t)
+	srv.aliasJSON = `{"journalpump-2021-01-01": {}}`
+	inst, err := NewOpenSearch(sender.ConstructorArgs{Config: map[string]any{
+		"opensearch_url":            srv.URL,
+		"opensearch_index_days_max": -1,
+		"max_send_interval":         0.05,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	in := make(chan sender.Item, 4)
+	loop := sender.NewLoop(sender.LoopConfig{Name: "es-loop"}, inst, in)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = loop.Run(ctx)
+		close(done)
+	}()
+	today := time.Now().UTC().Format("2006-01-02")
+	msg := []byte(`{"MESSAGE": "hi", "timestamp": "` + today + `T00:00:00"}`)
+	in <- sender.Item{Payload: msg, Cursor: "c0"}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for loop.State().Sent.Count < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	st := loop.State()
+	cancel()
+	<-done
+	if st.Sent.Count != 1 {
+		t.Fatalf("sent count = %d, want 1 (the maintenance error must not stop sending)", st.Sent.Count)
+	}
+}
+
+// --- CA resolution (review item 3) -----------------------------------------
+
+func writeCertPEM(t *testing.T, dir, name string, cert *x509.Certificate) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	pem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	if err := os.WriteFile(path, pem, 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	return path
+}
+
+func clientGets(t *testing.T, client *http.Client, url string) error {
+	t.Helper()
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return nil
+}
+
+func TestHTTPClientCAResolution(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	cert := srv.Certificate()
+	dir := t.TempDir()
+	certFile := writeCertPEM(t, dir, "ca.pem", cert)
+	certDir := t.TempDir()
+	writeCertPEM(t, certDir, "server.pem", cert)
+
+	for _, tc := range []struct {
+		name string
+		ca   any
+		env  map[string]string
+	}{
+		{"ca-false-disables", false, nil},
+		{"empty-string-disables", "", nil},
+		{"ca-file", certFile, nil},
+		{"ca-directory", certDir, nil},
+		{"requests-ca-bundle-env", true, map[string]string{"REQUESTS_CA_BUNDLE": certFile}},
+		{"curl-ca-bundle-env", true, map[string]string{"CURL_CA_BUNDLE": certFile}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("REQUESTS_CA_BUNDLE", "")
+			t.Setenv("CURL_CA_BUNDLE", "")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			client, err := newHTTPClient(tc.ca, defaultRequestTimeout)
+			if err != nil {
+				t.Fatalf("newHTTPClient(%v): %v", tc.ca, err)
+			}
+			if err := clientGets(t, client, srv.URL); err != nil {
+				t.Fatalf("HTTPS GET with ca=%v: %v", tc.ca, err)
+			}
+		})
+	}
+
+	if _, err := newHTTPClient(filepath.Join(dir, "nope.pem"), defaultRequestTimeout); err == nil {
+		t.Error("newHTTPClient accepted a missing CA path")
+	}
+	emptyDir := t.TempDir()
+	if _, err := newHTTPClient(emptyDir, defaultRequestTimeout); err == nil {
+		t.Error("newHTTPClient accepted a CA directory with no certificates")
+	}
+}
+
+// --- level-aware diagnostics (review item 4) -------------------------------
+
+// TestDiagnosticsUseWarningAndErrorLevels routes the sender's diagnostics
+// through a production level-aware logger (journaldlog TTY, WARNING threshold)
+// and asserts that Python's warning/error lines survive while its info lines
+// are dropped.
+func TestDiagnosticsUseWarningAndErrorLevels(t *testing.T) {
+	srv := newCaptureServer(t)
+	srv.aliasJSON = "{}"
+	srv.putStatus = http.StatusBadRequest
+	srv.putBody = `{"error":"boom"}`
+	var buf bytes.Buffer
+	log := journaldlog.NewTTYLog("es-test", &buf, journaldlog.LevelWarning)
+	s := newTestSender(t, opensearch, srv.URL, log)
+
+	// Missing timestamp + unmapped field (list) + failing create: all WARNING.
+	msg := []byte(`{"MESSAGE": "hi", "FIELDLIST": [1, 2]}`)
+	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
+		t.Fatalf("create failure must not fail the batch: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"timestamp", "Unmapped fields", "Could not create index mappings"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("WARNING-level output missing %q:\n%s", want, out)
+		}
+	}
+	// The INFO lines (Creating index / Sent ...) are below the threshold.
+	if strings.Contains(out, "Creating index") || strings.Contains(out, "Sent 1 log events") {
+		t.Errorf("INFO diagnostics leaked past the WARNING threshold:\n%s", out)
+	}
+
+	// A deletion TRANSPORT failure is ERROR-level (a 500 status does not raise in
+	// requests, so only a connection error reaches the except clause).
+	var delBuf bytes.Buffer
+	delLog := journaldlog.NewTTYLog("es-test", &delBuf, journaldlog.LevelWarning)
+	delSender := &Sender{
+		cfg: config{
+			senderType:          opensearch,
+			sessionURL:          "http://es",
+			requestTimeout:      defaultRequestTimeout,
+			indexName:           defaultIndexPrefix,
+			indexLifetimeInDays: defaultIndexLifetimeInDays,
+		},
+		log:     delLog,
+		now:     time.Now,
+		indices: map[string]struct{}{},
+		client: &methodDoer{
+			get: map[string]string{
+				"/_aliases": `{"journalpump-2021-01-01": {}, "journalpump-2021-01-02": {}, "journalpump-2021-01-03": {}, "journalpump-2021-01-04": {}}`,
+			},
+			err: map[string]error{http.MethodDelete: errors.New("connection refused")},
+		},
+	}
+	if err := delSender.MaintenanceOperations(context.Background()); err != nil {
+		t.Fatalf("maintenance: %v", err)
+	}
+	if !strings.Contains(delBuf.String(), "Unexpected exception deleting index") {
+		t.Errorf("deletion-failure ERROR line missing:\n%s", delBuf.String())
+	}
+}
+
+// --- create-index transport error (review item 5) --------------------------
+
+type fakeStats struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (f *fakeStats) UnexpectedException(_ error, where string, _ map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, where)
+}
+
+func (f *fakeStats) has(where string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c == where {
+			return true
+		}
+	}
+	return false
+}
+
+// methodDoer answers canned responses by HTTP method (used to simulate a
+// transport-level PUT failure that a capture server cannot express).
+type methodDoer struct {
+	get map[string]string
+	err map[string]error
+}
+
+func (d *methodDoer) Do(req *http.Request) (*http.Response, error) {
+	if err := d.err[req.Method]; err != nil {
+		return nil, err
+	}
+	body := ""
+	if req.Method == http.MethodGet {
+		body = d.get[req.URL.Path]
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+	}, nil
+}
+
+func TestCreateIndexTransportErrorBacksOffAndContinues(t *testing.T) {
+	stats := &fakeStats{}
+	var backoffs int
+	s := &Sender{
+		cfg:     config{senderType: opensearch, sessionURL: "http://es", requestTimeout: defaultRequestTimeout, indexName: defaultIndexPrefix},
+		log:     discardLogger{},
+		stats:   stats,
+		now:     time.Now,
+		indices: map[string]struct{}{},
+		backoff: func(context.Context) { backoffs++ },
+		client: &methodDoer{
+			get: map[string]string{
+				"/":         `{"version": {"number": "9.0.0"}}`,
+				"/_aliases": `{}`,
+			},
+			err: map[string]error{http.MethodPut: errors.New("connection refused")},
+		},
+	}
+
+	msg := []byte(`{"MESSAGE": "hi", "timestamp": "2019-10-07 14:00:00"}`)
+	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
+		t.Fatalf("create transport error must not fail the batch: %v", err)
+	}
+	if backoffs != 1 {
+		t.Errorf("backoffs = %d, want 1 (Python's self._backoff after a PUT ConnectionError)", backoffs)
+	}
+	if !stats.has("es_pump_create_index_and_mappings") {
+		t.Errorf("stats where missing: %v", stats.calls)
+	}
+}
+
+// TestLoopWiresBackoffObserver pins that the shared loop injects its
+// cancellable backoff into the sender (the seam the create path borrows).
+func TestLoopWiresBackoffObserver(t *testing.T) {
+	s := newTestSender(t, opensearch, "http://aaa", discardLogger{})
+	in := make(chan sender.Item)
+	_ = sender.NewLoop(sender.LoopConfig{Name: "es-backoff"}, sender.Instance{Transport: s, MaxSendInterval: time.Second}, in)
+	if s.backoff == nil {
+		t.Fatal("NewLoop did not inject the shared backoff into the sender")
+	}
+}
+
+// --- cleanup (review item 6) -----------------------------------------------
+
+func TestCloseReleasesIdleConnections(t *testing.T) {
+	var open int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateNew:
+			atomic.AddInt32(&open, 1)
+		case http.StateClosed, http.StateHijacked:
+			atomic.AddInt32(&open, -1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	s := newTestSender(t, opensearch, srv.URL, discardLogger{})
+	today := time.Now().UTC().Format("2006-01-02")
+	s.indices[defaultIndexPrefix+"-"+today] = struct{}{}
+	msg := []byte(`{"MESSAGE": "hi", "timestamp": "` + today + `T00:00:00"}`)
+	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&open) == 0 {
+		t.Fatal("no live connection after a send; the test cannot observe a leak")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&open) != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&open); got != 0 {
+		t.Fatalf("open connections = %d after Close, want 0", got)
+	}
+}
+
+var _ io.Closer = (*Sender)(nil)
+
+// --- bulk item errors (review item 8) --------------------------------------
+
+// TestSlowBulkResponseWithinTimeout checks the timeout is requests'
+// INACTIVITY timeout, not a total deadline: the bulk body streams over a
+// total longer than the (2×) configured timeout, but every gap between reads
+// is shorter, so the send succeeds.
+func TestSlowBulkResponseWithinTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/journalpump-2019-10-07/_bulk" {
+			w.WriteHeader(http.StatusOK)
+			flusher := w.(http.Flusher)
+			for _, chunk := range []string{"{", "}", ""} {
+				_, _ = io.WriteString(w, chunk)
+				flusher.Flush()
+				time.Sleep(120 * time.Millisecond)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	inst, err := NewOpenSearch(sender.ConstructorArgs{Config: map[string]any{
+		"opensearch_url":     srv.URL,
+		"opensearch_timeout": 0.15, // bulk timeout = 0.3s < the 0.36s total
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := inst.Transport.(*Sender)
+	s.indices[defaultIndexPrefix+"-2019-10-07"] = struct{}{}
+
+	msg := []byte(`{"MESSAGE": "hi", "timestamp": "2019-10-07 14:00:00"}`)
+	if err := s.SendMessages(context.Background(), [][]byte{msg}, "c1"); err != nil {
+		t.Fatalf("inactivity timeout aborted a progressing bulk response: %v", err)
+	}
+}
+
+// TestBulkItemErrorsAdvanceCursorThroughLoop quirk-locks Python: a 200 bulk
+// response whose body reports per-item failures is NOT inspected — the batch is
+// acked, the cursor advances, and there is no retry.
+func TestBulkItemErrorsAdvanceCursorThroughLoop(t *testing.T) {
+	srv := newCaptureServer(t)
+	srv.aliasJSON = "{}"
+	srv.bulkStatus = http.StatusOK
+	srv.bulkBody = `{"errors": true, "items": [{"index": {"_index": "journalpump-2019-10-07", "status": 429, "error": "rejected"}}]}`
+
+	inst, err := NewOpenSearch(sender.ConstructorArgs{Config: map[string]any{
+		"opensearch_url":    srv.URL,
+		"max_send_interval": 0.05,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	in := make(chan sender.Item, 4)
+	loop := sender.NewLoop(sender.LoopConfig{Name: "es-loop"}, inst, in)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = loop.Run(ctx)
+		close(done)
+	}()
+	msg := []byte(`{"MESSAGE": "hi", "timestamp": "2019-10-07 14:00:00"}`)
+	in <- sender.Item{Payload: msg, Cursor: "c0"}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for loop.State().Sent.Count < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	st := loop.State()
+	cancel()
+	<-done
+
+	if st.Sent.Count != 1 {
+		t.Fatalf("sent count = %d, want 1 (per-item errors must not retry)", st.Sent.Count)
+	}
+	if st.Sent.Cursor == nil || *st.Sent.Cursor != "c0" {
+		t.Fatalf("sent cursor = %v, want c0 (the cursor must advance)", st.Sent.Cursor)
+	}
+	if posts := srv.requestsWith(http.MethodPost, "/journalpump-2019-10-07/_bulk"); len(posts) != 1 {
+		t.Fatalf("bulk POSTs = %d, want exactly 1 (no retry)", len(posts))
 	}
 }

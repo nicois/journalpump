@@ -134,6 +134,17 @@ type ConnectionReporter interface {
 	SetConnectionObserver(connected func(), disconnected func(error))
 }
 
+// Backoffer is an OPTIONAL transport capability for senders that call
+// Python's self._backoff() INSIDE a path that still returns success — waiting
+// out the shared jittered backoff WITHOUT failing the batch. The elasticsearch
+// sender's _create_index_and_mapping backs off after a PUT transport error and
+// then CONTINUES to the bulk write, so returning an error would wrongly retry
+// the whole batch; instead it obtains the loop's cancellable backoff through
+// this seam, sharing the loop's attempt counter (Python's LogSender._backoff).
+type Backoffer interface {
+	SetBackoffObserver(backoff func(context.Context))
+}
+
 // Classifier is the per-sender retriable(error) seam — the Go
 // equivalent of Python's per-sender except-clauses
 // (e.g. kafka_sender's KAFKA_CONN_ERRORS set). The loop routes a
@@ -409,6 +420,12 @@ func NewLoop(cfg LoopConfig, inst Instance, in <-chan Item) *Loop {
 	// sender's _init_rsyslog_client).
 	if cr, ok := inst.Transport.(ConnectionReporter); ok {
 		cr.SetConnectionObserver(l.MarkConnected, l.MarkDisconnected)
+	}
+	// A transport that must pace an internal retry without failing the batch
+	// (the ES sender's create-then-continue path) borrows the loop's
+	// cancellable backoff, so its attempts share the loop's exponent.
+	if bo, ok := inst.Transport.(Backoffer); ok {
+		bo.SetBackoffObserver(l.backoffSleep)
 	}
 	return l
 }

@@ -33,7 +33,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -173,43 +172,17 @@ func resolvedTimeout(timeoutSeconds float64) time.Duration {
 //   - TLS verification is DISABLED (Python's verify=False — deliberate,
 //     spec §2).
 func newHTTPClient(timeoutSeconds float64) *http.Client {
-	idle := resolvedTimeout(timeoutSeconds)
-	dialer := &net.Dialer{Timeout: idle}
 	// The shared httpx helper owns client construction and proxy selection;
-	// logplex supplies its own dial hook (the inactivity-timeout conn
-	// wrapper) and the requests-compatible proxy selector, because its
-	// Python client is requests (spec §2).
+	// logplex supplies the inactivity-timeout dial hook (requests' socket
+	// timeout, not a total deadline) and the requests-compatible proxy
+	// selector, because its Python client is requests (spec §2).
 	return httpx.NewClient(httpx.ClientOptions{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			return &idleTimeoutConn{Conn: conn, idle: idle}, nil
-		},
-		Proxy: httpx.RequestsProxy,
+		DialContext: httpx.IdleTimeoutDialer(resolvedTimeout(timeoutSeconds)),
+		Proxy:       httpx.RequestsProxy,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, //nolint:gosec // verify=False is the ported Python behavior (spec §2)
 		},
 	})
-}
-
-// idleTimeoutConn resets the read/write deadline before every operation, so
-// a stalled peer trips the timeout while a slow-but-progressing transfer does
-// not — Python's socket inactivity timeout semantics.
-type idleTimeoutConn struct {
-	net.Conn
-	idle time.Duration
-}
-
-func (c *idleTimeoutConn) Read(b []byte) (int, error) {
-	_ = c.SetReadDeadline(time.Now().Add(c.idle))
-	return c.Conn.Read(b)
-}
-
-func (c *idleTimeoutConn) Write(b []byte) (int, error) {
-	_ = c.SetWriteDeadline(time.Now().Add(c.idle))
-	return c.Conn.Write(b)
 }
 
 // proxyForRequest and parseProxyURL are thin delegations to the shared

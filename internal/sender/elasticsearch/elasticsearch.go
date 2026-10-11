@@ -21,19 +21,13 @@
 // are never inspected. Maintenance deletes the oldest
 // <prefix>-YYYY-MM-DD indices while more than index_days_max exist.
 //
-// SANCTIONED DEVIATION (charter §2, Task 23): Python's request-session
-// timeout is a per-request inactivity timeout; Go applies a per-request
-// context deadline instead (the bulk request gets 2× the configured
-// timeout, exactly as Python passes timeout=request_timeout*2). A
-// stalled peer therefore fails the batch and the shared loop retries it
-// rather than hanging the sender goroutine.
-//
-// SANCTIONED DEVIATION (charter §2, Task 23): Python's
-// stats.unexpected_exception calls from the connect/create paths are not
-// reproduced — no reference sender in this tree owns a statsd client
-// (the shared loop emits the unexpected-exception metric for permanent
-// send errors). The errors themselves are logged and routed through the
-// loop's disconnect/backoff path.
+// The HTTP client is requests-faithful: the timeout is an INACTIVITY
+// timeout (httpx.IdleTimeoutDialer), the CA resolution mirrors
+// session.verify (a bundle FILE or DIRECTORY, an empty string disables
+// verification, REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE are honored), and the
+// stats.unexpected_exception emissions of the connect/create/delete paths
+// are reproduced. The sender implements io.Closer so the daemon's retire
+// path releases its idle keep-alive connections.
 package elasticsearch
 
 import (
@@ -44,8 +38,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -156,7 +152,19 @@ func configFrom(raw map[string]any, st senderType) (config, error) {
 		if !ok {
 			return config{}, fmt.Errorf("%s_timeout: %v is not a number", st, v)
 		}
-		cfg.requestTimeout = time.Duration(seconds * float64(time.Second))
+		// requests substitutes the session default whenever a per-request
+		// timeout is FALSY, so a ZERO timeout means the 60 s default, not "no
+		// timeout". A negative value is truthy and is passed to requests, which
+		// raises "the timeout cannot be set to a value less than or equal to 0";
+		// reject it at load instead of leaving the deadline unlimited.
+		switch {
+		case seconds < 0:
+			return config{}, fmt.Errorf("%s_timeout: %v cannot be set to a value less than 0", st, seconds)
+		case seconds == 0:
+			cfg.requestTimeout = defaultRequestTimeout
+		default:
+			cfg.requestTimeout = time.Duration(seconds * float64(time.Second))
+		}
 	}
 	if v, present := raw[string(st)+"_index_prefix"]; present {
 		s, ok := v.(string)
@@ -184,11 +192,19 @@ type doer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+// exceptionStats is the statsd seam for the sender's own
+// unexpected_exception emissions (Python's self.stats.unexpected_exception).
+// The pump's *statsd.Client satisfies it in production; tests inject a fake.
+type exceptionStats interface {
+	UnexpectedException(ex error, where string, tags map[string]string)
+}
+
 // Sender is the shared elasticsearch/opensearch transport.
 type Sender struct {
 	cfg    config
 	log    sender.Logger
 	client doer
+	stats  exceptionStats
 	now    func() time.Time
 
 	version        *version
@@ -200,6 +216,59 @@ type Sender struct {
 
 	onConnected    func()
 	onDisconnected func(error)
+	// backoff is the loop-owned cancellable backoff (Python's self._backoff
+	// called inside _create_index_and_mapping), injected by the loop.
+	backoff func(context.Context)
+}
+
+// warningLogger / errorLogger are the OPTIONAL level-aware logging
+// capabilities (the production journald sink provides Warningf/Errorf; plain
+// loggers fall back to Printf at INFO). Python logs these diagnostics at
+// WARNING/ERROR, so a Printf-only port would drop them at a WARNING/ERROR
+// threshold.
+type warningLogger interface {
+	Warningf(format string, args ...any)
+}
+
+type errorLogger interface {
+	Errorf(format string, args ...any)
+}
+
+func (s *Sender) logWarn(format string, args ...any) {
+	if l, ok := s.log.(warningLogger); ok {
+		l.Warningf(format, args...)
+		return
+	}
+	s.log.Printf(format, args...)
+}
+
+func (s *Sender) logError(format string, args ...any) {
+	if l, ok := s.log.(errorLogger); ok {
+		l.Errorf(format, args...)
+		return
+	}
+	s.log.Printf(format, args...)
+}
+
+// unexpected emits stats.unexpected_exception (Python passes no extra tags;
+// the client's global tags apply). A nil stats client skips the emission.
+func (s *Sender) unexpected(err error, where string) {
+	if s.stats != nil {
+		s.stats.UnexpectedException(err, where, nil)
+	}
+}
+
+// SetBackoffObserver satisfies sender.Backoffer: the loop injects its
+// cancellable jittered backoff so the sender can pace a failing index-create
+// WITHOUT failing the batch (Python's self._backoff() inside the create path
+// then continues to the bulk write).
+func (s *Sender) SetBackoffObserver(backoff func(context.Context)) { s.backoff = backoff }
+
+// waitBackoff runs the loop's backoff when wired (tests may leave it nil).
+func (s *Sender) waitBackoff(ctx context.Context) {
+	if s.backoff != nil {
+		s.backoff(ctx)
+	}
 }
 
 // NewElasticsearch is the wiring-map constructor for output_type
@@ -230,14 +299,19 @@ func newSender(args sender.ConstructorArgs, st senderType) (sender.Instance, err
 		}
 		interval = time.Duration(seconds * float64(time.Second))
 	}
-	client, err := newHTTPClient(cfg.ca)
+	client, err := newHTTPClient(cfg.ca, cfg.requestTimeout)
 	if err != nil {
 		return sender.Instance{}, err
+	}
+	var stats exceptionStats
+	if args.Stats != nil {
+		stats = args.Stats
 	}
 	s := &Sender{
 		cfg:     cfg,
 		log:     args.Log,
 		client:  client,
+		stats:   stats,
 		now:     time.Now,
 		indices: map[string]struct{}{},
 	}
@@ -260,39 +334,123 @@ type discardLogger struct{}
 func (discardLogger) Printf(string, ...any) {}
 
 // newHTTPClient builds the shared httpx client for the configured `ca`
-// value (Python session.verify = config.get("ca", True)): absent/true
-// uses the system CA set, false disables verification, a string is a PEM
-// bundle path. Proxy selection is the requests-compatible strategy,
-// because the Python ES/OpenSearch sender talks to the server through
-// requests (journalpump.util.get_requests_session), not
-// elasticsearch-py/urllib3.
-func newHTTPClient(ca any) (*http.Client, error) {
+// value (Python session.verify = config.get("ca", True)). Proxy selection is
+// the requests-compatible strategy, because the Python ES/OpenSearch sender
+// talks to the server through requests
+// (journalpump.util.get_requests_session), not elasticsearch-py/urllib3.
+// The dial hook is requests' inactivity timeout, so a slow-but-progressing
+// response is not aborted by a total deadline.
+func newHTTPClient(ca any, requestTimeout time.Duration) (*http.Client, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	switch v := ca.(type) {
-	case nil:
-		// default: verify with the system roots
-	case bool:
-		if !v {
-			tlsCfg.InsecureSkipVerify = true //nolint:gosec // explicit operator opt-out, Python verify=False parity
-		}
-	case string:
-		pem, err := os.ReadFile(v)
+	bundle, insecure, err := resolveVerify(ca)
+	if err != nil {
+		return nil, err
+	}
+	if insecure {
+		tlsCfg.InsecureSkipVerify = true //nolint:gosec // explicit operator opt-out, Python verify=False parity
+	} else if bundle != "" {
+		pool, err := loadCertPool(bundle)
 		if err != nil {
-			return nil, fmt.Errorf("ca: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("ca: %q contains no PEM certificates", v)
+			return nil, err
 		}
 		tlsCfg.RootCAs = pool
-	default:
-		return nil, fmt.Errorf("ca: %v is not a bool or path", ca)
 	}
 	return httpx.NewClient(httpx.ClientOptions{
 		Proxy:           httpx.RequestsProxy,
 		TLSClientConfig: tlsCfg,
+		DialContext:     httpx.IdleTimeoutDialer(requestTimeout),
 	}), nil
 }
+
+// resolveVerify maps Python's session.verify to a CA bundle path and an
+// insecure flag, requests-compatibly:
+//
+//   - absent / true  → the CA bundle named by REQUESTS_CA_BUNDLE, else
+//     CURL_CA_BUNDLE, else the system roots (empty path);
+//   - false          → verification DISABLED;
+//   - "" (empty)     → verification DISABLED (requests treats a falsy verify
+//     as no verification);
+//   - another string → a CA bundle FILE, or a DIRECTORY of PEM files.
+func resolveVerify(ca any) (bundle string, insecure bool, err error) {
+	switch v := ca.(type) {
+	case nil:
+		return caBundleFromEnv(), false, nil
+	case bool:
+		if v {
+			return caBundleFromEnv(), false, nil
+		}
+		return "", true, nil
+	case string:
+		if v == "" {
+			return "", true, nil
+		}
+		return v, false, nil
+	default:
+		return "", false, fmt.Errorf("ca: %v is not a bool or path", ca)
+	}
+}
+
+// caBundleFromEnv returns the CA bundle path from REQUESTS_CA_BUNDLE or
+// CURL_CA_BUNDLE (requests consults REQUESTS_CA_BUNDLE first), or "" when
+// neither is set.
+func caBundleFromEnv() string {
+	if v := os.Getenv("REQUESTS_CA_BUNDLE"); v != "" {
+		return v
+	}
+	return os.Getenv("CURL_CA_BUNDLE")
+}
+
+// loadCertPool builds a cert pool from a CA bundle path: a single PEM file,
+// or a directory whose (regular) files are read as PEM bundles (urllib3
+// accepts an OpenSSL CA directory).
+func loadCertPool(path string) (*x509.CertPool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("ca: %w", err)
+	}
+	pool := x509.NewCertPool()
+	var added bool
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, fmt.Errorf("ca: %w", err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			pem, err := os.ReadFile(filepath.Join(path, entry.Name()))
+			if err != nil {
+				return nil, fmt.Errorf("ca: %w", err)
+			}
+			if pool.AppendCertsFromPEM(pem) {
+				added = true
+			}
+		}
+	} else {
+		pem, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("ca: %w", err)
+		}
+		added = pool.AppendCertsFromPEM(pem)
+	}
+	if !added {
+		return nil, fmt.Errorf("ca: %q contains no PEM certificates", path)
+	}
+	return pool, nil
+}
+
+// Close implements io.Closer: release the transport's idle keep-alive
+// connections so a retired sender (SIGHUP reload) does not leak sockets or
+// transport goroutines. The daemon's retire path closes io.Closers.
+func (s *Sender) Close() error {
+	if c, ok := s.client.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+	return nil
+}
+
+var _ io.Closer = (*Sender)(nil)
 
 // SetConnectionObserver satisfies sender.ConnectionReporter: the loop
 // owns connected state and the shared backoff exponent.
@@ -315,8 +473,9 @@ func (s *Sender) disconnected(err error) {
 
 // SendMessages ports _EsOsLogSenderBase.send_messages.
 func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) error {
+	start := time.Now()
 	if err := s.loadIndices(ctx); err != nil {
-		s.log.Printf("Waiting for connection for %s", s.cfg.senderType)
+		s.logWarn("Waiting for connection for %s", s.cfg.senderType)
 		return err
 	}
 	var buf bytes.Buffer
@@ -347,22 +506,31 @@ func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) err
 	if buf.Len() == 0 {
 		return nil
 	}
-	// Python logs success purely from the status; the bulk response
-	// status is NOT enforced and per-item errors are ignored.
-	if err := s.postBulk(ctx, lastName, buf.Bytes()); err != nil {
+	// Python logs success purely from the status; the bulk response status is
+	// NOT enforced and per-item bulk errors are never inspected (the cursor
+	// advances regardless — TestBulkItemErrorsAdvanceCursorThroughLoop).
+	status, err := s.postBulk(ctx, lastName, buf.Bytes())
+	if err != nil {
 		return err
 	}
+	s.log.Printf(
+		"Sent %d log events successfully: %t, took: %.2fs",
+		len(batch),
+		status == http.StatusOK || status == http.StatusCreated,
+		time.Since(start).Seconds(),
+	)
 	return nil
 }
 
-// postBulk sends the NDJSON body to <index>/_bulk with the 2× timeout.
-func (s *Sender) postBulk(ctx context.Context, indexName string, body []byte) error {
+// postBulk sends the NDJSON body to <index>/_bulk with the 2× timeout and
+// returns the response status.
+func (s *Sender) postBulk(ctx context.Context, indexName string, body []byte) (int, error) {
 	headers := map[string]string{
 		"content-length": strconv.Itoa(len(body)),
 		"content-type":   "application/x-ndjson",
 	}
-	_, _, err := s.do(ctx, http.MethodPost, s.cfg.requestURL(indexName+"/_bulk"), body, headers, s.cfg.requestTimeout*2)
-	return err
+	status, _, err := s.do(ctx, http.MethodPost, s.cfg.requestURL(indexName+"/_bulk"), body, headers, s.cfg.requestTimeout*2)
+	return status, err
 }
 
 // indexDate returns timestamp[:10] when the message carries a non-empty
@@ -381,7 +549,7 @@ func (s *Sender) indexDate(message map[string]any) (string, error) {
 			return str[:10], nil
 		}
 	}
-	s.log.Printf("Message missing 'timestamp' field, using current date for index name")
+	s.logWarn("Message missing 'timestamp' field, using current date for index name")
 	return s.now().UTC().Format("2006-01-02"), nil
 }
 
@@ -435,8 +603,13 @@ func (s *Sender) createIndexAndMapping(ctx context.Context, indexName string, me
 	}
 	status, body, err := s.do(ctx, http.MethodPut, url, mapping, map[string]string{"content-type": "application/json"}, s.cfg.requestTimeout)
 	if err != nil {
+		// Python: mark_disconnected, log.error, stats.unexpected_exception and —
+		// importantly — self._backoff() BEFORE continuing to the bulk write, so
+		// an uncached index's failing PUTs are paced even when the bulk succeeds.
 		s.disconnected(err)
-		s.log.Printf("Problem creating index %q: %s: %v", indexName, errorClass(err), err)
+		s.logError("Problem creating index %q: %s: %v", indexName, errorClass(err), err)
+		s.unexpected(err, "es_pump_create_index_and_mappings")
+		s.waitBackoff(ctx)
 		return
 	}
 	if status == http.StatusOK || status == http.StatusCreated || strings.Contains(string(body), "already_exists_exception") {
@@ -444,7 +617,7 @@ func (s *Sender) createIndexAndMapping(ctx context.Context, indexName string, me
 		return
 	}
 	s.disconnected(fmt.Errorf("Cannot create index %q (%d %s)", indexName, status, string(body))) //nolint:staticcheck // error-text parity with the Python mark_disconnected message
-	s.log.Printf("Could not create index mappings for: %q, %q %d", indexName, string(body), status)
+	s.logWarn("Could not create index mappings for: %q, %q %d", indexName, string(body), status)
 }
 
 // createMapping is _create_mapping (plus the Elasticsearch ≤ 7 legacy
@@ -499,7 +672,7 @@ func (s *Sender) messageFields(message map[string]any) map[string]any {
 		}
 	}
 	if len(unmapped) > 0 {
-		s.log.Printf("Unmapped fields: %v", unmapped)
+		s.logWarn("Unmapped fields: %v", unmapped)
 	}
 	return fields
 }
@@ -545,16 +718,18 @@ func (s *Sender) logLoadError(err error) error {
 	class := errorClass(err)
 	s.disconnected(err)
 	if class != s.lastErrorClass {
-		s.log.Printf("Connection error to %s: %s: %v", s.cfg.senderType, class, err)
+		s.logWarn("Connection error to %s: %s: %v", s.cfg.senderType, class, err)
 	}
 	s.lastErrorClass = class
 	return err
 }
 
-// logUnexpected is the broad except clause.
+// logUnexpected is the broad except clause (Python's log.exception +
+// stats.unexpected_exception).
 func (s *Sender) logUnexpected(err error) error {
 	s.disconnected(err)
-	s.log.Printf("Unexpected exception connecting to %s: %v", s.cfg.senderType, err)
+	s.logError("Unexpected exception connecting to %s: %v", s.cfg.senderType, err)
+	s.unexpected(err, "es_pump_init_es_client")
 	return err
 }
 
@@ -588,11 +763,20 @@ func (s *Sender) checkIndices(ctx context.Context) error {
 	sort.Strings(indices)
 	s.log.Printf("Checking indices, currently: %v are available, max_indices: %d", indices, s.cfg.indexLifetimeInDays)
 	for len(indices) > s.cfg.indexLifetimeInDays {
+		if len(indices) == 0 {
+			// A negative index_days_max makes the loop condition true on an
+			// empty list. Python then raises IndexError from indices.pop(0),
+			// which the base maintenance caller catches (where=
+			// maintenance_operation) so sending continues. Return an error
+			// instead of panicking.
+			return fmt.Errorf("no indices left to delete for %s (index_days_max=%d)", s.cfg.indexName, s.cfg.indexLifetimeInDays)
+		}
 		indexToDelete := indices[0]
 		indices = indices[1:]
 		s.log.Printf("Deleting index: %q since we only keep %d days worth of indices", indexToDelete, s.cfg.indexLifetimeInDays)
 		if err := s.deleteIndex(ctx, indexToDelete); err != nil {
-			s.log.Printf("Unexpected exception deleting index %q: %v", indexToDelete, err)
+			s.logError("Unexpected exception deleting index %q: %v", indexToDelete, err)
+			s.unexpected(err, "es_pump_check_indices")
 		}
 	}
 	return nil
@@ -607,10 +791,13 @@ func (s *Sender) deleteIndex(ctx context.Context, indexName string) error {
 	return nil
 }
 
-// do runs one HTTP request under a per-request deadline and returns the
-// status and the fully-read body (the shared httpx.Do plumbing).
+// do runs one HTTP request and returns the status and the fully-read body.
+// The timeout is requests' INACTIVITY timeout (carried to the dial hook via
+// WithRequestTimeout), not a total deadline, so a slow-but-progressing
+// response is not aborted. httpx.Do is called with a zero deadline: the
+// idle-timeout connection governs the request.
 func (s *Sender) do(ctx context.Context, method, url string, body []byte, headers map[string]string, timeout time.Duration) (int, []byte, error) {
-	return httpx.Do(ctx, s.client, method, url, body, headers, timeout)
+	return httpx.Do(httpx.WithRequestTimeout(ctx, timeout), s.client, method, url, body, headers, 0)
 }
 
 // parseMessage decodes one wire payload preserving int/float (UseNumber),
