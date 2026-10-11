@@ -2373,16 +2373,54 @@ Wire and config:
 - Connection-error logging is deduped by error class (Python compares
   `ex.__class__`): `TestLoadErrorDedupLogging`.
 
-HTTP-client deviations (charter §2, Task 23):
+HTTP client (parity, 2026-10-11 review round — no §2 deviation remains):
 
-- Per-request timeout: Python's `requests` session timeout is a per-request
-  INACTIVITY timeout; Go applies a per-request `context` deadline (the bulk
-  request gets 2× the configured timeout, exactly as Python passes
-  `timeout=request_timeout*2`). A stalled peer fails the batch and the
-  shared loop retries it rather than hanging the sender goroutine.
-- `stats.unexpected_exception` from the connect/create paths is not
-  reproduced (no reference sender owns a statsd client); the errors are
-  logged and routed through the loop's disconnect/backoff path.
+- Timeout: requests' per-request INACTIVITY timeout, implemented with
+  `httpx.IdleTimeoutDialer` (the deadline resets on every read/write), NOT a
+  total context deadline — a slow-but-progressing response is not aborted.
+  The bulk request uses 2× the configured timeout (Python's
+  `timeout=request_timeout*2`). A configured `0` maps to the 60 s default
+  (requests substitutes the session default for a falsy timeout) and a
+  negative value is rejected at load (`TestTimeoutZeroFallsBackAndNegativeRejected`,
+  both sender types).
+- CA resolution mirrors `session.verify`: a bundle FILE or a DIRECTORY of
+  PEM files, an empty `ca` string DISABLES verification (requests treats a
+  falsy verify as no verification), `false` disables, and
+  REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE are honored when `ca` is absent/true
+  (`TestHTTPClientCAResolution`; HTTPS against a `httptest.NewTLSServer`).
+- `stats.unexpected_exception` is reproduced for the connect
+  (`es_pump_init_es_client`), create (`es_pump_create_index_and_mappings`)
+  and delete (`es_pump_check_indices`) paths, via the pump statsd client
+  carried on the sender.
+- A PUT TRANSPORT failure triggers requests' `self._backoff()` BEFORE the
+  bulk write continues, without failing the batch: the loop injects its
+  cancellable backoff through the `sender.Backoffer` seam
+  (`TestCreateIndexTransportErrorBacksOffAndContinues`,
+  `TestLoopWiresBackoffObserver`).
+- A negative `<type>_index_days_max` exhausts the index list; Python then
+  raises IndexError inside the maintenance caller, which the loop swallows.
+  Go returns a maintenance ERROR instead of panicking, and sending continues
+  (`TestMaintenanceNegativeDaysMaxReturnsErrorNotPanic`,
+  `TestLoopContinuesAfterNegativeDaysMaxMaintenance`).
+- Diagnostics route through the level-aware logger: missing-timestamp,
+  unmapped-field, create-failure and connection warnings are WARNING;
+  connect/delete/create transport failures are ERROR
+  (`TestDiagnosticsUseWarningAndErrorLevels`, using the production
+  `journaldlog` TTY logger at a WARNING threshold).
+- The bulk result is logged informationally (status-derived success flag)
+  without being enforced (`TestBulkStatusCodeIgnored`); per-item bulk errors
+  are never inspected, so a 200 body with `errors: true` still acks the
+  batch and advances the cursor with no retry
+  (`TestBulkItemErrorsAdvanceCursorThroughLoop`, through `sender.Loop`).
+- The sender implements `io.Closer` (releasing idle connections); the
+  daemon's retire path closes it (`TestCloseReleasesIdleConnections`,
+  `TestRetireReaderClosesCloserTransport`).
+
+REMAINING operator-visible divergence (flagged for coordinator→user, NOT
+decided here): with `ca` absent/true and no `*_CA_BUNDLE` env, requests
+verifies against the bundled **certifi** CA set while Go verifies against
+the **OS** trust store (a private CA in the OS store is trusted by Go, not
+by Python).
 
 Shared HTTP helper (coordinator decision 2026-10-11): closing Task 23
 extracted the raw-HTTP client plumbing into `internal/httpx` and moved
@@ -2396,10 +2434,11 @@ elasticsearch-py/urllib3. This corrects the initial ES port, which used
 Go's `http.ProxyFromEnvironment`: matching requests is Python-faithful, so
 it is a **bug fix toward Python, not a deviation**
 (`TestHTTPClientUsesRequestsProxySemantics`; logplex's pinned proxy tests
-pass unchanged). logplex keeps its own dial hook (inactivity-timeout conn
-wrapper), so its timing semantics are untouched, and the helper
-deliberately provides no retry hook — retries stay owned by
-`sender.Loop`.
+pass unchanged). Both senders use the shared `httpx.IdleTimeoutDialer`
+inactivity dial hook (logplex's own conn wrapper moved into `httpx`), so its
+timing semantics are unchanged, and the helper deliberately provides no
+retry hook — retries stay owned by `sender.Loop` (the ES create path borrows
+the loop's backoff through `sender.Backoffer`).
 
 Fixture parity: `systest-go/fixtures/elasticsearch.json` (Task 11) is
 consumed by `TestFixtureStructuralParity`: for each captured index the 40

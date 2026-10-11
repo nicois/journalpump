@@ -352,25 +352,29 @@ NEWS entry — plan Task 28):
   (spec §5 / D5: apache/kafka 4.0) is unaffected. User-directed
   2026-10-11 (Task 22; basis docs/assess-kafka-client.md). NEWS-recorded
   (Task 28).
-- Elasticsearch/OpenSearch HTTP client (Task 23): the timeout is applied
-  as a per-request Go `context` deadline where Python's `requests` session
-  timeout is a per-request INACTIVITY timeout; the configured value and the
-  bulk 2× (Python's `timeout=request_timeout*2`) are unchanged. A stalled
-  peer therefore fails the batch (the shared loop retries it) instead of
-  hanging the sender goroutine. The `stats.unexpected_exception` calls from
-  Python's connect/index-create except-clauses are NOT reproduced — no
-  reference sender in this tree owns a statsd client; the errors are logged
-  and routed through the loop's disconnect/backoff path. Not
-  operator-visible (same timeout value and success/quirk semantics).
-  Closing Task 23 (2026-10-11) extracted the raw-HTTP plumbing into the
+- Elasticsearch/OpenSearch HTTP client (Task 23): RESOLVED to parity in the
+  2026-10-11 review round — this is NO LONGER a deviation. The timeout is now
+  requests' per-request INACTIVITY timeout (`httpx.IdleTimeoutDialer`), not a
+  total context deadline, so a slow-but-progressing response is not aborted;
+  a configured `0` maps to the 60 s default and a negative value is rejected
+  at load (requests rejects non-positive). The connect/index-create/delete
+  `stats.unexpected_exception` emissions are reproduced (the sender carries
+  the pump statsd client). The raw-HTTP plumbing was extracted into the
   shared `internal/httpx` helper (logplex + ES), parameterized by
-  proxy-selection strategy. Both senders use the requests-compatible
-  selector (`httpx.RequestsProxy`) because both Python senders use
-  `requests` — ES through `journalpump.util.get_requests_session`, NOT
-  elasticsearch-py/urllib3. This corrects the initial ES port's use of Go's
-  `http.ProxyFromEnvironment`; matching requests is Python-faithful, so it
-  is a bug fix toward Python, not a deviation (recorded in
-  go-test-parity.md).
+  proxy-selection strategy; both senders use the requests-compatible selector
+  (`httpx.RequestsProxy`) because both Python senders use `requests` — ES
+  through `journalpump.util.get_requests_session`, NOT
+  elasticsearch-py/urllib3 (correcting the initial port's use of
+  `http.ProxyFromEnvironment`). CA resolution mirrors `session.verify`
+  (bundle FILE or DIRECTORY, empty string disables verification,
+  REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE honored). The sender implements
+  `io.Closer` so the retire path releases its idle connections.
+  ONE genuine operator-visible divergence REMAINS and is flagged for the
+  coordinator→user: with `ca` absent/true and no `*_CA_BUNDLE` env, Python
+  requests verifies against the bundled **certifi** CA set while Go verifies
+  against the **OS** trust store; a private CA present in the OS store would
+  be trusted by Go but not by Python (and vice versa). Practically equivalent
+  for the public CAs; not decided here.
 
 ## 3. Resolved decisions (spec §9, user-confirmed 2026-10-09)
 
