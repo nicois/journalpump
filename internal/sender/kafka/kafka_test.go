@@ -10,14 +10,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
+	"reflect"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
-	"github.com/IBM/sarama/mocks"
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kversion"
 
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
@@ -44,22 +47,10 @@ func baseConfig() map[string]any {
 	}
 }
 
-// TestNewDoesNotMutateSaramaLogger: New must not write sarama's global
-// Logger (review item C9). sarama already defaults to a discarding logger,
-// so the Python "silence kafka logging" behavior is preserved without a
-// data race against other constructors/clients.
-func TestNewDoesNotMutateSaramaLogger(t *testing.T) {
-	before := sarama.Logger
-	if _, err := New(sender.ConstructorArgs{Name: "test-sender", Config: baseConfig()}); err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if sarama.Logger != before {
-		t.Error("New mutated sarama.Logger")
-	}
-}
-
 // TestConcurrentConstruction exercises the constructor from several
-// goroutines; run with -race, it catches a global-logger write (C9).
+// goroutines; run with -race, it catches a global-logger write (C9): franz-go
+// (like sarama) defaults to a discarding logger and New never installs one,
+// so concurrent construction must not race on shared state.
 func TestConcurrentConstruction(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -82,8 +73,8 @@ func TestBasicInitialization(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	s := inst.Transport.(*Sender)
-	if s.key != nil {
-		t.Errorf("key = %v, want nil", s.key)
+	if s.keyBytes != nil {
+		t.Errorf("keyBytes = %v, want nil", s.keyBytes)
 	}
 	if s.topic != "test-topic" {
 		t.Errorf("topic = %q, want test-topic", s.topic)
@@ -97,15 +88,11 @@ func TestInitializationWithMessageKey(t *testing.T) {
 	raw := baseConfig()
 	raw["kafka_msg_key"] = "my-key"
 	s := newSender(t, raw)
-	if s.key == nil {
-		t.Fatal("key = nil, want encoded key")
+	if s.keyBytes == nil {
+		t.Fatal("keyBytes = nil, want encoded key")
 	}
-	got, err := s.key.Encode()
-	if err != nil {
-		t.Fatalf("key.Encode: %v", err)
-	}
-	if string(got) != "my-key" {
-		t.Errorf("key = %q, want my-key", got)
+	if string(s.keyBytes) != "my-key" {
+		t.Errorf("key = %q, want my-key", s.keyBytes)
 	}
 	if s.topic != "test-topic" {
 		t.Errorf("topic = %q, want test-topic", s.topic)
@@ -118,8 +105,8 @@ func TestInitializationWithEmptyMessageKeyIsNil(t *testing.T) {
 	raw := baseConfig()
 	raw["kafka_msg_key"] = ""
 	s := newSender(t, raw)
-	if s.key != nil {
-		t.Errorf("key = %v, want nil for empty kafka_msg_key", s.key)
+	if s.keyBytes != nil {
+		t.Errorf("keyBytes = %v, want nil for empty kafka_msg_key", s.keyBytes)
 	}
 }
 
@@ -471,8 +458,8 @@ func TestProducerConfigInheritsClientConfig(t *testing.T) {
 	if len(pc.brokers) != 1 || pc.brokers[0] != "localhost:9092" {
 		t.Errorf("brokers = %v", pc.brokers)
 	}
-	if pc.apiVersion == nil || *pc.apiVersion != sarama.V2_5_0_0 {
-		t.Errorf("apiVersion = %v, want V2_5_0_0", pc.apiVersion)
+	if pc.apiVersion != "2.5.0" {
+		t.Errorf("apiVersion = %q, want 2.5.0", pc.apiVersion)
 	}
 	if pc.securityProtocol != "PLAINTEXT" {
 		t.Errorf("securityProtocol = %q, want PLAINTEXT", pc.securityProtocol)
@@ -480,23 +467,25 @@ func TestProducerConfigInheritsClientConfig(t *testing.T) {
 }
 
 // TestNormalizeKafkaVersion covers the kafka-python accepted syntax
-// (review item D10): "auto" (and empty) mean detection, "X.Y" and "X.Y.Z"
-// are zero-padded, 0.x versions get the fourth component sarama requires.
+// (review item D10): "auto" (and empty) mean broker negotiation, "X.Y" and
+// "X.Y.Z" are zero-padded, and a trailing zero component is tolerated.
 func TestNormalizeKafkaVersion(t *testing.T) {
-	ver := func(v sarama.KafkaVersion) *sarama.KafkaVersion { return &v }
 	cases := []struct {
 		in   string
-		want *sarama.KafkaVersion
+		want string
 	}{
-		{"2.5.0", ver(sarama.V2_5_0_0)},
-		{"2.5", ver(sarama.V2_5_0_0)},
-		{"0.10.2", ver(sarama.V0_10_2_0)},
-		{"0.10", ver(sarama.V0_10_0_0)},
-		{"0.11.0", ver(sarama.V0_11_0_0)},
-		{"1.0.0", ver(sarama.V1_0_0_0)},
-		{"auto", nil},
-		{"AUTO", nil},
-		{"", nil},
+		{"2.5.0", "2.5.0"},
+		{"2.5", "2.5.0"},
+		{"0.10.2", "0.10.2"},
+		{"0.10.2.0", "0.10.2"},
+		{"0.10", "0.10.0"},
+		{"0.11.0", "0.11.0"},
+		{"1.0.0", "1.0.0"},
+		{"4.0.0", "4.0.0"},
+		{"auto", ""},
+		{"AUTO", ""},
+		{" Auto ", ""},
+		{"", ""},
 	}
 	for _, tc := range cases {
 		got, err := normalizeKafkaVersion(tc.in)
@@ -504,141 +493,75 @@ func TestNormalizeKafkaVersion(t *testing.T) {
 			t.Errorf("normalizeKafkaVersion(%q): %v", tc.in, err)
 			continue
 		}
-		switch {
-		case tc.want == nil && got != nil:
-			t.Errorf("normalizeKafkaVersion(%q) = %v, want nil (auto)", tc.in, *got)
-		case tc.want != nil && (got == nil || *got != *tc.want):
-			t.Errorf("normalizeKafkaVersion(%q) = %v, want %v", tc.in, got, *tc.want)
+		if got != tc.want {
+			t.Errorf("normalizeKafkaVersion(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
-	for _, bad := range []string{"not-a-version", "2.x", "a.b.c"} {
+	for _, bad := range []string{"not-a-version", "2.x", "a.b.c", "9.9.9", "2.5.0.1"} {
 		if _, err := normalizeKafkaVersion(bad); err == nil {
 			t.Errorf("normalizeKafkaVersion(%q): want error", bad)
 		}
 	}
 }
 
-// TestInferKafkaVersion covers the auto-detection decision list (D11)
-// against synthetic ApiVersions responses.
-func TestInferKafkaVersion(t *testing.T) {
-	// keyVersions builds an ApiVersionsResponse whose only entry grants
-	// the given api key the given max version.
-	resp := func(pairs map[int16]int16) *sarama.ApiVersionsResponse {
-		var keys []sarama.ApiVersionsResponseKey
-		for k, v := range pairs {
-			keys = append(keys, sarama.ApiVersionsResponseKey{ApiKey: k, MinVersion: 0, MaxVersion: v})
-		}
-		return &sarama.ApiVersionsResponse{ApiKeys: keys}
+// TestMaxVersionsFor: a normalized version maps onto the franz-go kversion
+// pin; an unknown one is an error. This replaces sarama's Config.Version
+// projection (review item D10).
+func TestMaxVersionsFor(t *testing.T) {
+	got, err := maxVersionsFor("2.5.0")
+	if err != nil {
+		t.Fatalf("maxVersionsFor(2.5.0): %v", err)
 	}
-	cases := []struct {
-		name string
-		resp *sarama.ApiVersionsResponse
-		want sarama.KafkaVersion
-	}{
-		{"2.6 via DescribeClientQuotas", resp(map[int16]int16{48: 0, 29: 2}), sarama.V2_6_0_0},
-		{"2.5 via DescribeAcls v2", resp(map[int16]int16{29: 2}), sarama.V2_5_0_0},
-		{"2.4 via Produce v8", resp(map[int16]int16{0: 8}), sarama.V2_4_0_0},
-		{"2.3 via Fetch v11", resp(map[int16]int16{1: 11}), sarama.V2_3_0_0},
-		{"2.2 via ListOffsets v5", resp(map[int16]int16{2: 5}), sarama.V2_2_0_0},
-		{"2.1 via Fetch v10", resp(map[int16]int16{1: 10}), sarama.V2_1_0_0},
-		{"2.0 via Fetch v8", resp(map[int16]int16{1: 8}), sarama.V2_0_0_0},
-		{"1.1 via Fetch v7", resp(map[int16]int16{1: 7}), sarama.V1_1_0_0},
-		{"1.0 via Metadata v5", resp(map[int16]int16{3: 5}), sarama.V1_0_0_0},
-		{"0.11 via Metadata v4", resp(map[int16]int16{3: 4}), sarama.V0_11_0_0},
-		{"0.10.2 via OffsetFetch v2", resp(map[int16]int16{9: 2}), sarama.V0_10_2_0},
-		{"0.10.1 via Metadata v2", resp(map[int16]int16{3: 2}), sarama.V0_10_1_0},
-		{"fallback 0.10.0", resp(map[int16]int16{}), sarama.V0_10_0_0},
+	if !reflect.DeepEqual(got, kversion.V2_5_0()) {
+		t.Error("maxVersionsFor(2.5.0) did not yield the V2_5_0 pin")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := inferKafkaVersion(tc.resp); got != tc.want {
-				t.Errorf("inferKafkaVersion = %v, want %v", got, tc.want)
-			}
-		})
+	if _, err := maxVersionsFor("9.9.9"); err == nil {
+		t.Error("maxVersionsFor(9.9.9): want error")
 	}
 }
 
-// TestBuildSaramaConfigDetectsVersion: an unset api_version probes the
-// broker, an explicit one does not (review items D10/D11).
-func TestBuildSaramaConfigDetectsVersion(t *testing.T) {
-	raw := baseConfig()
-	pc, err := resolveProducerConfig(raw)
-	if err != nil {
-		t.Fatalf("resolveProducerConfig: %v", err)
-	}
-	s := newSender(t, raw)
-	probed := false
-	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
-		probed = true
-		return sarama.V2_5_0_0, nil
-	}
-	cfg, _, err := s.buildSaramaConfig(context.Background(), pc)
-	if err != nil {
-		t.Fatalf("buildSaramaConfig: %v", err)
-	}
-	if !probed {
-		t.Error("unset api_version did not trigger detection")
-	}
-	if cfg.Version != sarama.V2_5_0_0 {
-		t.Errorf("cfg.Version = %v, want V2_5_0_0", cfg.Version)
-	}
-
-	raw["kafka_api_version"] = "1.1.0"
-	pc2, err := resolveProducerConfig(raw)
-	if err != nil {
-		t.Fatalf("resolveProducerConfig: %v", err)
-	}
-	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
-		t.Error("detection ran despite an explicit api_version")
-		return sarama.V0_10_0_0, nil
-	}
-	cfg2, _, err := s.buildSaramaConfig(context.Background(), pc2)
-	if err != nil {
-		t.Fatalf("buildSaramaConfig: %v", err)
-	}
-	if cfg2.Version != sarama.V1_1_0_0 {
-		t.Errorf("cfg.Version = %v, want V1_1_0_0", cfg2.Version)
-	}
-}
-
-// TestSaramaConfigRetryTimeouts pins the retry/timeout mapping: the metadata
-// retry uses the 100ms retry_backoff_ms (NOT the reconnect backoff — the
-// per-broker connect delay lives in the dialer, so keeping both would double
-// it), Producer.Timeout carries the BROKER-side request_timeout_ms and the
-// 120s delivery_timeout_ms is a separate client-side deadline, and the
-// producer retry count stays bounded (review round-3 items 4 and 5).
-func TestSaramaConfigRetryTimeouts(t *testing.T) {
+// TestProducerOptsConstructClient builds a real franz-go client from the
+// resolved options. franz-go validates the acks/idempotency pairing at
+// construction, so this pins that acks=1 is accompanied by
+// DisableIdempotentWrite (review item D12 / the assessment's mandatory
+// pairing).
+func TestProducerOptsConstructClient(t *testing.T) {
 	pc, err := resolveProducerConfig(baseConfig())
 	if err != nil {
 		t.Fatalf("resolveProducerConfig: %v", err)
 	}
-	cfg, err := pc.saramaConfig()
+	base, err := pc.clientOpts()
 	if err != nil {
-		t.Fatalf("saramaConfig: %v", err)
+		t.Fatalf("clientOpts: %v", err)
 	}
-	if cfg.Metadata.Retry.Backoff != 100*time.Millisecond {
-		t.Errorf("Metadata.Retry.Backoff = %v, want 100ms (retry_backoff_ms)", cfg.Metadata.Retry.Backoff)
+	cl, err := kgo.NewClient(append(base, pc.producerOpts()...)...)
+	if err != nil {
+		t.Fatalf("kgo.NewClient rejected the producer options (acks=1 needs DisableIdempotentWrite): %v", err)
 	}
-	if cfg.Metadata.Retry.BackoffFunc != nil {
-		t.Error("Metadata.Retry.BackoffFunc must be nil: the reconnect backoff belongs to the dialer, not the metadata retry (no double backoff)")
+	cl.Close()
+}
+
+// TestProducerSemanticsConstants pins the retry/timeout/linger values that
+// map onto franz-go's RecordRetries, RecordDeliveryTimeout,
+// ProduceRequestTimeout and ProducerLinger (review round-3 items 4/5).
+func TestProducerSemanticsConstants(t *testing.T) {
+	if lingerMS != 500 {
+		t.Errorf("lingerMS = %d, want 500", lingerMS)
 	}
-	// Producer.Timeout is transmitted in Produce requests, so it is the
-	// request_timeout_ms, NOT the 120s delivery_timeout_ms (review round-3
-	// item 5).
-	if cfg.Producer.Timeout != requestTimeout {
-		t.Errorf("Producer.Timeout = %v, want %v (request_timeout_ms)", cfg.Producer.Timeout, requestTimeout)
+	if requestTimeout != 30*time.Second {
+		t.Errorf("requestTimeout = %v, want 30s", requestTimeout)
+	}
+	if deliveryTimeout != 120*time.Second {
+		t.Errorf("deliveryTimeout = %v, want 120s", deliveryTimeout)
 	}
 	if deliveryTimeout == requestTimeout {
 		t.Fatal("deliveryTimeout and requestTimeout must be distinct so the two are independently observable")
 	}
-	if cfg.Producer.Retry.Backoff != retryBackoff {
-		t.Errorf("Producer.Retry.Backoff = %v, want %v", cfg.Producer.Retry.Backoff, retryBackoff)
+	if retryBackoff != 100*time.Millisecond {
+		t.Errorf("retryBackoff = %v, want 100ms", retryBackoff)
 	}
-	if cfg.Net.ReadTimeout != requestTimeout || cfg.Net.WriteTimeout != requestTimeout {
-		t.Errorf("Net timeouts = %v/%v, want %v/%v", cfg.Net.ReadTimeout, cfg.Net.WriteTimeout, requestTimeout, requestTimeout)
-	}
-	if cfg.Producer.Retry.Max <= 3 {
-		t.Errorf("Producer.Retry.Max = %d, want bounded but > sarama default 3", cfg.Producer.Retry.Max)
+	if producerRetryMax != 20 {
+		t.Errorf("producerRetryMax = %d, want 20", producerRetryMax)
 	}
 }
 
@@ -668,15 +591,11 @@ func TestProducerConfigCompressionSnappy(t *testing.T) {
 	if pc.compression != "snappy" {
 		t.Errorf("compression = %q, want snappy", pc.compression)
 	}
-	sc, err := pc.saramaConfig()
-	if err != nil {
-		t.Fatalf("saramaConfig: %v", err)
+	if !reflect.DeepEqual(compressionCodec(), kgo.SnappyCompression()) {
+		t.Error("compressionCodec() is not franz-go's SnappyCompression")
 	}
-	if sc.Producer.Compression != sarama.CompressionSnappy {
-		t.Errorf("sarama compression = %v, want CompressionSnappy", sc.Producer.Compression)
-	}
-	if got, want := sc.Producer.Flush.Frequency, 500*time.Millisecond; got != want {
-		t.Errorf("linger = %v, want %v", got, want)
+	if reflect.DeepEqual(compressionCodec(), kgo.GzipCompression()) {
+		t.Error("compressionCodec() must not be gzip")
 	}
 }
 
@@ -690,16 +609,8 @@ func TestProducerConfigWithSocks5Proxy(t *testing.T) {
 	if pc.socks5Proxy != "socks5://proxy:1080" {
 		t.Errorf("socks5Proxy = %q", pc.socks5Proxy)
 	}
-	s := newSender(t, raw)
-	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
-		return sarama.V2_5_0_0, nil
-	}
-	sc, _, err := s.buildSaramaConfig(context.Background(), pc)
-	if err != nil {
-		t.Fatalf("buildSaramaConfig: %v", err)
-	}
-	if !sc.Net.Proxy.Enable || sc.Net.Proxy.Dialer == nil {
-		t.Errorf("sarama proxy enable=%v dialer=%v, want enabled with dialer", sc.Net.Proxy.Enable, sc.Net.Proxy.Dialer)
+	if _, err := pc.clientOpts(); err != nil {
+		t.Fatalf("clientOpts with a socks5 proxy: %v", err)
 	}
 }
 
@@ -711,26 +622,8 @@ func TestProducerConfigWithoutSocks5Proxy(t *testing.T) {
 	if pc.socks5Proxy != "" {
 		t.Errorf("socks5Proxy = %q, want empty", pc.socks5Proxy)
 	}
-	s := newSender(t, baseConfig())
-	s.detectVersion = func(context.Context, []string, *sarama.Config) (sarama.KafkaVersion, error) {
-		return sarama.V2_5_0_0, nil
-	}
-	sc, td, err := s.buildSaramaConfig(context.Background(), pc)
-	if err != nil {
-		t.Fatalf("buildSaramaConfig: %v", err)
-	}
-	// The dialer chain is installed unconditionally (sarama only consults
-	// Net.Proxy.Dialer when Enable is set) to carry the per-broker reconnect
-	// backoff; buildSaramaConfig wraps the persistent backoff dialer in the
-	// cancellation-tracking dialer (review round-3 items 2 and 4).
-	if !sc.Net.Proxy.Enable {
-		t.Error("dialer chain not installed: sarama would ignore the per-broker backoff dialer")
-	}
-	if sc.Net.Proxy.Dialer != td {
-		t.Errorf("proxy dialer = %T, want the tracking dialer", sc.Net.Proxy.Dialer)
-	}
-	if _, ok := td.inner.(*backoffDialer); !ok {
-		t.Errorf("tracking dialer inner = %T, want *backoffDialer", td.inner)
+	if _, err := pc.clientOpts(); err != nil {
+		t.Fatalf("clientOpts: %v", err)
 	}
 }
 
@@ -741,9 +634,8 @@ func TestProducerConfigInvalidSocks5Proxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveProducerConfig: %v", err)
 	}
-	s := newSender(t, raw)
-	if _, _, err := s.buildSaramaConfig(context.Background(), pc); err == nil {
-		t.Fatal("invalid socks5 scheme: buildSaramaConfig want error")
+	if _, err := pc.clientOpts(); err == nil {
+		t.Fatal("invalid socks5 scheme: clientOpts want error")
 	}
 }
 
@@ -758,22 +650,13 @@ func TestSocks5DialerFromURL(t *testing.T) {
 }
 
 func TestSaslMechanisms(t *testing.T) {
-	cases := map[string]sarama.SASLMechanism{
-		"PLAIN":         sarama.SASLTypePlaintext,
-		"SCRAM-SHA-256": sarama.SASLTypeSCRAMSHA256,
-		"SCRAM-SHA-512": sarama.SASLTypeSCRAMSHA512,
-	}
-	for name, want := range cases {
-		got, err := saslMechanism(name)
-		if err != nil {
-			t.Fatalf("saslMechanism(%s): %v", name, err)
-		}
-		if got != want {
-			t.Errorf("saslMechanism(%s) = %v, want %v", name, got, want)
+	for _, name := range []string{"PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"} {
+		if _, err := saslOption(producerConfig{saslMechanism: name, saslUsername: "user", saslPassword: "password"}); err != nil {
+			t.Errorf("saslOption(%s): %v", name, err)
 		}
 	}
-	if _, err := saslMechanism("GSSAPI"); err == nil {
-		t.Error("saslMechanism(GSSAPI): want error")
+	if _, err := saslOption(producerConfig{saslMechanism: "GSSAPI"}); err == nil {
+		t.Error("saslOption(GSSAPI): want error")
 	}
 }
 
@@ -786,23 +669,23 @@ func TestRetriableClassification(t *testing.T) {
 		want bool
 	}{
 		{"nil", nil, false},
-		{"out of brokers", sarama.ErrOutOfBrokers, true},
-		{"leader not available", sarama.ErrLeaderNotAvailable, true},
-		{"unknown server error", sarama.ErrUnknown, true},
-		{"network exception", sarama.ErrNetworkException, true},
-		{"request timed out", sarama.ErrRequestTimedOut, true},
-		{"producer error wraps retriable", &sarama.ProducerError{Err: sarama.ErrNotLeaderForPartition}, true},
-		{"producer error wraps permanent", &sarama.ProducerError{Err: sarama.ErrInvalidMessage}, false},
+		{"leader not available", kerr.ErrorForCode(5), true},
+		{"unknown server error", &kerr.Error{Code: -1}, true},
+		{"network exception", kerr.ErrorForCode(13), true},
+		{"request timed out", kerr.ErrorForCode(7), true},
+		{"broker not available is not retriable", kerr.ErrorForCode(8), false},
+		{"corrupt message permanent", &kerr.Error{Code: 2}, false},
+		{"batch all retriable", sendErr(kerr.ErrorForCode(6), kerr.ErrorForCode(7)), true},
+		{"batch mixed is permanent", sendErr(kerr.ErrorForCode(6), &kerr.Error{Code: 2}), false},
+		{"empty batch", sendErr(), false},
+		{"batch wrapped", fmt.Errorf("send failed: %w", sendErr(kerr.ErrorForCode(5))), true},
 		{"connection refused", syscall.ECONNREFUSED, true},
-		{"invalid message is permanent", sarama.ErrInvalidMessage, false},
-		// ProducerErrors (the slice returned by SyncProducer.SendMessages)
-		// has no Unwrap, so it is inspected element by element (A2).
-		{"batch all retriable", sarama.ProducerErrors{{Err: sarama.ErrNotLeaderForPartition}, {Err: sarama.ErrRequestTimedOut}}, true},
-		{"batch all retriable network", sarama.ProducerErrors{{Err: sarama.ErrOutOfBrokers}, {Err: sarama.ErrNetworkException}}, true},
-		{"batch mixed is permanent", sarama.ProducerErrors{{Err: sarama.ErrNotLeaderForPartition}, {Err: sarama.ErrInvalidMessage}}, false},
-		{"batch single permanent", sarama.ProducerErrors{{Err: sarama.ErrInvalidMessage}}, false},
-		{"empty batch", sarama.ProducerErrors{}, false},
-		{"batch wrapped", fmt.Errorf("send failed: %w", sarama.ProducerErrors{{Err: sarama.ErrLeaderNotAvailable}}), true},
+		{"deadline exceeded", context.DeadlineExceeded, true},
+		{"cancelled", context.Canceled, true},
+		{"client closed", kgo.ErrClientClosed, true},
+		{"record timeout", kgo.ErrRecordTimeout, true},
+		{"record retries", kgo.ErrRecordRetries, true},
+		{"eof", io.EOF, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -823,69 +706,41 @@ func TestRetriableTimeout(t *testing.T) {
 // kafka-python 2.3.2's retriable=True classes (review item A3). Certain
 // codes that look transient (BrokerNotAvailable, RebalanceInProgress) are
 // deliberately NOT retriable because kafka-python does not mark them so,
-// and newer codes are included even though sarama lacks named constants.
+// even though franz-go's kerr.Retriable says BrokerNotAvailable is.
 func TestRetriableKErrorMapping(t *testing.T) {
-	retriable := map[sarama.KError]string{
-		sarama.ErrUnknown:                         "UnknownError (-1)",
-		sarama.ErrUnknownTopicOrPartition:         "3",
-		sarama.ErrLeaderNotAvailable:              "5",
-		sarama.ErrNotLeaderForPartition:           "6",
-		sarama.ErrRequestTimedOut:                 "7",
-		sarama.ErrReplicaNotAvailable:             "9",
-		sarama.ErrNetworkException:                "13",
-		sarama.ErrOffsetsLoadInProgress:           "14",
-		sarama.ErrConsumerCoordinatorNotAvailable: "15",
-		sarama.ErrNotCoordinatorForConsumer:       "16",
-		sarama.ErrNotEnoughReplicas:               "19",
-		sarama.ErrNotEnoughReplicasAfterAppend:    "20",
-		sarama.ErrNotController:                   "41",
-		sarama.ErrConcurrentTransactions:          "51",
-		sarama.ErrKafkaStorageError:               "56",
-		sarama.ErrFetchSessionIDNotFound:          "70",
-		sarama.ErrInvalidFetchSessionEpoch:        "71",
-		sarama.ErrListenerNotFound:                "72",
-		sarama.ErrFencedLeaderEpoch:               "74",
-		sarama.ErrUnknownLeaderEpoch:              "75",
-		sarama.ErrOffsetNotAvailable:              "78",
-		sarama.ErrPreferredLeaderNotAvailable:     "80",
-		sarama.ErrEligibleLeadersNotAvailable:     "83",
-		sarama.ErrElectionNotNeeded:               "84",
-		sarama.ErrUnstableOffsetCommit:            "88",
-		sarama.ErrThrottlingQuotaExceeded:         "89",
-		sarama.KError(100):                        "100 UnknownTopicId",
-		sarama.KError(103):                        "103 InconsistentTopicId",
-		sarama.KError(106):                        "106 FetchSessionTopicId",
-		sarama.KError(122):                        "122 ShareSessionNotFound",
-		sarama.KError(123):                        "123 InvalidShareSessionEpoch",
+	retriable := []int16{
+		-1, 3, 5, 6, 7, 9, 13, 14, 15, 16, 19, 20, 41, 51, 56, 70, 71, 72,
+		74, 75, 78, 80, 83, 84, 88, 89, 100, 103, 106, 122, 123,
 	}
-	for code, label := range retriable {
-		if !Retriable(code) {
-			t.Errorf("Retriable(%s) = false, want true", label)
+	for _, code := range retriable {
+		if !Retriable(&kerr.Error{Code: code}) {
+			t.Errorf("Retriable(code %d) = false, want true", code)
 		}
 	}
-	permanent := map[sarama.KError]string{
-		sarama.ErrBrokerNotAvailable:       "8 BrokerNotAvailable (kafka-python: not retriable)",
-		sarama.ErrRebalanceInProgress:      "27 RebalanceInProgress (kafka-python: not retriable)",
-		sarama.ErrInvalidMessage:           "2 CorruptRecord",
-		sarama.ErrTopicAlreadyExists:       "36 TopicAlreadyExists",
-		sarama.ErrTopicAuthorizationFailed: "29 TopicAuthorizationFailed",
-		sarama.ErrMessageSizeTooLarge:      "10 MessageSizeTooLarge",
+	permanent := []int16{
+		8,  // BrokerNotAvailable (kafka-python: not retriable)
+		27, // RebalanceInProgress (kafka-python: not retriable)
+		2,  // CorruptMessage
+		36, // TopicAlreadyExists
+		29, // TopicAuthorizationFailed
+		10, // MessageSizeTooLarge
 	}
-	for code, label := range permanent {
-		if Retriable(code) {
-			t.Errorf("Retriable(%s) = true, want false", label)
+	for _, code := range permanent {
+		if Retriable(&kerr.Error{Code: code}) {
+			t.Errorf("Retriable(code %d) = true, want false", code)
 		}
 	}
 }
 
-// TestRetriableClientErrors covers the sarama client-side errors mapped
-// onto kafka-python's retriable client exceptions.
-func TestRetriableClientErrors(t *testing.T) {
+// TestRetriableNetworkErrors covers the socket-level errors mapped onto
+// kafka-python's retriable client exceptions.
+func TestRetriableNetworkErrors(t *testing.T) {
 	for _, err := range []error{
-		sarama.ErrNotConnected,
-		sarama.ErrControllerNotAvailable,
-		sarama.ErrIncompleteResponse,
-		sarama.ErrInsufficientData,
+		syscall.ECONNREFUSED,
+		syscall.ECONNRESET,
+		syscall.EPIPE,
+		io.ErrUnexpectedEOF,
+		&netTimeoutError{},
 	} {
 		if !Retriable(err) {
 			t.Errorf("Retriable(%v) = false, want true", err)
@@ -893,97 +748,68 @@ func TestRetriableClientErrors(t *testing.T) {
 	}
 }
 
+// netTimeoutError is a net.Error whose Timeout() is true, modelling a socket
+// read/write deadline.
+type netTimeoutError struct{}
+
+func (*netTimeoutError) Error() string   { return "i/o timeout" }
+func (*netTimeoutError) Timeout() bool   { return true }
+func (*netTimeoutError) Temporary() bool { return true }
+
 // --- send path ---
 
-// mockProducer builds a sarama mocks SyncProducer valid for the resolved
-// producer config (mocks validate the config).
-func mockProducer(t *testing.T, pc producerConfig) *mocks.SyncProducer {
-	t.Helper()
-	sc, err := pc.saramaConfig()
-	if err != nil {
-		t.Fatalf("saramaConfig: %v", err)
-	}
-	return mocks.NewSyncProducer(t, sc)
-}
+type fakeProducer struct{ closed bool }
+
+func (f *fakeProducer) Produce(context.Context, [][]byte) error { return nil }
+func (f *fakeProducer) Close() error                            { f.closed = true; return nil }
 
 func TestSendMessagesSuccess(t *testing.T) {
 	raw := baseConfig()
 	raw["kafka_msg_key"] = "journalpump"
 	s := newSender(t, raw)
-	pc, err := resolveProducerConfig(raw)
-	if err != nil {
-		t.Fatalf("resolveProducerConfig: %v", err)
-	}
-	mp := mockProducer(t, pc)
-	bodies := [][]byte{[]byte("one"), []byte("two")}
-	for range bodies {
-		mp.ExpectSendMessageWithMessageCheckerFunctionAndSucceed(func(msg *sarama.ProducerMessage) error {
-			if msg.Topic != "test-topic" {
-				return errors.New("wrong topic " + msg.Topic)
-			}
-			val, _ := msg.Value.Encode()
-			if len(val) == 0 {
-				return errors.New("empty value")
-			}
-			key, _ := msg.Key.Encode()
-			if string(key) != "journalpump" {
-				return errors.New("wrong key " + string(key))
-			}
-			return nil
-		})
-	}
-	s.newProducer = func(context.Context, producerConfig) (producer, error) { return mp, nil }
+	rp := &recordingProducer{}
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return rp, nil }
 
+	bodies := [][]byte{[]byte("one"), []byte("two")}
 	if err := s.SendMessages(context.Background(), bodies, "cursor"); err != nil {
 		t.Fatalf("SendMessages: %v", err)
 	}
-	if err := mp.Close(); err != nil {
-		t.Fatalf("mock Close: %v", err)
+	values := rp.recorded()
+	if len(values) != 2 || string(values[0]) != "one" || string(values[1]) != "two" {
+		t.Fatalf("delivered = %q, want [one two]", values)
+	}
+	// The topic and the fixed key are stamped by liveProducer from the Sender.
+	if s.topic != "test-topic" {
+		t.Errorf("topic = %q, want test-topic", s.topic)
+	}
+	if string(s.keyBytes) != "journalpump" {
+		t.Errorf("keyBytes = %q, want journalpump", s.keyBytes)
 	}
 }
 
 func TestSendMessagesWithoutKey(t *testing.T) {
 	s := newSender(t, baseConfig())
-	pc, err := resolveProducerConfig(baseConfig())
-	if err != nil {
-		t.Fatalf("resolveProducerConfig: %v", err)
-	}
-	mp := mockProducer(t, pc)
-	mp.ExpectSendMessageWithMessageCheckerFunctionAndSucceed(func(msg *sarama.ProducerMessage) error {
-		if msg.Key != nil {
-			return errors.New("key set without kafka_msg_key")
-		}
-		return nil
-	})
-	s.newProducer = func(context.Context, producerConfig) (producer, error) { return mp, nil }
-
+	rp := &recordingProducer{}
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return rp, nil }
 	if err := s.SendMessages(context.Background(), [][]byte{[]byte("one")}, "cursor"); err != nil {
 		t.Fatalf("SendMessages: %v", err)
 	}
-	if err := mp.Close(); err != nil {
-		t.Fatalf("mock Close: %v", err)
+	if s.keyBytes != nil {
+		t.Errorf("keyBytes = %v, want nil without kafka_msg_key", s.keyBytes)
 	}
 }
 
 func TestSendMessagesFailureDropsProducer(t *testing.T) {
 	s := newSender(t, baseConfig())
-	pc, err := resolveProducerConfig(baseConfig())
-	if err != nil {
-		t.Fatalf("resolveProducerConfig: %v", err)
-	}
-	mp := mockProducer(t, pc)
-	mp.ExpectSendMessageAndFail(sarama.ErrOutOfBrokers)
-	s.newProducer = func(context.Context, producerConfig) (producer, error) { return mp, nil }
+	rp := &recordingProducer{errs: []error{errors.New("boom")}}
+	s.newProducer = func(context.Context, producerConfig) (producer, error) { return rp, nil }
 
-	err = s.SendMessages(context.Background(), [][]byte{[]byte("one")}, "cursor")
+	err := s.SendMessages(context.Background(), [][]byte{[]byte("one")}, "cursor")
 	if err == nil {
 		t.Fatal("SendMessages: want error")
 	}
 	if s.prod != nil {
 		t.Error("producer not dropped after send failure")
-	}
-	if err := mp.Close(); err != nil {
-		t.Fatalf("mock Close: %v", err)
 	}
 }
 
@@ -999,15 +825,17 @@ func TestSendMessagesConnectFailure(t *testing.T) {
 // --- topic auto-create ---
 
 type fakeAdmin struct {
-	created []string
-	detail  *sarama.TopicDetail
-	err     error
-	closed  bool
+	created    []string
+	partitions int32
+	rf         int16
+	err        error
+	closed     bool
 }
 
-func (f *fakeAdmin) CreateTopic(topic string, detail *sarama.TopicDetail, _ bool) error {
+func (f *fakeAdmin) CreateTopic(_ context.Context, partitions int32, rf int16, topic string) error {
 	f.created = append(f.created, topic)
-	f.detail = detail
+	f.partitions = partitions
+	f.rf = rf
 	return f.err
 }
 
@@ -1015,11 +843,6 @@ func (f *fakeAdmin) Close() error {
 	f.closed = true
 	return nil
 }
-
-type fakeProducer struct{ closed bool }
-
-func (f *fakeProducer) SendMessages([]*sarama.ProducerMessage) error { return nil }
-func (f *fakeProducer) Close() error                                 { f.closed = true; return nil }
 
 func TestMaybeCreateTopicWithBothValues(t *testing.T) {
 	raw := baseConfig()
@@ -1034,8 +857,8 @@ func TestMaybeCreateTopicWithBothValues(t *testing.T) {
 	if len(fa.created) != 1 || fa.created[0] != "test-topic" {
 		t.Errorf("created = %v, want [test-topic]", fa.created)
 	}
-	if fa.detail == nil || fa.detail.NumPartitions != 2 || fa.detail.ReplicationFactor != 1 {
-		t.Errorf("detail = %+v, want 2/1", fa.detail)
+	if fa.partitions != 2 || fa.rf != 1 {
+		t.Errorf("partitions/rf = %d/%d, want 2/1", fa.partitions, fa.rf)
 	}
 	if !fa.closed {
 		t.Error("admin not closed")
@@ -1054,8 +877,8 @@ func TestMaybeCreateTopicWithJSONNumberConfig(t *testing.T) {
 	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("maybeCreateTopic: %v", err)
 	}
-	if fa.detail == nil || fa.detail.NumPartitions != 2 || fa.detail.ReplicationFactor != 1 {
-		t.Errorf("detail = %+v, want 2/1", fa.detail)
+	if fa.partitions != 2 || fa.rf != 1 {
+		t.Errorf("partitions/rf = %d/%d, want 2/1", fa.partitions, fa.rf)
 	}
 }
 
@@ -1064,7 +887,7 @@ func TestMaybeCreateTopicAlreadyExistsTolerated(t *testing.T) {
 	raw["kafka_topic_config"] = map[string]any{"num_partitions": 2, "replication_factor": 1}
 	s := newSender(t, raw)
 	pc, _ := resolveProducerConfig(raw)
-	fa := &fakeAdmin{err: sarama.ErrTopicAlreadyExists}
+	fa := &fakeAdmin{err: kerr.TopicAlreadyExists}
 	s.newAdmin = func(context.Context, producerConfig) (admin, error) { return fa, nil }
 	if err := s.maybeCreateTopic(context.Background(), pc); err != nil {
 		t.Fatalf("TopicAlreadyExists should be tolerated, got %v", err)
@@ -1219,37 +1042,25 @@ type signalledProducer struct {
 	once   sync.Once
 }
 
-func (p *signalledProducer) SendMessages([]*sarama.ProducerMessage) error { return nil }
+func (p *signalledProducer) Produce(context.Context, [][]byte) error { return nil }
 func (p *signalledProducer) Close() error {
 	p.once.Do(func() { close(p.closed) })
 	return nil
 }
 
-// signalledAdmin is the admin analogue of signalledProducer.
-type signalledAdmin struct {
-	closed chan struct{}
-	once   sync.Once
-}
-
-func (a *signalledAdmin) CreateTopic(string, *sarama.TopicDetail, bool) error { return nil }
-func (a *signalledAdmin) Close() error {
-	a.once.Do(func() { close(a.closed) })
-	return nil
-}
-
-// TestEnsureProducerRespectsCancellation: a stalled connect must return
-// promptly when the context is cancelled, and the producer that the dial
-// eventually yields must be closed (no leak), leaving the sender ready to
-// re-init on the next attempt.
+// TestEnsureProducerRespectsCancellation: the factory seam must honor the
+// caller's context — a connect that has not completed when ctx ends must
+// surface context.Canceled and leave no producer installed, so the next
+// attempt re-initializes. (The production connectProducer does this via
+// franz-go's ctx-aware Ping, which aborts the metadata handshake.)
 func TestEnsureProducerRespectsCancellation(t *testing.T) {
 	s := newSender(t, baseConfig())
 	release := make(chan struct{})
 	entered := make(chan struct{})
-	late := &signalledProducer{closed: make(chan struct{})}
-	s.newProducer = func(context.Context, producerConfig) (producer, error) {
+	s.newProducer = func(ctx context.Context, _ producerConfig) (producer, error) {
 		close(entered)
 		<-release
-		return late, nil
+		return nil, ctx.Err()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1258,9 +1069,6 @@ func TestEnsureProducerRespectsCancellation(t *testing.T) {
 		_, err := s.ensureProducer(ctx)
 		done <- err
 	}()
-	// Cancel once the dial is in flight, then let the (bounded) dial return as
-	// a real Net.DialTimeout would; the call must JOIN the worker and clean up
-	// the late producer BEFORE returning (review item 3).
 	<-entered
 	cancel()
 	close(release)
@@ -1272,12 +1080,6 @@ func TestEnsureProducerRespectsCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ensureProducer did not return after cancellation")
 	}
-	// The join guarantee: cleanup already ran before the call returned.
-	select {
-	case <-late.closed:
-	default:
-		t.Fatal("late producer was not closed before ensureProducer returned (no join)")
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.prod != nil {
@@ -1285,8 +1087,9 @@ func TestEnsureProducerRespectsCancellation(t *testing.T) {
 	}
 }
 
-// TestMaybeCreateTopicRespectsCancellation: the admin dial and the create
-// call are both cancellation-aware, and an abandoned admin is closed.
+// TestMaybeCreateTopicRespectsCancellation: the admin factory and the create
+// call are cancellation-aware, and a cancelled connect surfaces
+// context.Canceled.
 func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 	raw := baseConfig()
 	raw["kafka_topic_config"] = map[string]any{"num_partitions": 3, "replication_factor": 1}
@@ -1297,11 +1100,10 @@ func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 	}
 	release := make(chan struct{})
 	entered := make(chan struct{})
-	late := &signalledAdmin{closed: make(chan struct{})}
-	s.newAdmin = func(context.Context, producerConfig) (admin, error) {
+	s.newAdmin = func(ctx context.Context, _ producerConfig) (admin, error) {
 		close(entered)
 		<-release
-		return late, nil
+		return nil, ctx.Err()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1309,7 +1111,7 @@ func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 	go func() { done <- s.maybeCreateTopic(ctx, pc) }()
 	<-entered
 	cancel()
-	close(release) // the bounded dial returns
+	close(release)
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
@@ -1317,11 +1119,6 @@ func TestMaybeCreateTopicRespectsCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("maybeCreateTopic did not return after cancellation")
-	}
-	select {
-	case <-late.closed:
-	default:
-		t.Fatal("late admin was not closed before maybeCreateTopic returned (no join)")
 	}
 }
 
@@ -1341,5 +1138,17 @@ func TestSendMessagesCancelledContext(t *testing.T) {
 	}
 	if called {
 		t.Error("SendMessages connected despite a cancelled context")
+	}
+}
+
+func TestSignalledProducerClose(t *testing.T) {
+	// Guard the fake: Close fires its channel exactly once.
+	sp := &signalledProducer{closed: make(chan struct{})}
+	_ = sp.Close()
+	_ = sp.Close()
+	select {
+	case <-sp.closed:
+	default:
+		t.Fatal("signalledProducer.Close did not signal")
 	}
 }

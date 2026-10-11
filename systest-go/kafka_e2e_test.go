@@ -8,6 +8,7 @@
 package systestgo
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -21,7 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // kafkaFixture mirrors the committed capture of
@@ -437,61 +439,39 @@ type kafkaRecord struct {
 // expected record count arrives or the deadline passes.
 func consumeKafka(t *testing.T, broker, topic string, partitions, want int) ([]kafkaRecord, error) {
 	t.Helper()
-	cfg := sarama.NewConfig()
-	cfg.Version = sarama.V2_5_0_0
-	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
 	// CRITICAL: the consumer's metadata requests must NOT auto-create the
-	// topic. On an auto-create broker, a subscribe/metadata request for a
-	// not-yet-existing topic creates it with the DEFAULT partition count
-	// and would race (and beat) the sender's own admin create_topics — the
-	// exact race the Task 12 harness documents. With this disabled the
-	// consumer waits for the sender's topic (and its partition count).
-	cfg.Metadata.AllowAutoTopicCreation = false
-	consumer, err := sarama.NewConsumer([]string{broker}, cfg)
+	// topic. franz-go defaults AllowAutoTopicCreation to false, so a metadata
+	// request for a not-yet-existing topic does NOT create it with the
+	// DEFAULT partition count and race (and beat) the sender's own admin
+	// create_topics — the exact race the Task 12 harness documents.
+	admin, err := kgo.NewClient(kgo.SeedBrokers(broker))
 	if err != nil {
-		return nil, fmt.Errorf("new consumer: %w", err)
+		return nil, fmt.Errorf("new admin: %w", err)
 	}
-	defer func() { _ = consumer.Close() }()
+	adm := kadm.NewClient(admin)
+	defer admin.Close()
 
 	var records []kafkaRecord
 	deadline := time.Now().Add(60 * time.Second)
-	// Wait for the producer to create the topic (the admin scenario
-	// creates it), then read every partition from the earliest offsets.
-	// Each outer pass re-reads from the beginning and replaces the
-	// accumulated set, so a partially-populated topic does not duplicate
-	// records across passes.
+	// Wait for the producer to create the topic (the admin scenario creates
+	// it), then read every partition from the earliest offsets. Each outer
+	// pass re-reads from the beginning and replaces the accumulated set, so a
+	// partially-populated topic does not duplicate records across passes.
 	for len(records) < want && time.Now().Before(deadline) {
-		partitionsList, perr := consumer.Partitions(topic)
-		// Require EXACTLY the fixture's partition count: a larger count
-		// means the broker auto-created the topic (or the sender's admin
-		// create raced the consumer), which the fixture forbids.
-		if perr != nil || len(partitionsList) != partitions {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		details, derr := adm.ListTopics(ctx)
+		cancel()
+		// Require EXACTLY the fixture's partition count: a larger count means
+		// the broker auto-created the topic (or the sender's admin create
+		// raced the consumer), which the fixture forbids.
+		td, ok := details[topic]
+		if derr != nil || !ok || len(td.Partitions) != partitions {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 		records = records[:0]
-		for _, p := range partitionsList {
-			pc, err := consumer.ConsumePartition(topic, p, sarama.OffsetOldest)
-			if err != nil {
-				continue
-			}
-			drain := time.NewTimer(2 * time.Second)
-			collecting := true
-			for collecting {
-				select {
-				case msg, ok := <-pc.Messages():
-					if !ok {
-						collecting = false
-						continue
-					}
-					records = append(records, kafkaRecord{partition: msg.Partition, offset: msg.Offset, key: msg.Key, value: msg.Value})
-				case <-drain.C:
-					collecting = false
-				}
-			}
-			drain.Stop()
-			_ = pc.Close()
-		}
+		passRecs, _ := pollKafka(broker, topic, want)
+		records = append(records, passRecs...)
 		if len(records) < want {
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -506,6 +486,34 @@ func consumeKafka(t *testing.T, broker, topic string, partitions, want int) ([]k
 		return records, fmt.Errorf("consumed %d records, want %d", len(records), want)
 	}
 	return records, nil
+}
+
+// pollKafka reads every partition of topic from the earliest offsets for up
+// to two seconds, or until want records are collected.
+func pollKafka(broker, topic string, want int) ([]kafkaRecord, error) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(broker),
+		kgo.ConsumeTopics(topic),
+		// No committed offsets: start from the earliest record each pass.
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new consumer: %w", err)
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var recs []kafkaRecord
+	for len(recs) < want {
+		fetches := cl.PollFetches(ctx)
+		if ctx.Err() != nil {
+			break
+		}
+		fetches.EachRecord(func(r *kgo.Record) {
+			recs = append(recs, kafkaRecord{partition: r.Partition, offset: r.Offset, key: r.Key, value: r.Value})
+		})
+	}
+	return recs, nil
 }
 
 func less(a, b kafkaRecord) bool {

@@ -223,10 +223,7 @@ func TestSocks5DialerHasTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("socks5Dialer: %v", err)
 	}
-	d, ok := dialer.(*socks5ProxyDialer)
-	if !ok {
-		t.Fatalf("dialer = %T, want *socks5ProxyDialer", dialer)
-	}
+	d := dialer
 	if d.timeout != proxyDialTimeout {
 		t.Errorf("timeout = %s, want %s", d.timeout, proxyDialTimeout)
 	}
@@ -237,7 +234,7 @@ func TestSocks5DialerHasTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("socks5Dialer: %v", err)
 	}
-	if local.(*socks5ProxyDialer).resolve == nil {
+	if local.resolve == nil {
 		t.Error("socks5 must resolve locally")
 	}
 }

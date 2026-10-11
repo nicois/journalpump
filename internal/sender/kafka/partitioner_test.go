@@ -8,7 +8,7 @@ package kafka
 import (
 	"testing"
 
-	"github.com/IBM/sarama"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // TestMurmur2MatchesKafkaPython pins murmur2 against values computed by
@@ -60,13 +60,10 @@ func TestPartitionerMatchesKafkaPythonDefaultPartitioner(t *testing.T) {
 	}
 	for _, tc := range keys {
 		for _, n := range counts {
-			p := &murmur2Partitioner{topic: "t", consistency: true}
-			msg := &sarama.ProducerMessage{Topic: "t", Key: sarama.ByteEncoder(tc.key)}
-			got, err := p.Partition(msg, n)
-			if err != nil {
-				t.Fatalf("Partition(%q, %d): %v", tc.key, n, err)
-			}
-			if want := tc.wantBy[n]; got != want {
+			tp := murmur2Partitioner{keyed: true}.ForTopic("t")
+			msg := &kgo.Record{Topic: "t", Key: []byte(tc.key)}
+			got := tp.Partition(msg, int(n))
+			if want := int(tc.wantBy[n]); got != want {
 				t.Errorf("key %q, %d partitions: got %d, want %d", tc.key, n, got, want)
 			}
 		}
@@ -76,13 +73,10 @@ func TestPartitionerMatchesKafkaPythonDefaultPartitioner(t *testing.T) {
 // TestPartitionerUnkeyedPicksValidPartition covers the key=None branch:
 // kafka-python draws a random partition in [0, numPartitions).
 func TestPartitionerUnkeyedPicksValidPartition(t *testing.T) {
-	p := &murmur2Partitioner{topic: "t"}
-	msg := &sarama.ProducerMessage{Topic: "t"}
+	tp := murmur2Partitioner{}.ForTopic("t")
+	msg := &kgo.Record{Topic: "t"}
 	for i := 0; i < 200; i++ {
-		got, err := p.Partition(msg, 5)
-		if err != nil {
-			t.Fatalf("Partition: %v", err)
-		}
+		got := tp.Partition(msg, 5)
 		if got < 0 || got >= 5 {
 			t.Fatalf("unkeyed partition %d out of range [0,5)", got)
 		}
@@ -92,10 +86,12 @@ func TestPartitionerUnkeyedPicksValidPartition(t *testing.T) {
 // TestPartitionerConsistencyReflectsKeying: a keyed sender needs stable
 // routing (RequiresConsistency true); an unkeyed one does not.
 func TestPartitionerConsistencyReflectsKeying(t *testing.T) {
-	if !(&murmur2Partitioner{consistency: true}).RequiresConsistency() {
+	keyed := murmur2Partitioner{keyed: true}.ForTopic("t")
+	unkeyed := murmur2Partitioner{}.ForTopic("t")
+	if !keyed.RequiresConsistency(&kgo.Record{Topic: "t"}) {
 		t.Error("keyed partitioner must require consistency")
 	}
-	if (&murmur2Partitioner{consistency: false}).RequiresConsistency() {
+	if unkeyed.RequiresConsistency(&kgo.Record{Topic: "t"}) {
 		t.Error("unkeyed partitioner must not require consistency")
 	}
 }

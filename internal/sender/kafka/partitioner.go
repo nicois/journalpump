@@ -8,16 +8,17 @@ package kafka
 import (
 	"math/rand"
 
-	"github.com/IBM/sarama"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // murmur2Partitioner reproduces kafka-python's DefaultPartitioner
 // (kafka/partitioner/default.py) exactly: a keyed message is routed with
 // the Java-client murmur2 hash, and an unkeyed message picks a random
-// partition. sarama's own NewReferenceHashPartitioner is NOT equivalent
-// — it hashes with FNV-1a, so keyed records land on different partitions
-// than the Python sender and cross-cutover data routing would diverge
-// (review item A1). The sender therefore installs this partitioner.
+// partition. franz-go's default UniformBytesPartitioner uses the same
+// Java-compatible murmur2 for keyed records, but for unkeyed records it is
+// sticky-per-batch (Java semantics), NOT the Python sender's
+// random.choice. Keeping our partitioner preserves both behaviours
+// byte-for-byte (review item A1).
 //
 // kafka-python:
 //
@@ -27,32 +28,40 @@ import (
 //	return all_partitions[idx]
 //
 // all_partitions is sorted by id, so the index is the partition id.
+//
+// The keyed/random decision is a client-wide config (whether a fixed
+// kafka_msg_key is set), so the top-level Partitioner returns a
+// per-topic partitioner carrying that one bit.
 type murmur2Partitioner struct {
-	topic string
-	// consistency is RequiresConsistency: true when the sender configures
-	// a fixed kafka_msg_key (stable keyed routing), false otherwise so
-	// sarama does not gate on every partition having a leader when the
-	// Python sender would simply pick a random available one.
+	// keyed is true when the sender configures a fixed kafka_msg_key
+	// (stable keyed routing): it becomes RequiresConsistency, so franz-go
+	// waits for a metadata view covering every partition. An unkeyed
+	// sender reports false and franz-go only requires the partitions it
+	// would pick.
+	keyed bool
+}
+
+func (p murmur2Partitioner) ForTopic(string) kgo.TopicPartitioner {
+	return murmur2TopicPartitioner{consistency: p.keyed}
+}
+
+type murmur2TopicPartitioner struct {
 	consistency bool
 }
 
-func (p *murmur2Partitioner) Partition(msg *sarama.ProducerMessage, numPartitions int32) (int32, error) {
-	if numPartitions <= 0 {
-		return 0, nil
-	}
-	if msg.Key == nil {
-		// kafka-python with key None: random.choice(available or all).
-		return rand.Int31n(numPartitions), nil
-	}
-	key, err := msg.Key.Encode()
-	if err != nil {
-		return 0, err
-	}
-	idx := murmur2(key) & 0x7fffffff
-	return int32(idx % uint32(numPartitions)), nil
-}
+func (p murmur2TopicPartitioner) RequiresConsistency(*kgo.Record) bool { return p.consistency }
 
-func (p *murmur2Partitioner) RequiresConsistency() bool { return p.consistency }
+func (p murmur2TopicPartitioner) Partition(rec *kgo.Record, numPartitions int) int {
+	if numPartitions <= 0 {
+		return 0
+	}
+	if rec.Key == nil {
+		// kafka-python with key None: random.choice(available or all).
+		return int(rand.Int31n(int32(numPartitions)))
+	}
+	idx := murmur2(rec.Key) & 0x7fffffff
+	return int(idx % uint32(numPartitions))
+}
 
 // murmur2 is the Java client's MurmurHash2 (org.apache.kafka.common.utils.
 // Utils.murmur2) as reimplemented by kafka-python's partitioner.py: seed

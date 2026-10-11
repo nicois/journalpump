@@ -17,21 +17,21 @@ import (
 
 // proxyDialTimeout bounds the WHOLE proxy connect: the local broker-name
 // lookup (socks5), the TCP connect to the proxy and the SOCKS negotiation.
-// sarama dials through the proxy with a context-less Dial, so the deadline
-// must live in the dialer; without it a black-holed proxy, a stalled
-// resolver or a stalled SOCKS handshake hangs the connect forever (review
-// items C8, 8).
+// The dialer is wired into kgo.Dialer, whose signature carries the request
+// context, so the caller's cancellation is honored alongside this deadline;
+// without the deadline a black-holed proxy, a stalled resolver or a stalled
+// SOCKS handshake hangs the connect (review items C8, 8).
 const proxyDialTimeout = 10 * time.Second
 
 // socks5Dialer builds the SOCKS5 dialer for kafka_sender.py's socks5_proxy
-// (the Aiven kafka-python fork's option; sarama surfaces it as
-// Net.Proxy.Dialer). socks5-kafka is a hard requirement.
+// (the Aiven kafka-python fork's option; franz-go surfaces it as
+// kgo.Dialer). socks5-kafka is a hard requirement.
 //
 // Scheme semantics match kafka-python: socks5 resolves the broker hostname
 // locally and hands the proxy an IP, while socks5h defers the name to the
 // proxy. x/net resolves names remotely in both cases, so a local resolver is
 // layered in for socks5 (review item C8).
-func socks5Dialer(address string) (proxy.Dialer, error) {
+func socks5Dialer(address string) (*socks5ProxyDialer, error) {
 	u, err := url.Parse(address)
 	if err != nil {
 		return nil, fmt.Errorf("socks5_proxy: %w", err)

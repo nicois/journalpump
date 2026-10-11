@@ -1570,14 +1570,13 @@ func rollbackSent(st, prev *state.State, reader, senderName string) {
 
 // senderJoinHardStop bounds how long shutdown waits for the sender
 // goroutines to finish after they are cancelled. It is the larger of 10s
-// and one Kafka request_timeout_ms (30s): sarama cannot abort a call
-// immediately (context-less dials at broker.go:203, uninterruptible
-// retry/backoff time.Sleeps at async_producer.go:627/667, client.go:961),
-// so a sender built on it can need up to
-// Producer.Retry.Max x Retry.Backoff (plus the metadata path) to drain
-// after its connection is closed. Without this bound an unbounded
-// senderGroup.Wait() turns "bounded shutdown" into "must be perfectly
-// abortive", which no Go library-based sender can guarantee.
+// and one Kafka request_timeout_ms (30s). The Kafka sender is built on
+// franz-go and aborts its in-flight work on cancellation (closing the client
+// fails the buffered/in-flight records), so it drains promptly; the bound is
+// retained as defence in depth for any sender that cannot abort instantly.
+// Without this bound an unbounded senderGroup.Wait() turns "bounded shutdown"
+// into "must be perfectly abortive", which no Go library-based sender can
+// guarantee.
 //
 // SANCTIONED DEVIATION (charter §2, operator-visible): if a sender is still
 // draining at the bound, shutdown logs a warning and PROCEEDS to
