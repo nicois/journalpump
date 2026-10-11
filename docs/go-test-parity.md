@@ -2633,6 +2633,23 @@ proxied-to-direct and direct-to-proxied transitions),
 `TestNoProxyStarOnlyWholeValue`, `TestNoProxyEmptyLowercaseRemovesUppercase`
 and `TestSelectEnvProxyUnaffectedByUppercaseLeak`.
 
+A third review round added: `TestStopWatchdogAbortsBlockedWrite` drives the
+REAL `Close`/reload path while `serve` is blocked in `writeFrames` with a
+gorilla-cleared write deadline (`noWriteDeadlineConn` models the re-armed
+socket), so only the independent watchdog can bound shutdown;
+`TestProxyConnectStalledHTTPIsBounded` / `TestProxyConnectStalledHTTPSIsBounded`
+point at HTTP(S) proxies that hijack the CONNECT request and never answer
+(no manual release), asserting the dial fails within the opening deadline;
+`TestProxyConnectStopCancelsStalled` closes `stopCh` mid-tunnel and asserts the
+blocked CONNECT read is cancelled; `TestProxyConnectAuthenticated` uses a
+407-returning proxy that requires Basic `Proxy-Authorization` and asserts the
+credential reaches the proxy but NOT the destination handshake;
+`TestDialOrdinarySharedOpeningDeadline` proves ONE opening deadline spans
+establishment and a multi-hop redirect chain;
+`TestExplicitSocksPreconnectUsesOuterBudget` proves the explicit-SOCKS
+preconnection is bounded by `connectTimeout`, not `openTimeout`; and
+`TestNoProxyPaddedWildcardDoesNotBypass` covers the padded `" * "` value.
+
 Fixture parity: unlike Task 23, a systest-go e2e driver WAS added
 (`systest-go/websocket_e2e_test.go:TestWebsocketSenderEndToEnd`): the real
 Go binary runs against an in-process gorilla capture server, and the
@@ -2674,10 +2691,14 @@ Dispositions (coordinator rulings 2026-10-12):
    makes the abort IRREVERSIBLE: an abort closes the raw `net.Conn`, after
    which no gorilla write can re-arm anything; a normal stop still performs
    the closing handshake first (setting only a one-shot write deadline to
-   unblock an in-flight write) and force-closes afterwards. Verified by
-   `TestAbortPreventsWriteRearm` and `TestCloseUnblocksBlockedWrite` (with
-   the reload path) — in-library, so no cross-reviewer→user library decision
-   is needed.
+   unblock an in-flight write) and force-closes afterwards. Round 3 adds an
+   independent watchdog: `stop()` still nudges the in-flight write with a
+   one-shot deadline, but gorilla re-arms that deadline at the start of a
+   later frame write, so a goroutine now irreversibly `abort()`s the
+   connection after the close deadline even while `serve` is stuck inside
+   `writeFrames`. Verified by `TestAbortPreventsWriteRearm`,
+   `TestCloseUnblocksBlockedWrite` and `TestStopWatchdogAbortsBlockedWrite` —
+   in-library, so no cross-reviewer→user library decision is needed.
 4. **HTTPS proxy + urllib env rules + per-redirect proxy: parity.** The
    environment proxy is selected per target URI (and re-selected per redirect
    destination, since scheme and `no_proxy` can change). An `https://` proxy
@@ -2685,9 +2706,27 @@ Dispositions (coordinator rulings 2026-10-12):
    only accepts `http://` (it returns "unknown scheme: https"). urllib's
    precedence is reproduced: a present-but-empty lowercase var removes the
    uppercase setting, and `no_proxy` bypasses only when the whole value is
-   `*`. No deviation; tests `TestSendMessagesThroughHTTPSProxy`,
-   `TestRedirectReselectsProxy`, `TestEnvValueUppercaseFallbackAndEmptyRemoval`,
-   `TestNoProxyStarOnlyWholeValue`, `TestNoProxyEmptyLowercaseRemovesUppercase`.
+   `*` — round 3 tightened this to compare the COMPLETE value (no trimming),
+   so a padded `" * "` does NOT bypass an ordinary host. Round 3 also bounds
+   the ENTIRE CONNECT tunnel exchange (explicit socket deadline plus
+   close-on-context-cancellation, with `HandshakeContext` for the TLS hop) so a
+   proxy withholding its CONNECT response cannot block past the deadline or a
+   runner stop, and sends a Python-compatible Basic `Proxy-Authorization` from
+   the proxy URL userinfo to the PROXY only. No deviation; tests
+   `TestSendMessagesThroughHTTPSProxy`, `TestRedirectReselectsProxy`,
+   `TestEnvValueUppercaseFallbackAndEmptyRemoval`,
+   `TestNoProxyStarOnlyWholeValue`, `TestNoProxyEmptyLowercaseRemovesUppercase`,
+   `TestNoProxyPaddedWildcardDoesNotBypass`, `TestProxyConnectStalledHTTPIsBounded`,
+   `TestProxyConnectStalledHTTPSIsBounded`, `TestProxyConnectStopCancelsStalled`,
+   `TestProxyConnectAuthenticated`.
+7. **Phase separation: one opening deadline.** Python's 10 s `open_timeout`
+   covers ordinary TCP, env-proxy establishment AND the whole redirect
+   sequence; only an EXPLICIT `socks5_proxy` preconnection sits under the
+   outer 30 s `connectTimeout`. Round 3 removes gorilla's `HandshakeTimeout`
+   (which restarted the deadline per attempt) so one shared context deadline
+   governs; tests `TestDialOrdinarySharedOpeningDeadline`,
+   `TestExplicitSocksPreconnectUsesOuterBudget` and the rewritten
+   `TestDialStalledHandshake`.
 5. **`ssl: true` with a `ws://` URI: reject (security).** gorilla ignores
    `TLSClientConfig` for `ws://`, so the config would silently send
    PLAINTEXT; Python rejects the combination. The Go parser now rejects it
