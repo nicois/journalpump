@@ -636,6 +636,40 @@ func TestMaintenanceDeletesOldestIndices(t *testing.T) {
 	}
 }
 
+// --- HTTP client wiring ---------------------------------------------------
+
+// TestHTTPClientUsesRequestsProxySemantics pins that the ES sender's client
+// selects proxies with the requests-compatible strategy (its Python client
+// is journalpump.util.get_requests_session → requests), not Go's
+// http.ProxyFromEnvironment.
+func TestHTTPClientUsesRequestsProxySemantics(t *testing.T) {
+	client, err := newHTTPClient(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok || tr.Proxy == nil {
+		t.Fatalf("transport.Proxy not installed: %T", client.Transport)
+	}
+	t.Setenv("http_proxy", "http://proxy.example:8080")
+	t.Setenv("no_proxy", "")
+	t.Setenv("NO_PROXY", "")
+
+	req, _ := http.NewRequest(http.MethodGet, "http://target.example/", nil)
+	u, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u == nil || u.String() != "http://proxy.example:8080" {
+		t.Fatalf("proxy = %v", u)
+	}
+
+	t.Setenv("no_proxy", "target.example")
+	if u, err := tr.Proxy(req); err != nil || u != nil {
+		t.Fatalf("no_proxy target not bypassed: %v, %v", u, err)
+	}
+}
+
 // --- fixture parity -------------------------------------------------------
 
 type esFixture struct {

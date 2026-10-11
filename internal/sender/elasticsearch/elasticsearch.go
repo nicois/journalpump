@@ -44,7 +44,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -52,6 +51,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Aiven-Open/journalpump/internal/httpx"
 	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
@@ -259,10 +259,13 @@ type discardLogger struct{}
 
 func (discardLogger) Printf(string, ...any) {}
 
-// newHTTPClient builds the net/http client for the configured `ca`
+// newHTTPClient builds the shared httpx client for the configured `ca`
 // value (Python session.verify = config.get("ca", True)): absent/true
-// uses the system CA set, false disables verification, a string is a
-// PEM bundle path.
+// uses the system CA set, false disables verification, a string is a PEM
+// bundle path. Proxy selection is the requests-compatible strategy,
+// because the Python ES/OpenSearch sender talks to the server through
+// requests (journalpump.util.get_requests_session), not
+// elasticsearch-py/urllib3.
 func newHTTPClient(ca any) (*http.Client, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	switch v := ca.(type) {
@@ -285,11 +288,10 @@ func newHTTPClient(ca any) (*http.Client, error) {
 	default:
 		return nil, fmt.Errorf("ca: %v is not a bool or path", ca)
 	}
-	transport := &http.Transport{
-		Proxy:           http.ProxyFromEnvironment,
+	return httpx.NewClient(httpx.ClientOptions{
+		Proxy:           httpx.RequestsProxy,
 		TLSClientConfig: tlsCfg,
-	}
-	return &http.Client{Transport: transport}, nil
+	}), nil
 }
 
 // SetConnectionObserver satisfies sender.ConnectionReporter: the loop
@@ -606,34 +608,9 @@ func (s *Sender) deleteIndex(ctx context.Context, indexName string) error {
 }
 
 // do runs one HTTP request under a per-request deadline and returns the
-// status and the fully-read body.
+// status and the fully-read body (the shared httpx.Do plumbing).
 func (s *Sender) do(ctx context.Context, method, url string, body []byte, headers map[string]string, timeout time.Duration) (int, []byte, error) {
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
-	if err != nil {
-		return 0, nil, err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resp.StatusCode, nil, err
-	}
-	return resp.StatusCode, data, nil
+	return httpx.Do(ctx, s.client, method, url, body, headers, timeout)
 }
 
 // parseMessage decodes one wire payload preserving int/float (UseNumber),

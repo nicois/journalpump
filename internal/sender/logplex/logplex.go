@@ -36,13 +36,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/Aiven-Open/journalpump/internal/httpx"
 	"github.com/Aiven-Open/journalpump/internal/journal"
 	"github.com/Aiven-Open/journalpump/internal/sender"
 )
@@ -175,7 +175,11 @@ func resolvedTimeout(timeoutSeconds float64) time.Duration {
 func newHTTPClient(timeoutSeconds float64) *http.Client {
 	idle := resolvedTimeout(timeoutSeconds)
 	dialer := &net.Dialer{Timeout: idle}
-	transport := &http.Transport{
+	// The shared httpx helper owns client construction and proxy selection;
+	// logplex supplies its own dial hook (the inactivity-timeout conn
+	// wrapper) and the requests-compatible proxy selector, because its
+	// Python client is requests (spec §2).
+	return httpx.NewClient(httpx.ClientOptions{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := dialer.DialContext(ctx, network, addr)
 			if err != nil {
@@ -183,16 +187,11 @@ func newHTTPClient(timeoutSeconds float64) *http.Client {
 			}
 			return &idleTimeoutConn{Conn: conn, idle: idle}, nil
 		},
-		// Match requests.Session's proxy selection (resolve_proxies +
-		// select_proxy over urllib.getproxies()), reading the environment per
-		// request — not net/http.ProxyFromEnvironment, whose precedence,
-		// ALL_PROXY handling and loopback bypass all differ.
-		Proxy: proxyForRequest,
+		Proxy: httpx.RequestsProxy,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, //nolint:gosec // verify=False is the ported Python behavior (spec §2)
 		},
-	}
-	return &http.Client{Transport: transport}
+	})
 }
 
 // idleTimeoutConn resets the read/write deadline before every operation, so
@@ -213,194 +212,13 @@ func (c *idleTimeoutConn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-// proxyForRequest reproduces requests.Session's proxy resolution for one
-// request (requests.utils.resolve_proxies + select_proxy over
-// urllib.request.getproxies). It deliberately does NOT use
-// net/http.ProxyFromEnvironment (httpproxy): that helper gives uppercase
-// variables precedence, ignores the ALL_PROXY fallback, and unconditionally
-// bypasses loopback addresses — three differences from requests.
-func proxyForRequest(req *http.Request) (*url.URL, error) {
-	u := req.URL
-	if u == nil || u.Hostname() == "" {
-		return nil, nil
-	}
-	if shouldBypassProxies(u) {
-		return nil, nil
-	}
-	proxies := proxyEnvironment()
-	proxy := proxies[u.Scheme]
-	if proxy == "" {
-		proxy = proxies["all"]
-	}
-	if proxy == "" {
-		return nil, nil
-	}
-	return parseProxyURL(proxy)
-}
+// proxyForRequest and parseProxyURL are thin delegations to the shared
+// httpx helper (the requests-compatible semantics live there now). The
+// wrappers keep the sender-local names the proxy tests exercise; the
+// behavior is unchanged.
+func proxyForRequest(req *http.Request) (*url.URL, error) { return httpx.RequestsProxy(req) }
 
-// parseProxyURL normalizes a proxy address the way requests does before
-// building the connection: a scheme-less address (e.g. HTTP_PROXY=
-// "proxy.example:8080") gets an "http://" scheme prepended
-// (utils.prepend_scheme_if_needed), and the result must have a host. requests
-// accepts these addresses; net/url would otherwise parse "proxy.example:8080"
-// as an opaque URL with no usable host.
-func parseProxyURL(proxy string) (*url.URL, error) {
-	if !strings.Contains(proxy, "://") {
-		if strings.HasPrefix(proxy, "//") {
-			proxy = "http:" + proxy
-		} else {
-			proxy = "http://" + proxy
-		}
-	}
-	u, err := url.Parse(proxy)
-	if err != nil {
-		return nil, fmt.Errorf("proxy %q: %w", proxy, err)
-	}
-	if u.Host == "" {
-		return nil, fmt.Errorf("proxy %q has no host", proxy)
-	}
-	return u, nil
-}
-
-// shouldBypassProxies mirrors requests.utils.should_bypass_proxies in full.
-// It is TWO OR-ed layers with DIFFERENT sources and matching rules, and
-// conflating them is wrong:
-//
-//  1. requests' own no_proxy loop (only when `get_proxy("no_proxy")`, i.e.
-//     a lowercase value or the uppercase fallback, is non-empty). It is
-//     CASE-SENSITIVE and a PLAIN suffix: for a hostname, the RAW entry must
-//     suffix-match the lowercased host or host:port with no label boundary;
-//     for an IP host, CIDR and plain-IP matching apply. Space characters are
-//     stripped and empty entries skipped.
-//  2. urllib's proxy_bypass_environment fallback (requests' `set_environ(
-//     "no_proxy", None)` leaves the environment untouched, so it is NOT a
-//     no-op). Its list comes from getproxies_environment()["no"] — a DIFFERENT
-//     source: an empty lowercase no_proxy REMOVES the entry, so `no_proxy=""`
-//     with `NO_PROXY="*"` does NOT bypass everything. Matching here IS
-//     case-insensitive and label-boundary aware (hostonly == name or a
-//     ".name" suffix), with exact `== "*"` bypassing all.
-//
-// Loopback targets are NOT special-cased: they are proxied unless no_proxy
-// matches.
-func shouldBypassProxies(u *url.URL) bool {
-	host := u.Hostname()
-	if host == "" {
-		return true
-	}
-	hostLower := strings.ToLower(host)
-	hostWithPort := hostLower
-	if port := u.Port(); port != "" {
-		hostWithPort = hostLower + ":" + port
-	}
-
-	// Layer 1: requests' own case-sensitive, plain-suffix loop.
-	firstNoProxy := os.Getenv("no_proxy")
-	if firstNoProxy == "" {
-		firstNoProxy = os.Getenv("NO_PROXY")
-	}
-	if firstNoProxy != "" {
-		entries := splitNoProxyEntries(firstNoProxy)
-		if ip := net.ParseIP(hostLower); ip != nil {
-			for _, entry := range entries {
-				if _, network, err := net.ParseCIDR(entry); err == nil {
-					if network.Contains(ip) {
-						return true
-					}
-					continue
-				}
-				if other := net.ParseIP(entry); other != nil && other.Equal(ip) {
-					return true
-				}
-			}
-		} else {
-			for _, entry := range entries {
-				if strings.HasSuffix(hostLower, entry) || strings.HasSuffix(hostWithPort, entry) {
-					return true
-				}
-			}
-		}
-	}
-
-	// Layer 2: urllib's case-insensitive, label-boundary fallback, fed by
-	// proxyEnvironment()["no"] (empty lowercase removes the entry).
-	fallback, present := proxyEnvironment()["no"]
-	if !present || fallback == "" {
-		return false
-	}
-	if fallback == "*" {
-		return true
-	}
-	for _, entry := range splitFallbackEntries(fallback) {
-		name := strings.ToLower(strings.TrimLeft(entry, "."))
-		if name == "" {
-			continue
-		}
-		if hostLower == name || strings.HasSuffix(hostLower, "."+name) {
-			return true
-		}
-	}
-	return false
-}
-
-// splitNoProxyEntries mirrors requests' no_proxy preprocessing for LAYER 1:
-// strip ALL ASCII spaces, split on commas, drop empty entries (tabs and other
-// whitespace are NOT removed here).
-func splitNoProxyEntries(noProxy string) []string {
-	var entries []string
-	for _, entry := range strings.Split(strings.ReplaceAll(noProxy, " ", ""), ",") {
-		if entry != "" {
-			entries = append(entries, entry)
-		}
-	}
-	return entries
-}
-
-// splitFallbackEntries mirrors urllib's proxy_bypass_environment preprocessing
-// for LAYER 2: split on commas, then strip each entry's leading/trailing
-// whitespace (Python str.strip(): space, \t, \n, \r, \f, \v — TrimSpace also
-// covers these), dropping empty entries.
-func splitFallbackEntries(noProxy string) []string {
-	var entries []string
-	for _, entry := range strings.Split(noProxy, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry != "" {
-			entries = append(entries, entry)
-		}
-	}
-	return entries
-}
-
-// proxyEnvironment builds the scheme -> proxy map like urllib's
-// getproxies_environment: every *_proxy variable contributes under its
-// lowercase scheme name, and a LOWERCASE variable wins over its uppercase
-// twin (an empty lowercase value removes the entry). The second pass inspects
-// the ORIGINAL name, so an uppercase *_PROXY never overrides a lowercase one.
-func proxyEnvironment() map[string]string {
-	proxies := make(map[string]string)
-	for _, kv := range os.Environ() {
-		name, value, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
-		lower := strings.ToLower(name)
-		if strings.HasSuffix(lower, "_proxy") && value != "" {
-			proxies[strings.TrimSuffix(lower, "_proxy")] = value
-		}
-	}
-	for _, kv := range os.Environ() {
-		name, value, ok := strings.Cut(kv, "=")
-		if !ok || !strings.HasSuffix(name, "_proxy") {
-			continue
-		}
-		key := strings.TrimSuffix(strings.ToLower(name), "_proxy")
-		if value != "" {
-			proxies[key] = value
-		} else {
-			delete(proxies, key)
-		}
-	}
-	return proxies
-}
+func parseProxyURL(proxy string) (*url.URL, error) { return httpx.ParseProxyURL(proxy) }
 
 // formatMsg ports logplex.py:20-29 into the CLEAN frame (sanctioned
 // deviation D6): "<190>1 <format-now> <hostname> <token> <pid> - -<MESSAGE>"
