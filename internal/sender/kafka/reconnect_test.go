@@ -86,26 +86,73 @@ func TestReconnectBackoffMeasuresFromAttemptStart(t *testing.T) {
 	}
 }
 
-// TestReconnectBackoffGrowsCapsAndResets locks the exponential growth from
-// base to max and the reset on a complete connection (mark_connected).
+// TestReconnectBackoffActualWaitsGrowFromBase locks item 3 (review round 2):
+// the interval is scheduled BEFORE it is increased, so the actual waits are
+// 1s, 2s, 4s, 8s, 10s, 10s — the first retry does NOT double the initial 1s
+// interval before its first use. The waits are observed on the virtual clock,
+// not inferred from the stored value.
+func TestReconnectBackoffActualWaitsGrowFromBase(t *testing.T) {
+	c := newFakeClock()
+	b := newTestBackoff(c)
+	const addr = "broker:9092"
+
+	type step struct {
+		afterFailure int
+		wait         time.Duration
+	}
+	steps := []step{
+		{afterFailure: 0, wait: reconnectBackoffBase}, // first attempt: no history
+		{afterFailure: 1, wait: 1 * time.Second},
+		{afterFailure: 2, wait: 2 * time.Second},
+		{afterFailure: 3, wait: 4 * time.Second},
+		{afterFailure: 4, wait: 8 * time.Second},
+		{afterFailure: 5, wait: 10 * time.Second},
+		{afterFailure: 6, wait: 10 * time.Second},
+	}
+	for i, s := range steps {
+		if got := b.failuresFor(addr); got != s.afterFailure {
+			t.Fatalf("step %d: failures = %d, want %d", i, got, s.afterFailure)
+		}
+		c.slept = 0
+		c.sleeps = 0
+		if err := b.begin(context.Background(), addr); err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if i == 0 {
+			if c.sleeps != 0 {
+				t.Fatalf("first attempt slept %v, want none", c.slept)
+			}
+		} else if c.slept != s.wait {
+			t.Fatalf("step %d: waited %v, want %v", i, c.slept, s.wait)
+		}
+		b.failed(addr)
+	}
+}
+
+// TestReconnectBackoffGrowsCapsAndResets locks the interval growth from base
+// to max and the reset on a complete connection (mark_connected).
 func TestReconnectBackoffGrowsCapsAndResets(t *testing.T) {
 	c := newFakeClock()
 	b := newTestBackoff(c)
 	const addr = "broker:9092"
 
 	if got := b.backoffFor(addr); got != reconnectBackoffBase {
-		t.Fatalf("initial backoff = %v, want %v", got, reconnectBackoffBase)
+		t.Fatalf("initial interval = %v, want %v", got, reconnectBackoffBase)
 	}
-	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
+	// After the first failure the NEXT interval is still base (1s).
+	want := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
 	for i, w := range want {
 		b.failed(addr)
 		if got := b.backoffFor(addr); got != w {
-			t.Fatalf("after failure %d: backoff = %v, want %v", i+1, got, w)
+			t.Fatalf("after failure %d: interval = %v, want %v", i+1, got, w)
 		}
 	}
 	b.connected(addr)
 	if got := b.backoffFor(addr); got != reconnectBackoffBase {
-		t.Fatalf("after connected: backoff = %v, want reset to %v", got, reconnectBackoffBase)
+		t.Fatalf("after connected: interval = %v, want reset to %v", got, reconnectBackoffBase)
+	}
+	if got := b.failuresFor(addr); got != 0 {
+		t.Fatalf("after connected: failures = %d, want 0", got)
 	}
 }
 
@@ -117,11 +164,11 @@ func TestReconnectBackoffIsPerAddress(t *testing.T) {
 
 	b.failed("a:9092")
 	b.failed("a:9092")
-	if got := b.backoffFor("a:9092"); got != 4*time.Second {
-		t.Fatalf("a backoff = %v, want 4s", got)
+	if got := b.backoffFor("a:9092"); got != 2*time.Second {
+		t.Fatalf("a interval = %v, want 2s", got)
 	}
 	if got := b.backoffFor("b:9092"); got != reconnectBackoffBase {
-		t.Fatalf("b backoff = %v, want the untouched base %v", got, reconnectBackoffBase)
+		t.Fatalf("b interval = %v, want the untouched base %v", got, reconnectBackoffBase)
 	}
 }
 

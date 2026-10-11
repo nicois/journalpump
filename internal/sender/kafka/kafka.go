@@ -381,7 +381,14 @@ func (pc producerConfig) clientOpts() ([]kgo.Opt, error) {
 	if err != nil {
 		return nil, err
 	}
-	opts = append(opts, kgo.Dialer(d.DialContext))
+	// The dialer enforces the backoff; the hook drives its success/failure
+	// accounting from franz-go's COMPLETE-connection outcome (post
+	// ApiVersions + SASL), so a TCP/TLS-only success cannot reset it.
+	opts = append(
+		opts,
+		kgo.Dialer(d.DialContext),
+		kgo.WithHooks(&brokerConnectHook{backoff: d.backoff}),
+	)
 	if pc.securityProtocol == "SASL_PLAINTEXT" || pc.securityProtocol == "SASL_SSL" {
 		mech, err := saslOption(pc)
 		if err != nil {

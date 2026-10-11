@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/Aiven-Open/journalpump/internal/sender"
@@ -253,5 +254,76 @@ func TestRealAdminCancellationAbortsCreateTopic(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("maybeCreateTopic did not return after cancellation; the real admin call was not aborted")
+	}
+}
+
+// newHookedClient builds a REAL franz-go client wired to our dialer + hook, so
+// the test can observe the per-broker reconnect accounting directly.
+func newHookedClient(t *testing.T, addr string, b *reconnectBackoff, timeout time.Duration) *kgo.Client {
+	t.Helper()
+	d := &kafkaDialer{
+		backoff: b,
+		dial:    (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		timeout: timeout,
+	}
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.Dialer(d.DialContext),
+		kgo.WithHooks(&brokerConnectHook{backoff: b}),
+	)
+	if err != nil {
+		t.Fatalf("kgo.NewClient: %v", err)
+	}
+	t.Cleanup(cl.Close)
+	return cl
+}
+
+// TestRealClientIncompleteConnectionCountsAsFailure (item 1, review round 2):
+// with a REAL franz-go client, a connection that completes TCP/TLS but never
+// finishes the Kafka init (ApiVersions) is reported to the hook as a FAILURE,
+// so the reconnect history is NOT reset the way a TCP-only success would have.
+func TestRealClientIncompleteConnectionCountsAsFailure(t *testing.T) {
+	addr, _ := startSilentBroker(t)
+	b := newReconnectBackoff(reconnectBackoffBase, reconnectBackoffMax)
+	cl := newHookedClient(t, addr, b, 200*time.Millisecond)
+
+	// Seed a history so a reset (bug) would be visible.
+	b.failed(addr)
+	b.failed(addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	_ = cl.Ping(ctx)
+
+	if got := b.failuresFor(addr); got < 3 {
+		t.Fatalf("failures = %d after an incomplete connection, want >= 3 (TCP-only success must not reset, and the init failure must count)", got)
+	}
+	if got := b.backoffFor(addr); got < 2*time.Second {
+		t.Fatalf("interval = %v after repeated incomplete connections, want it grown (>= 2s)", got)
+	}
+}
+
+// TestRealClientCompleteConnectionResetsBackoff (item 1, review round 2): a
+// COMPLETE connection (ApiVersions + Metadata answered) resets the history via
+// the hook.
+func TestRealClientCompleteConnectionResetsBackoff(t *testing.T) {
+	fb := startFakeBroker(t, "reset-topic")
+	b := newReconnectBackoff(reconnectBackoffBase, reconnectBackoffMax)
+	cl := newHookedClient(t, fb.addr, b, dialTimeout)
+
+	b.failed(fb.addr)
+	b.failed(fb.addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := cl.Ping(ctx); err != nil {
+		t.Fatalf("Ping against the fake broker: %v", err)
+	}
+
+	if got := b.failuresFor(fb.addr); got != 0 {
+		t.Fatalf("failures = %d after a complete connection, want 0", got)
+	}
+	if got := b.backoffFor(fb.addr); got != reconnectBackoffBase {
+		t.Fatalf("interval = %v after a complete connection, want base", got)
 	}
 }

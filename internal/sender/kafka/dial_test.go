@@ -15,6 +15,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -214,5 +215,146 @@ func TestKgoRejectsDialerAndDialTLSConfig(t *testing.T) {
 	if err == nil {
 		cl.Close()
 		t.Fatal("kgo.NewClient accepted both Dialer and DialTLSConfig; the fold assumption is stale")
+	}
+}
+
+// startStalledTLSListener accepts TCP connections and reads but never writes,
+// so a TLS handshake against it never completes.
+func startStalledTLSListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4096)
+				for {
+					if _, err := c.Read(buf); err != nil {
+						return
+					}
+					// Never write: the TLS handshake stalls.
+				}
+			}(conn)
+		}
+	}()
+	return ln
+}
+
+// TestTLSHandshakeBoundedWithoutCallerCancel (item 2, review round 2): the TLS
+// handshake runs under the dialer's OWN per-attempt deadline, so a broker that
+// accepts TCP but never completes the handshake cannot stall initialization
+// even when the caller's context carries no deadline. Direct connection.
+func TestTLSHandshakeBoundedWithoutCallerCancel(t *testing.T) {
+	pool, _, _ := makeBrokerCert(t)
+	ln := startStalledTLSListener(t)
+	d := &kafkaDialer{
+		backoff: newReconnectBackoff(reconnectBackoffBase, reconnectBackoffMax),
+		dial:    (&net.Dialer{}).DialContext,
+		tlsCfg:  &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		timeout: 200 * time.Millisecond,
+	}
+
+	start := time.Now()
+	conn, err := d.DialContext(context.Background(), "tcp", ln.Addr().String())
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("dial with a stalled TLS handshake returned nil; want a deadline error")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("stalled TLS handshake took %v; the per-attempt deadline did not bound it", elapsed)
+	}
+}
+
+// TestTLSHandshakeBoundedThroughProxy is the proxy half: the same per-attempt
+// deadline must bound a stalled handshake through the SOCKS5-style dialer.
+func TestTLSHandshakeBoundedThroughProxy(t *testing.T) {
+	pool, _, _ := makeBrokerCert(t)
+	ln := startStalledTLSListener(t)
+	d := &kafkaDialer{
+		backoff: newReconnectBackoff(reconnectBackoffBase, reconnectBackoffMax),
+		dial:    proxyLikeDialer(ln.Addr().String()),
+		tlsCfg:  &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		timeout: 200 * time.Millisecond,
+	}
+
+	start := time.Now()
+	conn, err := d.DialContext(context.Background(), "tcp", "broker.test:9092")
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("dial with a stalled TLS handshake through the proxy returned nil; want a deadline error")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("stalled proxied TLS handshake took %v; the per-attempt deadline did not bound it", elapsed)
+	}
+}
+
+// TestDialerTCPOnlySuccessDoesNotResetBackoff (item 1, review round 2): the
+// dialer itself does NOT reset the reconnect history on a TCP/TLS success — a
+// TCP connection is not yet a Kafka connection. Only the broker-connect hook
+// (complete outcome) may reset it.
+func TestDialerTCPOnlySuccessDoesNotResetBackoff(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) { _, _ = io.Copy(io.Discard, c); _ = c.Close() }(conn)
+		}
+	}()
+
+	b := newReconnectBackoff(reconnectBackoffBase, reconnectBackoffMax)
+	d := &kafkaDialer{backoff: b, dial: (&net.Dialer{}).DialContext, timeout: time.Second}
+	addr := ln.Addr().String()
+	b.failed(addr)
+	b.failed(addr)
+
+	conn, err := d.DialContext(context.Background(), "tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = conn.Close()
+	if got := b.failuresFor(addr); got != 2 {
+		t.Fatalf("failures after a TCP-only success = %d, want 2 (the dialer must not reset the history)", got)
+	}
+}
+
+// TestBrokerConnectHookDrivesCompleteOutcome (item 1, review round 2): the
+// hook resets only on a COMPLETE connection (nil error) and grows on any
+// failure — including a post-connect ApiVersions/SASL failure.
+func TestBrokerConnectHookDrivesCompleteOutcome(t *testing.T) {
+	b := newReconnectBackoff(reconnectBackoffBase, reconnectBackoffMax)
+	h := &brokerConnectHook{backoff: b}
+	meta := kgo.BrokerMetadata{Host: "broker.test", Port: 9092}
+	addr := brokerAddr(meta.Host, meta.Port)
+
+	h.OnBrokerConnect(meta, 0, nil, errors.New("SASL authentication failed"))
+	h.OnBrokerConnect(meta, 0, nil, errors.New("ApiVersions timed out"))
+	if got := b.failuresFor(addr); got != 2 {
+		t.Fatalf("failures = %d, want 2", got)
+	}
+	if got := b.backoffFor(addr); got != 2*time.Second {
+		t.Fatalf("interval after two post-connect failures = %v, want 2s", got)
+	}
+
+	h.OnBrokerConnect(meta, 0, nil, nil)
+	if got := b.failuresFor(addr); got != 0 {
+		t.Fatalf("failures after a complete connection = %d, want 0", got)
+	}
+	if got := b.backoffFor(addr); got != reconnectBackoffBase {
+		t.Fatalf("interval after a complete connection = %v, want base", got)
 	}
 }
