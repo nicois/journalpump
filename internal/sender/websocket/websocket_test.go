@@ -421,8 +421,10 @@ func TestSendMessagesNotConnected(t *testing.T) {
 }
 
 // TestNewRegistersInstance asserts the framework wiring values: the
-// websocket sender overrides the shared batch overhead to 1, the default
-// type name, and the default max_send_interval.
+// websocket sender keeps the LogSender batch-slicing defaults (30-byte
+// overhead, 1 MiB limit — base.py:130-131), the default type name, and the
+// default max_send_interval. The configured max_batch_size drives only
+// batching and the header, never the slicing limit.
 func TestNewRegistersInstance(t *testing.T) {
 	inst, err := New(sender.ConstructorArgs{
 		Name:   "out",
@@ -435,14 +437,38 @@ func TestNewRegistersInstance(t *testing.T) {
 	if inst.Type != "WebsocketSender" {
 		t.Errorf("Type = %q", inst.Type)
 	}
-	if inst.MessageOverhead != 1 {
-		t.Errorf("MessageOverhead = %d, want 1", inst.MessageOverhead)
+	if inst.MessageOverhead != sender.DefaultMessageOverhead {
+		t.Errorf("MessageOverhead = %d, want %d", inst.MessageOverhead, sender.DefaultMessageOverhead)
 	}
-	if inst.MaxBatchSize != defaultMaxBatchSize {
-		t.Errorf("MaxBatchSize = %d, want %d", inst.MaxBatchSize, defaultMaxBatchSize)
+	if inst.MaxBatchSize != sender.DefaultMaxBatchSize {
+		t.Errorf("MaxBatchSize = %d, want %d", inst.MaxBatchSize, sender.DefaultMaxBatchSize)
 	}
 	if inst.MaxSendInterval != time.Second {
 		t.Errorf("MaxSendInterval = %v, want 1s", inst.MaxSendInterval)
+	}
+}
+
+// TestNewSlicingIndependentOfConfiguredMaxBatchSize pins the Python quirk:
+// the configured max_batch_size (which drives batching and the header) does
+// NOT change the slicing limit, which stays at the 1 MiB base default.
+func TestNewSlicingIndependentOfConfiguredMaxBatchSize(t *testing.T) {
+	inst, err := New(sender.ConstructorArgs{
+		Name:   "out",
+		Config: map[string]any{"websocket_uri": "ws://h/pump", "max_batch_size": 2048},
+		Tags:   tagged.New(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.MaxBatchSize != sender.DefaultMaxBatchSize {
+		t.Errorf("MaxBatchSize = %d, want the 1 MiB default %d", inst.MaxBatchSize, sender.DefaultMaxBatchSize)
+	}
+	if inst.MessageOverhead != sender.DefaultMessageOverhead {
+		t.Errorf("MessageOverhead = %d, want %d", inst.MessageOverhead, sender.DefaultMessageOverhead)
+	}
+	s := inst.Transport.(*Sender)
+	if h := s.handshakeHeaders().Get("Journalpump-Batch-Size"); h != "2048" {
+		t.Errorf("Journalpump-Batch-Size = %q, want 2048 (header follows config)", h)
 	}
 }
 

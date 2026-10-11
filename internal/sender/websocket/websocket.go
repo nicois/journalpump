@@ -178,14 +178,18 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	inst := sender.Instance{
 		Transport:       s,
 		MaxSendInterval: time.Duration(cfg.maxSendInterval * float64(time.Second)),
-		MessageOverhead: 1, // plan: websocket overrides the shared overhead to 1 (websocket.py:73)
+		// Batch slicing keeps the LogSender base defaults (base.py:130-131):
+		// a 30-byte overhead and a 1 MiB limit, INDEPENDENT of the configured
+		// max_batch_size. Python passes max_batch_size to the WebsocketRunner,
+		// which stores it on ITSELF (websocket.py:71) only to emit the
+		// Journalpump-Batch-Size header (websocket.py:169); the runner's
+		// batch_message_overhead = 1 (websocket.py:73) is never read, and the
+		// LogSender that actually slices (base.py:262-266) keeps the base
+		// defaults. So the configured value changes ONLY batching (the
+		// NUL-join) and the header — see batching().
+		MaxBatchSize:    sender.DefaultMaxBatchSize,
+		MessageOverhead: sender.DefaultMessageOverhead,
 		Type:            "WebsocketSender",
-	}
-	// Framework batch slicing limit: the configured max_batch_size when
-	// batching is enabled (the frame NUL-joins the whole slice), else the
-	// framework default 1 MiB.
-	if cfg.maxBatchSize > 0 {
-		inst.MaxBatchSize = cfg.maxBatchSize
 	}
 	return inst, nil
 }
