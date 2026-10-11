@@ -1,9 +1,10 @@
 # Spec: journalpump migration from Python to Go
 
-Status: final (rev 7) — folds in the Go-idiom review (thread A), the mock
-strategy decision (thread B), e2e frontloading (thread C), and the
-SIGTERM-grace-flush sanctioned deviation (validation round).
-Date: 2026-10-09
+Status: final (rev 8) — folds in the Go-idiom review (thread A), the mock
+strategy decision (thread B), e2e frontloading (thread C), the
+SIGTERM-grace-flush sanctioned deviation (validation round), and the kafka
+client revision (D5: IBM/sarama → twmb/franz-go, user decision 2026-10-11).
+Date: 2026-10-09 (rev 8: 2026-10-11)
 Author: architect (grounded in a full read of the current codebase)
 
 ---
@@ -330,12 +331,12 @@ as in Python.
 |---|---|---|
 | journald | python-systemd | coreos/go-systemd/v22/sdjournal |
 | sd_notify/watchdog | systemd.daemon | coreos/go-systemd (sdnotify/daemon) |
-| Kafka | kafka-python (+Aiven fork socks5) | IBM/sarama (D5): `SyncProducer.SendMessages(batch)` per batch with per-message `*ProduceError` (do NOT reimplement kafka-python's produce-per-message/future/flush dance); `sarama.CompressionSnappy`; socks5 via custom `net.Dial` through golang.org/x/net/proxy (D4) |
+| Kafka | kafka-python (+Aiven fork socks5) | twmb/franz-go (D5, revised 2026-10-11 — see §9 D5; the client choice was revisited because the sender contract is `SendMessages(ctx)` and sarama has no context support, `docs/assess-sender-cancellation.md`): `kgo.Client.ProduceSync(ctx, batch...)` per batch with per-record results (`ProduceResults.FirstErr()` fails the batch); acks=1 via `RequiredAcks(LeaderAck())` + `DisableIdempotentWrite()` (do NOT reimplement kafka-python's produce-per-message/future/flush dance); `ProducerBatchCompression(SnappyCompression())`; socks5/socks5h via `kgo.Dialer` wrapping golang.org/x/net/proxy (D4); SASL PLAIN/SCRAM from franz-go's in-tree `pkg/sasl`; topic auto-create via `kadm`; our murmur2 partitioner kept behind `kgo.RecordPartitioner` (Python nil-key placement is random, franz-go's default is sticky) |
 | ES/OpenSearch | raw HTTP via requests | raw HTTP via net/http (no ES client — matches today) |
 | CloudWatch | botocore | aws-sdk-go-v2 (cloudwatchlogs) |
 | Google Cloud Logging | google-api-python-client (REST v2) | google.golang.org/api/logging/v2 (same REST surface) |
 | Websocket | websockets (asyncio) + aiohttp-socks | coder/websocket (or gorilla) + golang.org/x/net/proxy SOCKS5 |
-| Snappy | python-snappy (libsnappy) | github.com/golang/snappy (pure Go — drops libsnappy build dep); used ONLY for websocket app-level compression; kafka compression is `sarama.CompressionSnappy`, not a manual snappy dependency (see §5 kafka quirks re xerial framing) |
+| Snappy | python-snappy (libsnappy) | github.com/golang/snappy (pure Go — drops libsnappy build dep); used ONLY for websocket app-level compression; kafka compression is franz-go's `SnappyCompression()` (raw snappy block — the same framing the earlier sarama implementation emitted and kafka-python proved to read), not a manual snappy dependency (see §5 kafka quirks re xerial framing) |
 | GeoIP | geoip2 | oschwald/geoip2-golang (same .mmdb format) |
 | Regex | re / google-re2 | stdlib regexp (RE2 semantics); `\1`-style backrefs in secret_filter `replacement` translated to Go `$1` syntax at load time |
 | statsd | raw UDP socket | raw UDP socket (direct port, ~60 lines) |
@@ -361,7 +362,7 @@ listed).
 
 | Sender (lines) | Transport | Config keys (defaults) | Quirks that must be preserved |
 |---|---|---|---|
-| **kafka** (190) | kafka-python producer + admin client | `kafka_topic` (req), `kafka_address`, `kafka_msg_key`, `kafka_api_version` (None = auto), `security_protocol` (`PLAINTEXT\|SSL\|SASL_PLAINTEXT\|SASL_SSL`; else derived from `ssl` bool), `ssl` (bool), `ca` (SSL/SASL_SSL), `certfile`, `keyfile` (SSL), `sasl_mechanism` (`PLAIN`), `sasl_plain_username`, `sasl_plain_password` (both required for SASL), `socks5_proxy` (retained in Go, D4), `kafka_topic_config` (`num_partitions` + `replication_factor`), `max_send_interval` (0.3) | Fixed `kafka_msg_key` for all messages (single-partition ordering); topic auto-create only when both `num_partitions` and `replication_factor` present in `kafka_topic_config` (`TopicAlreadyExistsError` tolerated); producer `linger_ms=500`; compression: kafka-python applies **xerial-framed snappy** (magic-byte block stream) — sarama's `sarama.CompressionSnappy` uses the same broker-side snappy codec but the producer-side framing must be proven byte-compatible by a kafka-python-consumer-vs-sarama-producer interop test on a real broker; if framing differs for a supported consumer, record in NEWS; ack-then-advance semantics (Python: produce+flush+await futures with 1 s timeout — Go: one `SyncProducer.SendMessages(batch)` call with per-message `*ProduceError`); on retriable error: full teardown + re-init loop while `running && !connected`; client logging silenced. |
+| **kafka** (190) | kafka-python producer + admin client | `kafka_topic` (req), `kafka_address`, `kafka_msg_key`, `kafka_api_version` (None = auto; a set value pins `kgo.MaxVersions`; brokers older than 0.10.0 are no longer supported — §6.1(c)), `security_protocol` (`PLAINTEXT\|SSL\|SASL_PLAINTEXT\|SASL_SSL`; else derived from `ssl` bool), `ssl` (bool), `ca` (SSL/SASL_SSL), `certfile`, `keyfile` (SSL), `sasl_mechanism` (`PLAIN`), `sasl_plain_username`, `sasl_plain_password` (both required for SASL), `socks5_proxy` (retained in Go, D4), `kafka_topic_config` (`num_partitions` + `replication_factor`), `max_send_interval` (0.3) | Fixed `kafka_msg_key` for all messages (single-partition ordering); topic auto-create only when both `num_partitions` and `replication_factor` present in `kafka_topic_config` (`TopicAlreadyExistsError` tolerated); producer `linger_ms=500`; compression: kafka-python applies **xerial-framed snappy** (magic-byte block stream) — franz-go's `SnappyCompression()` emits a raw snappy block (not xerial-framed) and kafka-python's decoder accepts both; this must be proven by a kafka-python-consumer-vs-Go-producer interop test on a real broker (first proven against the sarama implementation, re-run after the franz-go switch); if framing differs for a supported consumer, record in NEWS; ack-then-advance semantics (Python: produce+flush+await futures with 1 s timeout — Go: one `ProduceSync(ctx, batch...)` call, `FirstErr()` fails the whole batch); on retriable error: full teardown + re-init loop while `running && !connected`; client logging silenced. |
 | **elasticsearch / opensearch** (354) | raw HTTP (requests), not elasticsearch-py | `elasticsearch_url` / `opensearch_url` (req), `elasticsearch_timeout` / `opensearch_timeout` (60.0), `elasticsearch_index_prefix` / `opensearch_index_prefix` (`journalpump`), `elasticsearch_index_days_max` / `opensearch_index_days_max` (3), `ca` (default `True` = system CAs), `max_send_interval` (10.0) | Daily index rollover `prefix-YYYY-MM-DD` from first 10 chars of entry `timestamp` (missing → current UTC date + warning); mapping auto-created from the FIRST message seen (bool→boolean, float→float, int→integer, str→text, dict→recursive; unmappable skipped with warning; fixed `SYSTEMD_SESSION`/`SESSION_ID` fields); `?include_type_name=true` + `_type: journal_msg` for ES ≤7; success = HTTP 200/201 only, `_bulk` per-item errors NOT inspected (mark_sent regardless); `already_exists_exception` counts as success; hourly retention deletes oldest indices while count > `index_days_max`; connection-error logging de-duplicated by error class; bulk timeout = 2× configured timeout. |
 | **aws_cloudwatch** (142) | botocore `logs` client | `aws_cloudwatch_log_group` (req), `aws_cloudwatch_log_stream` (req), `aws_region`, `aws_access_key_id`, `aws_secret_access_key` (all optional → botocore default chain), `max_send_interval` (0.3) | Sequence-token protocol: first PutLogEvents without token, then `nextSequenceToken` (AWS now ignores tokens — keep sending for parity); init: 3 attempts to create group/stream ignoring already-exists, paginator over describe_log_streams to recover token, AccessDenied → backoff → `SenderInitializationError`; timestamp = `REALTIME_TIMESTAMP` ms (fallback wall clock); message body = raw JSON line; no explicit 1 MB/10k-event guard — base 1 MiB batching is the guard (keep batches ≤1 MB and ≤10k events in Go). |
 | **google_cloud_logging** (132) | REST v2 via googleapiclient | `google_cloud_logging_project_id` (required; the service account credentials may override the value after load), `google_cloud_logging_log_id` (req), `google_cloud_logging_resource_labels` (None), `google_service_account_credentials` (None → Application Default Credentials), `max_send_interval` (0.3) | Entry quota logic: 250 KiB quota / 200 KiB per-message → truncate `MESSAGE` + `"[MESSAGE TRUNCATED]"`, then fallback replacement entry with the fixed "can't be logged" message; entries without `MESSAGE` replaced; `timestamp` popped, truncated to 26 chars + `Z`; `PRIORITY` → GCP severity map (7→DEBUG … 0→EMERGENCY, unknown→DEFAULT); `MESSAGE` attempted JSON-parse → structured jsonPayload; resource type fixed `generic_node`; logName `projects/{id}/logs/{log_id}`; optimistic reconnect after failure (mark_connected immediately). |
@@ -386,7 +387,17 @@ on exit (by design).
    **Sanctioned deviations (NEWS-recorded)**: (a) config values of the
    wrong JSON type are rejected at load time by typed decoding, where
    Python crashed mid-run when the value was used; (b) the SIGTERM
-   grace-flush window (§6.8, D9).
+   grace-flush window (§6.8, D9); (c) **kafka broker version floor**
+   (user decision 2026-10-11, with the D5 client switch): Python's
+   `_infer_broker_version_from_api_versions` port and the pre-0.10
+   legacy probe (ListGroups/FindCoordinator/FetchOffset fallbacks) are
+   dropped — franz-go negotiates per-request versions via ApiVersions on
+   every connection, so **Kafka 0.10.0 and newer are supported** (auto
+   when `kafka_api_version` is unset; a set value pins
+   `kgo.MaxVersions(kversion.V<x>())`); brokers older than 0.10.0 are no
+   longer supported and an explicit `kafka_api_version` below 0.10.0 is
+   rejected at load with a clear error (recommended; the builder confirms
+   the exact outcome in the Task 22 parity record).
 2. **Journald reading**: chunk size 5000; poll budget 1000 ms;
    `initial_position` head/tail/seconds-from-boot; cursor seek + one-entry
    skip on resume; rotation = drop-and-recreate (≤1 attempt/2 s); "Bad
@@ -457,15 +468,19 @@ on exit (by design).
     `sd_journal` writer) into real journald, real rsyslogd on TCP, assert
     delivered lines.
 - **Mock strategy (standing rule, thread B)**: wire-level fake at the
-  seam. Source fakes from third-party mock tooling FIRST — sarama's
-  mocks, hand-written or mockgen-generated fakes for the CloudWatch
-  client-interface seam (aws-sdk-go-v2 ships no generated mocks), official
-  Elastic Go client tooling, Google Cloud Logging fakes; write custom
+  seam. Source fakes from third-party mock tooling FIRST — for kafka, a
+  narrow `producer` interface fake in `internal/sender/kafka` plus
+  franz-go's in-tree `pkg/kfake` in-process cluster for stall/cancel
+  tests (franz-go ships no SyncProducer-style mock; the earlier sarama
+  mocks are retired with the D5 switch), hand-written or
+  mockgen-generated fakes for the CloudWatch client-interface seam
+  (aws-sdk-go-v2 ships no generated mocks), official Elastic Go client
+  tooling, Google Cloud Logging fakes; write custom
   httptest/net.Pipe/localhost fakes only where no maintained one exists
   (rsyslog framing, logplex, websocket via httptest, ES rollover/mapping
   assertions if the official tooling is insufficient). **Every fake must
   assert wire bytes, not library call shape.** Kafka: real broker for
-  system tests, sarama mocks for unit tests.
+  system tests, producer-interface fake / kfake for unit tests.
 - **Rewritten (Python-internals-bound):** mocking of python-systemd
   private methods, `botocore.stub.Stubber`, `responses`, GCP
   `RequestMockBuilder`, registry mutation.
@@ -523,7 +538,8 @@ docs/plan-python-to-go-migration.md)
   logplex sender. *Milestone: end-to-end journal→rsyslogd parity with
   the Python output.*
 - **Phase 3 — Kafka, ES/OpenSearch, websocket.** The three heavyweight
-  senders (sarama + xerial interop proof, raw HTTP, websocket+snappy).
+  senders (franz-go + snappy-framing interop proof, raw HTTP,
+  websocket+snappy).
 - **Phase 4 — CloudWatch + GCL.** aws-sdk-go-v2 and logging/v2 ports with
   quota/truncation logic.
 - **Phase 5 — Packaging + cutover.** deb/rpm on the branch with the
@@ -573,10 +589,11 @@ docs/plan-python-to-go-migration.md)
      callables would silently produce empty tags if the GeoIP/geohash port
      is forgotten. Mitigation: dedicated task + tests (plan Phase 0).
   10. **Kafka snappy framing mismatch** — kafka-python xerial-framed
-      snappy vs sarama codec framing may not be byte-identical on the
-      wire for consumers. Mitigation: kafka-python-consumer-vs-sarama-
-      producer interop test on a real broker (plan kafka task); NEWS
-      entry if a supported consumer is affected.
+      snappy vs the Go client's codec framing (franz-go emits a raw
+      snappy block) may not be byte-identical on the wire for consumers.
+      Mitigation: kafka-python-consumer-vs-Go-producer interop test on a
+      real broker (plan kafka task; re-run after the D5 client switch);
+      NEWS entry if a supported consumer is affected.
   11. **Shutdown semantics drift** — the grace-flush window is a
       deliberate deviation from Python (daemon threads, buffered messages
       lost); a later "parity fix" that removes the flush would silently
@@ -595,7 +612,19 @@ docs/plan-python-to-go-migration.md)
 3. **State files**: compatible with Python-written state files so users
    can switch back and forth between implementations freely.
 4. **socks5-kafka**: retained.
-5. **Kafka library**: IBM/sarama.
+5. **Kafka library**: twmb/franz-go (**revised 2026-10-11**; originally
+   IBM/sarama). Revisited because the sender contract is
+   `SendMessages(ctx)` and sarama has no context support — uninterruptible
+   retry sleeps and a context-less dial cost four Task 22 review rounds of
+   socket-force-close workarounds with a ~2-3 s cancellation floor
+   (`docs/assess-sender-cancellation.md`). franz-go is ctx-first
+   (`ProduceSync(ctx)`, `Close()` fails buffered records promptly),
+   emits kafka-python-readable raw snappy, takes a custom `kgo.Dialer`
+   for socks5h, ships SASL SCRAM in-tree, and removes ~500 lines of
+   workaround code (`docs/assess-kafka-client.md`). kafka-go (acks
+   defaults to none; cancel only abandons the wait) and
+   confluent-kafka-go (cgo) were eliminated. Accepted deviation:
+   pre-0.10 broker version inference dropped — §6.1(c).
 6. **Logplex**: identical behavior — including the underscore-stripping
    quirk that makes hostname/pid always literal `"localhost"`, and the
    fire-and-forget send.

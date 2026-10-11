@@ -1,8 +1,9 @@
 # Plan: journalpump Python → Go migration (implementation tasks)
 
-Source spec: `docs/spec-python-to-go-migration.md` (final, rev 7). Decisions
-D1–D12 referenced below are §9 of the spec. Every task's diff goes through
-the dual review gate (parity + Go idiom, charter §5).
+Source spec: `docs/spec-python-to-go-migration.md` (final, rev 8). Decisions
+D1–D12 referenced below are §9 of the spec (D5 revised 2026-10-11: kafka
+client is twmb/franz-go, not IBM/sarama — see Task 22). Every task's diff
+goes through the dual review gate (parity + Go idiom, charter §5).
 
 ## Conventions for every task (D1, D10, thread A)
 
@@ -244,8 +245,10 @@ broker (CI service) or a recording proxy: run the **Python binary**
 producing a fixture journal (fixed `kafka_msg_key`, snappy compression),
 consume with kafka-python, and record: delivered byte payloads, key/
 partition placement, topic auto-create behavior. This is the ground truth
-for the sarama sender (Task 22) and the xerial-framing interop question
-(spec §5 kafka, risk 10).
+for the Go kafka sender (Task 22 — client-agnostic: it validated the
+sarama implementation and is re-run unchanged against the franz-go
+rewrite) and the xerial-framing interop question (spec §5 kafka, risk
+10).
 Acceptance: recorded broker fixtures committed; auto-create and
 key-partition behavior documented in the task output.
 Tests: capture tests; consumer assertions include decompression and
@@ -524,31 +527,101 @@ Depends on: Tasks 13, 11.
 
 ## Phase 3 — Kafka, ES/OpenSearch, websocket
 
-### Task 22. Kafka sender (sarama, D4, D5)
+### Task 22. Kafka sender (franz-go, D4, D5 — client revised 2026-10-11)
 Files: `internal/sender/kafka/`. Config mapping for
 PLAINTEXT/SSL/SASL_PLAINTEXT/SASL_SSL (`ca` for SSL/SASL_SSL,
-certfile/keyfile SSL), SASL PLAIN/SCRAM-SHA-256/512, socks5 dialer,
-`kafka_api_version`, producer settings (linger 500 ms, reconnect backoff
-1 s/10 s), fixed `kafka_msg_key`, topic auto-create via cluster admin only
-when both `kafka_topic_config` values present (already-exists tolerated).
-**Send path uses `sarama.SyncProducer.SendMessages(batch)`** — one call
-per batch, per-message `*ProduceError`, ack-then-advance (thread A7: do
-not reimplement kafka-python's produce-per-message/future/flush dance;
-map the 1 s per-future timeout to `Producer.WaitForAcks`/Net.ReadTimeout
-and NEWS-note if user-visible). **Compression: `sarama.CompressionSnappy`**
-(thread A8 — not a manual github.com/golang/snappy dependency; that
-module is websocket-only). Retriable error → teardown + re-init loop,
-silenced client logging.
-Acceptance: config validation outcomes identical to Python; messages land
-on a real broker matching the Task 12 ground truth (payload bytes,
-key/partition, auto-create); kafka-python-consumer-vs-sarama-producer
-interop test on a real broker proves the snappy framing story or yields a
-NEWS-recorded deviation (spec risk 10).
+certfile/keyfile SSL), SASL PLAIN/SCRAM-SHA-256/512 (franz-go in-tree
+`pkg/sasl/plain`, `pkg/sasl/scram`), socks5/socks5h dialer via
+`kgo.Dialer` wrapping the existing `socks5.go`, `kafka_api_version`
+(unset = auto via franz-go's per-connection ApiVersions negotiation; set
+= `kgo.MaxVersions(kversion.V<x>())`; values below 0.10.0 rejected at
+load — spec §6.1(c)), producer settings (linger 500 ms via
+`ProducerLinger`; `ProduceRequestTimeout` 30 s, `RecordDeliveryTimeout`
+120 s, `RecordRetries` 20; `RetryBackoffFn` pinned to a fixed 100 ms so
+the documented bound holds; reconnect backoff 1 s/10 s in our loop), fixed
+`kafka_msg_key`, our murmur2 `partitioner.go` kept behind
+`kgo.RecordPartitioner` (Python nil-key placement is random; franz-go's
+default is sticky — Task 12 run 2 asserts partition numbers), topic
+auto-create via `kadm.CreateTopic(ctx, ...)` only when both
+`kafka_topic_config` values present (`kerr.TopicAlreadyExists`
+tolerated). **Send path uses `kgo.Client.ProduceSync(ctx, records...)`**
+— one call per batch, `ProduceResults.FirstErr()` fails the whole batch,
+ack-then-advance; acks=1 is `RequiredAcks(LeaderAck())` paired with the
+mandatory `DisableIdempotentWrite()` (thread A7: do not reimplement
+kafka-python's produce-per-message/future/flush dance; NEWS-note the
+timeout mapping if user-visible). **Compression:
+`ProducerBatchCompression(SnappyCompression())`** (thread A8 — raw snappy
+block, not a manual github.com/golang/snappy dependency; that module is
+websocket-only). Retriable error → teardown + re-init loop, classified
+via `kerr.Error.Retriable` plus a short override list; silenced client
+logging. **Cancellation**: on `ctx.Done()` during a stalled produce the
+sender calls `cl.Close()`, which fails buffered records with
+`ErrClientClosed` so `ProduceSync` returns within one
+`ProduceRequestTimeout` (typically sub-second) — a documented library
+path, not a socket closed under the library.
+Acceptance: config validation outcomes identical to Python (except the
+§6.1(c) version floor); messages land on a real broker matching the Task
+12 ground truth (payload bytes, key/partition, auto-create);
+kafka-python-consumer-vs-Go-producer interop test on a real broker proves
+the snappy framing story or yields a NEWS-recorded deviation (spec risk
+10); ctx cancel during a stalled produce returns within one request
+timeout; `Close()` returns promptly.
 Tests: parity ports of the ~20 config tests
-(`test/unit/senders/test_kafka_sender.py`); unit tests with **sarama
-mocks** (thread B: maintained mock tooling first); systest against a real
-broker asserting the Task 12 fixtures; update parity checklist.
+(`test/unit/senders/test_kafka_sender.py`); unit tests against a narrow
+`producer` interface fake (connect / produce batch / create topic / close
+— the `loop_test.go` `recordingProducer` pattern) and franz-go's in-tree
+`pkg/kfake` in-process cluster for the stall/cancel suite (thread B:
+franz-go ships no SyncProducer-style mock; `sarama/mocks` retired);
+`partitioner_test.go`, `socks5_test.go`, config tests and
+`kafka_e2e_test.go` carry over; systest against a real broker asserting
+the Task 12 fixtures (both runs) with the kafka-python consumer re-run;
+update parity checklist.
 Depends on: Tasks 13, 14, 12.
+
+Client revision (user decision 2026-10-11; rationale in
+`docs/assess-kafka-client.md`, sarama limitation in
+`docs/assess-sender-cancellation.md`; the builder records the §2 charter
+deviation — not restated here):
+- Rounds 1–4 of this task were delivered on IBM/sarama (ledger row 22).
+  Sarama has no context support, so cancellation was a socket-force-close
+  workaround with a ~2-3 s floor. The franz-go rewrite **replaces the
+  sarama implementation behind the unchanged `SendMessages(ctx)` / Loop
+  contract** (spec §4.2, Task 13) — no change to the shared loop, the
+  wiring map, config parsing/validation, `topicConfig`,
+  `normalizeKafkaVersion`, the TLS builder, `socks5.go`, or
+  `partitioner.go` (interface rename only).
+- Sub-steps, each one builder dispatch, in order: (a) throwaway spike —
+  `ProduceSync` with `DisableIdempotentWrite` + `LeaderAck` against the
+  systest broker; confirm ctx cancel during a stalled produce returns
+  within one `ProduceRequestTimeout`, `Close()` returns promptly, and the
+  kafka-python consumer reads the records (go/no-go gate, not merged);
+  (b) introduce the narrow `producer` interface + fake and port
+  `loop_test.go`'s `recordingProducer`; (c) replace
+  `buildSaramaConfig`/connect/`sendBatch`/`maybeCreateTopic` with the
+  kgo/kadm implementation and wire socks5, partitioner, SASL,
+  `kafka_api_version`; (d) delete `trackingDialer`, `runCancellable`,
+  version inference + legacy probe, `scram.go`, the KError table; replace
+  classification with the `kerr` retriable flag; drop the sarama, xdg-go/
+  scram, eapache/*, gokrb5, go-metrics, go-resiliency module deps;
+  (e) rewrite the round2/round3 cancellation tests against kfake or the
+  interface fake — keep the ≤5 s assertion and add the tighter
+  one-request-timeout bound; (f) parity re-verification: re-run
+  `kafka_e2e_test.go` against `fixtures/kafka.json` (both runs) with the
+  kafka-python consumer; update `docs/go-test-parity.md` (retire the
+  "Sarama limitation" subsection, record the new shutdown bound and the
+  deviations below) and the charter ledger row 22 via builder-only docs
+  commits.
+- **Carries over unchanged**: the bounded supervisor join from round 4
+  (`pump.go`, defence in depth independent of client choice — keep it);
+  the Task 12 fixture and the dual-run parity assertion (payload bytes,
+  key, partition number, contiguous offsets, partition count, sent
+  cursor).
+- Deviations the builder records (charter §2 / parity doc): pre-0.10
+  broker version inference dropped (spec §6.1(c), operator-visible —
+  user-approved); retry backoff pinned to fixed 100 ms instead of
+  franz-go's default jittered exponential (cosmetic); shutdown latency
+  bound improves from "~2-3 s floor, ≤5 s asserted" to "≤ one request
+  timeout, typically sub-second".
 
 ### Task 23. Elasticsearch/OpenSearch sender
 Files: `internal/sender/elasticsearch/`. Raw HTTP; version probe;
@@ -637,39 +710,44 @@ Depends on: Task 18 (working binary).
 Files: branch `README.rst` section (Go build/cutover instructions incl.
 state-file compatibility and rollback: reinstall Python package, state
 file interoperates both ways — D3), `NEWS` entry listing intentional
-behavior notes: golang release ID; kafka compression via sarama
-(`CompressionSnappy`) and the xerial-framing interop verdict from Task 22;
-sarama send-path timeout mapping NEWS note if user-visible (thread A7);
-**sanctioned deviation: SIGTERM grace-flush window — the Go daemon gives
-senders up to `max_send_interval` to flush buffered messages where
-Python's daemon sender threads lose them** (D9); **sanctioned deviation:
-wrong-typed config values are rejected at load where Python crashed
-mid-run — extended (user decision, Task 3 review) to values Python
-silently coerced or truthiness-tested: numeric strings/floats for integer
-keys, non-string values for string keys, boolean/float tag values,
-readers: null** (thread A17); **sanctioned deviation: the state-file and
-running-config writers use Go 1.27's `encoding/json/v2` encoder — the
-parsed document stays equal to Python's `json.dump(indent=4,
-sort_keys=True)` output, but the bytes are Go-native: object key order
-follows Go map iteration (NOT sorted and NOT deterministic across
-writes; nothing may assume an ordering in Go-written files), floats
-render Go-style (60.0 → "60", 1e-05 → "0.00001",
+behavior notes: golang release ID; kafka client is franz-go — compression
+via `SnappyCompression()` (raw snappy block) and the xerial-framing
+interop verdict from Task 22; **sanctioned deviation: Kafka brokers
+older than 0.10.0 are no longer supported — the pre-0.10 version probe
+is dropped, `kafka_api_version` unset negotiates automatically, a set
+value pins the maximum protocol version** (user decision, 2026-10-11, D5
+revision); franz-go send-path timeout mapping NEWS note if user-visible
+(thread A7); **sanctioned deviation: SIGTERM grace-flush window — the Go
+daemon gives senders up to `max_send_interval` to flush buffered messages
+where Python's daemon sender threads lose them** (D9); **sanctioned
+deviation: wrong-typed config values are rejected at load where Python
+crashed mid-run — extended (user decision, Task 3 review) to values
+Python silently coerced or truthiness-tested: numeric strings/floats for
+integer keys, non-string values for string keys, boolean/float tag
+values, readers: null** (thread A17); **sanctioned deviation: the
+state-file and running-config writers use Go 1.27's `encoding/json/v2`
+encoder — the parsed document stays equal to Python's
+`json.dump(indent=4, sort_keys=True)` output, but the bytes are
+Go-native: object key order follows Go map iteration (NOT sorted and NOT
+deterministic across writes; nothing may assume an ordering in Go-written
+files), floats render Go-style (60.0 → "60", 1e-05 → "0.00001",
 1e+20 → "100000000000000000000"), and non-ASCII is raw UTF-8 instead of
 ensure_ascii \uXXXX; the resume-cursor quirk is unaffected because
 reading walks the file's key order in both implementations** (user
-decision, 2026-10-09, extending the Task 3 review decision); **sanctioned deviation: the logplex sender emits the clean RFC frame —
-Python's accidental f-string bytes-repr wire framing (`len b'...'`) is
-NOT reproduced; the Task 11 logplex fixture pins Python's actual wire
-shape and Go's content parity is asserted via the repr-stripped frame
-list** (user decision, 2026-10-09, Task 11 review); **sanctioned deviation: runtime tolerance of
-malformed entry values — values that crash Python mid-run (truthy
-non-string MESSAGE in the secret-filter/apply paths, float/exotic search
-field values, non-numeric PRIORITY, non-string unit) are tolerated: the
-value is left untouched or the field does not match, and processing
-continues** (user decision, Task 5 review); **sanctioned deviation: the
-regex warn-and-disable policy — secret-filter patterns that are
-Python-valid but use constructs RE2 cannot compile are disabled with a
-startup warning instead of being rejected** (user decision, Task 5
+decision, 2026-10-09, extending the Task 3 review decision); **sanctioned
+deviation: the logplex sender emits the clean RFC frame — Python's
+accidental f-string bytes-repr wire framing (`len b'...'`) is NOT
+reproduced; the Task 11 logplex fixture pins Python's actual wire shape
+and Go's content parity is asserted via the repr-stripped frame list**
+(user decision, 2026-10-09, Task 11 review); **sanctioned deviation:
+runtime tolerance of malformed entry values — values that crash Python
+mid-run (truthy non-string MESSAGE in the secret-filter/apply paths,
+float/exotic search field values, non-numeric PRIORITY, non-string unit)
+are tolerated: the value is left untouched or the field does not match,
+and processing continues** (user decision, Task 5 review); **sanctioned
+deviation: the regex warn-and-disable policy — secret-filter patterns
+that are Python-valid but use constructs RE2 cannot compile are disabled
+with a startup warning instead of being rejected** (user decision, Task 5
 review); no other behavior changes.
 Acceptance: a user can follow the README to build, install, cut over, and
 roll back; every sanctioned deviation has a NEWS entry.
@@ -691,8 +769,11 @@ Depends on: Tasks 18–26.
 
 ### Task 30. CI systest job
 Files: `.github/workflows/build-go.yml` systest job on ubuntu-latest (real
-journald + rsyslogd + broker service as needed), plus
-`scripts/systest-go-on-podman` (privileged Fedora container with
+journald + rsyslogd + broker service as needed — the kafka gate runs the
+Task 22 franz-go systest against the Task 12 fixtures plus the
+kafka-python consumer interop check; `CGO_ENABLED=0` static build is
+preserved, which is one reason the cgo confluent client was rejected),
+plus `scripts/systest-go-on-podman` (privileged Fedora container with
 systemd-journald, mirroring `scripts/systest-on-podman`).
 Acceptance: `make systest-go` runs in CI green; podman script works
 locally.
@@ -714,7 +795,8 @@ Depends on: Task 18.
   gate; the Task 16 checkpoint is a mid-course demonstration only.
 - 19→20→21 (Phase 2; 21 also needs 11). **Milestone B** after 20:
   journal→rsyslogd byte parity.
-- 22 (needs 12, 13, 14) / 23 (needs 11) / 24 (needs 11) parallelizable.
+- 22 (needs 12, 13, 14; sub-steps a→f in order, 2026-10-11 client
+  revision) / 23 (needs 11) / 24 (needs 11) parallelizable.
 - 25/26 (Phase 4, parallelizable, need 13).
 - 27→28→29→30 (Phase 5). **Milestone C** after 30: installable
   golang-marked packages + full CI parity.
