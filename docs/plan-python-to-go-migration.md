@@ -743,7 +743,9 @@ NEWS can cite measured numbers and Task 30 can wire the optional CI job).
 The task is numbered 31 — the plan's numbering is strictly sequential and
 ordering is carried by the "Dependency order and milestones" section, the
 same convention the Task 23 shared-HTTP-helper block used ("no task
-renumbering"). Tasks 27–30 keep their numbers.
+renumbering"). Tasks 27–30 keep their numbers. Task 32 (streaming
+pipeline, added 2026-10-13) joins this phase under the same convention:
+it consumes the Task 31 baseline and precedes Phase 5.
 
 Rationale (audit, 2026-10-12): the repo has NO performance or resource
 comparison of any kind — no Go benchmarks, no pytest-benchmark, no
@@ -998,6 +1000,162 @@ helpers), Task 13 (`journal.sent_lines` gauge from the shared sender
 loop); ordered after Tasks 25/26 so the baseline is taken on the
 feature-complete binary.
 
+### Task 32. Streaming journal pipeline — idiomatic Go path (design approved 2026-10-13)
+Files: `internal/reader/ffi.go` (`jp_api` function-pointer struct +
+`jp_read_batch` C batch loop), `internal/reader/sdjournal.go` (`ReadRaw`,
+`Batch`/`RawEntry`/`RawField`; `ReadBatch` kept as an adapter until step
+(g)), `internal/journal/stream.go` (`EmitJSON`, field index,
+`appendJSONString`; replaces `serialize.go`/`process.go`/`converters.go`),
+`internal/journal/handler.go` (rewrite over `RawEntry`; the §2.6 global
+severity pre-filter; delete `fieldMap` and the `filterByLogLevel` JSON
+re-parse), `internal/filter/` (byte-slice
+entry points), `internal/sender/` (`Item.IndexDate` sidecar; file sender
+write-then-`\n`; ES uses the sidecar), `systest/groundtruth_support.py`
+(`semantic_equal`), `internal/journal/transform_bench_test.go`,
+`bench/results/`, `docs/perf-baseline.md`, `docs/perf-root-cause.md`
+(ledger). Design: **`docs/design-journal-pipeline.md`** (approved; it is
+the spec for this task and is not restated here). Motivation: the Task 31
+baseline and `docs/perf-root-cause.md` show the Go port at ~28.7 µs
+CPU/entry serial and worse than Python at default GOMAXPROCS; the design
+targets ≈5-6 µs, ~4 allocs/entry.
+Scope: one cgo crossing per batch (C loop fills a Go-owned buffer), a
+16 B/field offset index instead of `[]Field`/maps, every filter over byte
+views, JSON appended straight from raw field bytes into one exactly-sized
+payload per filter key shared across senders as today. Rulings carried
+from design §7 (user, 2026-10-13):
+- **Ruling 1 (emulate, no deviation)**: cross-sender `extra_field_values`
+  contamination is reproduced via precomputed per-sender "effective
+  extras" — the union, in config order, of the fragments of earlier
+  cache-miss senders plus the sender's own. Zero runtime cost. No NEWS
+  entry.
+- **Ruling 2 (cheap emulation, no deviation)**: on a cache hit,
+  `unit_log_level` is decided from the live entry only if the emitting
+  sender's field filter kept BOTH `PRIORITY` and `SYSTEMD_UNIT`, taking
+  presence/value from that sender's effective entry (incl. its effective
+  extras); otherwise the entry passes. Python-identical outcome, no JSON
+  re-parse. No NEWS entry.
+- **Ruling 3 (charter amendment)**: the charter's "byte-identical"
+  serialization requirement becomes "semantically-equivalent,
+  byte-identical where free". The builder records the amendment in the
+  charter via its dedicated docs commit; Task 28 carries the NEWS entry.
+- **Global severity pre-filter (design §2.6, behaviour-preserving, no
+  ruling)**: before any emission, skip the entry entirely when EVERY
+  sender's `unit_log_level` would drop it — tier A: a unit-agnostic
+  floor from the senders' catch-all `*` globs (max level across senders;
+  no floor if any sender lacks a `*` glob or has no `unit_log_level`),
+  checked by a byte scan of the raw `PRIORITY` view (~20-50 ns, zero
+  alloc); tier B: the exact `Decide` of every sender over the effective
+  entry (~0.3-1 µs). Both use the ruling-1 effective entry (all-drop
+  extras union; an extras override of `PRIORITY`/`SYSTEMD_UNIT` is
+  folded at construction). Python rules preserved and pinned: absent,
+  `0`, non-numeric or repeated `PRIORITY` passes; absent/empty
+  `SYSTEMD_UNIT` passes (kernel entries never pruned); searches hit
+  counters and the secret-filter metric still count pruned entries;
+  `Process` returns today's all-dropped result. The journald-side
+  `PRIORITY` add_match variant is ASSESSED AND REJECTED (design §2.6.2:
+  libsystemd cannot express "field absent", so it would drop entries
+  Python passes, plus unit/value-form/metric differences) — not
+  implemented; any future opt-in is a charter §2 deviation needing a
+  user ruling. The refined **two-reader partition** (a reader for
+  records with both unit and `PRIORITY`, one for the complement) is
+  likewise ASSESSED AND REJECTED (design §2.6.5): `sd_journal_add_match`
+  has no existence/wildcard/negation form — empirically, field-only and
+  `!=` are `-EINVAL`, `PRIORITY=` matches the literal empty value and
+  `PRIORITY=*` matches nothing — so the complement cannot be expressed
+  and the second reader could only ever be the unmatched main reader.
+**Sink PROTOCOLS stay exact; message-content JSON becomes
+semantically-equivalent.** Kafka framing/compression/key→partition,
+logplex octet-counted frames and headers, rsyslog framing, ES `_bulk`
+action lines and mapping, websocket NUL-join/snappy frames, file
+`payload + "\n"`, CloudWatch/GCL request shapes are untouched and remain
+byte-asserted; only the JSON object they carry is compared semantically
+(same key set, equal decoded strings, numbers equal as float64 or as
+decimal strings beyond 2^53, structural equality for null/arrays).
+Python formatting (separators, first-occurrence key order, synthesised
+keys last, `ensure_ascii=True`, `PythonFloatRepr`, repr fallback) is kept
+where free, so the expectation is zero fixture regeneration.
+Sub-steps, each one builder dispatch, in order (design §5.2; (a) and (b)
+may run in parallel): (a) reader C batch loop + `ReadRaw` with the
+`ReadBatch` adapter — existing `sdjournal_test.go` unchanged plus an
+adapter-equals-`readNext` test on the systest `.journal` fixtures;
+(b) `stream.go` `EmitJSON` + index — the old
+`ConvertEntry/ProcessEntry/Serialize` chain becomes the ORACLE in a
+semantic-equivalence test and a fuzz test (random keys/values/duplicates/
+invalid UTF-8 → both paths → parse → compare), golden file kept as byte
+canary; (c) filter byte-slice entry points (`Searcher.MatchRaw`,
+`UnitLogLevel.Decide(unit, prio []byte)`, `FieldFilter.KeepKey`,
+`SecretFilters.ApplyRaw`; a literal `*` glob compiles to a constant-true
+matcher) with table tests mirroring the string ones and a pin test for
+repeated-field behaviour BEFORE changing it; (d) handler rewrite over
+`RawEntry` with the decision record (ruling 2), effective-extras list
+(ruling 1), the §2.6 pre-filter (tier A floor + tier B exact, computed at
+construction, calling the SAME `Decide` and key-resolution helper as the
+per-sender path — no second implementation of the rule), `Item.IndexDate`;
+`handler_test.go` ported to semantic assertions plus quirk-lock tests
+with the OLD handler as oracle — (i) three senders, distinct filter keys
+and extras, sender C's payload carries A's and B's extras; (ii)
+first-of-key sender dropped by unit level then a same-key sender emits
+with its own extras appended, and a cache-hit sender after a filter that
+removed `PRIORITY` passes; (iii) the §2.6.1 preserved-rules table and a
+property test over random configs/entries asserting prune ⇒ the old
+handler enqueued nothing to any sender, and no prune ⇒ per-sender
+outputs semantically equal; `pump_test.go` unchanged; (e) senders — file
+write-then-`\n`, ES `IndexDate`; (f) tests + bench — `semantic_equal` for
+the JSON body in `test_groundtruth_{file,kafka}.py` keeping raw comparison
+for framing/headers/partition/key/counts, `TestSerializeGolden` becomes
+the canary (`t.Logf` on byte diff, fail only on semantic diff), micro-benchmark
+rewired to `EmitJSON` plus a debug-heavy pruned-path variant (`*`/`INFO`
+config, `PRIORITY=7` entries — records the ~2.5-3 µs pruned figure;
+the committed bench fixture has no `unit_log_level`, so the pre-filter is
+inactive in the baseline and the main gate is measured without it),
+`make bench-baseline` re-recorded and `bench-check` re-armed; (g) cleanup
+— delete the adapter, old chain,
+`enumBufPool`; `-tags poison` build fills the batch buffer after each
+batch; `perf-root-cause.md` ledger closed.
+Gates (all must hold before (g) closes the task):
+- **Bench performance gate** (Task 31 harness, same host and fixture as
+  the committed baseline, COMPATIBLE comparison): Go CPU/entry serial
+  (`GOMAXPROCS=1`) ≤ 8 µs (from 28.7; design target 5-6); allocs/entry
+  ≤ 8 (from 158; target ~4); default-GOMAXPROCS whole-run CPU below
+  Python's with non-overlapping ranges; `bench-check` tripwire shows no
+  regression on any PRIMARY metric; wall is expected unchanged (poll-
+  paced) and is not gated beyond the tripwire.
+- **NEW semantic-equivalence tests**: the (b) oracle + fuzz tests, the
+  (d) handler semantic port and two quirk-lock tests, the (f)
+  `semantic_equal` systest comparisons — all green against BOTH binaries
+  where dual-implementation suites exist.
+- **Byte-exact fixtures as canary**: `serialization_golden.jsonl` and
+  the Task 11/12 file and kafka fixtures are retained unmodified; a byte
+  diff is logged, never fails, and a semantic diff fails. Expected
+  outcome: zero byte diffs (recorded in the ledger).
+- **Existing suites green**: `go test -race ./...`, `make systest-go`,
+  `make systest` dual-implementation suites, `make bench-test`; the
+  json-cache quirk systest (`test_groundtruth_json_cache.py`), the
+  replay and logplex fixtures, and `poll_interval_systest.go` (no added
+  latency) pass unchanged.
+- **No deviations** beyond ruling 3; rulings 1 and 2 and the §2.6
+  pre-filter are behaviour-preserving and the parity doc records them as
+  emulated quirks / short-circuit pinned by the (d) tests. The
+  pre-filter's wrong direction (pruning an entry a sender would keep) is
+  data loss; the (d) property test asserts that direction specifically.
+Non-goals: pure-Go journal reader and `journalctl -o export` subprocess
+(design §1.2/§1.3, fallbacks only); journald-side `PRIORITY` add_match
+pre-filter (design §2.6.2, rejected — would need an operator opt-in and a
+user ruling); turning `ensure_ascii` off (exists as
+an option, default true, Python form); sidecars for logplex/rsyslog
+(later phase); any sender wire change.
+Parity checklist: `docs/go-test-parity.md` gains a `## Task 32` section
+listing the oracle/fuzz/quirk-lock tests as `go-native` (reason: the
+oracle is the old Go chain, no Python counterpart) and the semantic
+re-expression of `TestSerializeGolden` and the file/kafka systests
+(ported → semantic, with the canary note). Charter ledger row 32 and the
+ruling-3 charter amendment via the builder-only docs commit as usual.
+Depends on: Task 15 (reader seam, `sdjournal.go`/`ffi.go`), Task 16
+(run loop, handler, file sender), Task 31 (harness, committed baseline
+and `bench-check` for the performance gate); ordered after 31 and BEFORE
+27 so Task 28's NEWS cites the post-pipeline numbers and the ruling-3
+amendment. Numbered 32 to avoid renumbering 27–30.
+
 ## Phase 5 — Packaging, docs, cutover
 
 ### Task 27. Packaging on the branch (D1, D7)
@@ -1115,5 +1273,12 @@ Depends on: Task 18.
   informational `workflow_dispatch`/nightly job and `make bench-test` to
   the correctness systest job, never a perf threshold as a required
   check. Numbered 31 to avoid renumbering 27–30.
+- **32 (Phase 4b, added 2026-10-13) runs after 31 and BEFORE 27** — hard
+  prerequisites are 15, 16 and 31; sub-steps (a)/(b) parallel, (d) needs
+  both, (f) before (g). Its gate is the Task 31 harness against the
+  committed baseline; it re-records the baseline on completion. Task 28
+  carries the ruling-3 NEWS entry (charter amendment to
+  "semantically-equivalent, byte-identical where free") and cites the
+  post-pipeline numbers. Numbered 32 to avoid renumbering 27–30.
 - 27→28→29→30 (Phase 5). **Milestone C** after 30: installable
   golang-marked packages + full CI parity.

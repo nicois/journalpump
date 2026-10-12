@@ -1,7 +1,12 @@
 # Design: the idiomatic Go journald → sinks pipeline
 
-Status: proposal for user decision (2026-10-13). Supersedes the Option A/B
-sketch in `docs/perf-root-cause.md`. No code changed by this document.
+Status: **APPROVED by the user 2026-10-13**, with the three rulings in §7
+(revision of the 2026-10-13 proposal; the open questions it carried are
+closed here). §2.6 (global severity pre-filter) added the same day on a
+user question; it is behaviour-preserving and needs no ruling. Supersedes
+the Option A/B sketch in `docs/perf-root-cause.md`. Implementation is plan
+Task 32 (`docs/plan-python-to-go-migration.md`). No code changed by this
+document.
 
 Authored by: **claude-fable** (the model id reported by my runtime; the
 gateway table maps the `architect` role to it). I cannot independently verify
@@ -21,15 +26,23 @@ filter key, shared by all senders of that key exactly as today. Keep
 Python's JSON formatting where it is free (it is free everywhere; the
 byte-exact reference serializer already measured 1.7 µs), but downgrade
 byte-identity from *contract* to *canary*: the tests assert semantic
-equivalence, and formatting may change later without a redesign.
+equivalence, and formatting may change later without a redesign. An
+in-process **global severity pre-filter** (§2.6) skips emission entirely
+for entries every sender would drop, at ~50 ns per entry and with
+Python-identical outcome.
 
 Expected: **~5-6 µs CPU/entry serial (from 28.7), ~4 allocs/entry (from
-158), ~1 KB/entry (from 12.5 KB)**, i.e. ~5x less CPU than Python. Wall
-time does not move (poll-paced). Three operator-visible quirks need a user
-ruling (§7).
+158), ~1 KB/entry (from 12.5 KB)**, i.e. ~5x less CPU than Python; entries
+pruned by §2.6 cost ~2.5-3 µs. Wall time does not move (poll-paced). The
+three operator-visible quirks that needed a user ruling are **resolved in
+§7**: both handler quirks are emulated exactly (no deviation, no NEWS
+entry), and the charter's byte-identical requirement is amended to
+"semantically-equivalent, byte-identical where free".
 
-Rejected: pure-Go journal-file reader (§1.2) and `journalctl -o export`
-subprocess (§1.3). Both are documented as fallbacks only.
+Rejected: pure-Go journal-file reader (§1.2), `journalctl -o export`
+subprocess (§1.3), and a journald-side PRIORITY match as the severity
+pre-filter (§2.6.2 — it would drop entries Python passes). All are
+documented as fallbacks or opt-ins only.
 
 ## 1. Sourcing journal entries
 
@@ -240,13 +253,35 @@ Per entry, the handler runs, in today's order:
    is repointed at it (a flag bit selects scratch vs buf). One scratch,
    reused, bounded by the largest MESSAGE (≤64 KiB by data threshold). Secret
    metric counted once per entry, as today.
-4. **per sender, in configured order**, with the per-filter-key cache:
-   - `unit_log_level.Decide(unit, priority []byte)` — evaluated on the real
-     entry fields from the index, for every sender, no JSON re-parse (see
-     §7 Q2 for the quirk this removes).
-   - cache lookup on `fieldFilter.Name()` ("" when none). Hit → enqueue the
-     same `[]byte`. Miss → `EmitJSON` (§3) into a new exactly-sized `[]byte`,
-     store, enqueue.
+3b. **global severity pre-filter** (§2.6) — if every sender would drop the
+   entry on unit log level, stop here: nothing is emitted, nothing is
+   enqueued, no `IncLineStats` call — exactly the observable result of
+   step 4 dropping in every sender today.
+4. **per sender, in configured order**, with the per-filter-key cache
+   keyed on `fieldFilter.Name()` ("" when none):
+   - **cache miss** (first sender of this filter key for this entry):
+     the sender's **effective extras** are the extras of every cache-miss
+     sender encountered so far for this entry, in config order, plus its
+     own (ruling 1, §7 — this is Python's shared-dict contamination,
+     reproduced from precomputed fragments with no runtime work beyond
+     appending a fragment-list reference per cache-miss sender). The
+     `unit_log_level` decision is taken on this **effective entry**: the
+     unit and priority views come from the index unless an effective
+     extra overrides `SYSTEMD_UNIT`/`PRIORITY`, in which case the
+     fragment's value is used — exactly what Python's filter sees in
+     the mutated dict. Drop → nothing cached (as today; the next sender
+     with the same key is then a cache miss too, which the fragment-list
+     rule above handles for free). Keep → `EmitJSON` (§3) into a new
+     exactly-sized `[]byte`, store it **together with a 3-word
+     decision record** — whether the field filter kept BOTH `PRIORITY`
+     and `SYSTEMD_UNIT`, and the unit/priority views of the effective
+     entry — and enqueue.
+   - **cache hit**: `unit_log_level` is decided from the decision record
+     (ruling 2, §7): if the emitting sender's field filter kept both
+     keys, run this sender's `UnitLogLevel.Decide(unit, priority)` on the
+     recorded views; otherwise the entry passes, which is the outcome
+     Python's filter gives for a cached payload lacking either key. No
+     JSON re-parse, no allocation. Keep → enqueue the same `[]byte`.
    - `truncateLongMessage` (payload > `MaxKafkaMessageSize`): emits the
      3-field `{error, partial_data, timestamp}` object directly from the
      index; no map, no re-serialise of the big one.
@@ -255,7 +290,13 @@ Everything that is static per sender is precomputed at construction: the
 field-filter key set (as a `map[string]struct{}` queried with
 `m[string(view)]`, which the compiler does without allocating), the
 `extra_field_values` as pre-escaped `"key":value` JSON fragments plus a key
-set, and the unit-log-level table.
+set, whether the field filter keeps `PRIORITY` and `SYSTEMD_UNIT`, and the
+unit-log-level table. The effective-extras union is therefore a
+concatenation of precomputed fragment lists; in the common case (no
+unit-level drop by a first-of-key sender) it is identical to the static
+"union in config order of earlier first-of-their-key senders" and could be
+tabulated at construction — the runtime list form is kept because it also
+covers the drop-then-re-miss case exactly, at the same cost.
 
 ### 2.4 Sharing across senders
 
@@ -282,6 +323,242 @@ Only two places, both bounded and rare:
 Nothing else: no `[]Field`, no `fieldMap`, no `ProcessEntry`, no
 `ConvertEntry`, no `any` boxing, no `bytes.Buffer`.
 
+### 2.6 Global severity pre-filter (added 2026-10-13, user question)
+
+Question: if DEBUG-level entries are not selected by any sender, can we
+avoid processing them at all, or at least check more cheaply?
+
+What the filter actually is. `unit_log_level` is **per unit glob**, not a
+global level (`internal/filter/unit_log_level.go:82-104`, porting
+`journalpump.py:671-696`): a sender drops an entry only when (i) the entry
+has a truthy `PRIORITY` (absent, `0`, or non-numeric → pass), (ii) it has a
+non-empty `SYSTEMD_UNIT` (absent → pass), and (iii) some configured
+`service_glob` matches that unit with `priority > level` (most-restrictive
+wins). A sender with no `unit_log_level` drops nothing. So "DEBUG is not
+selected by any sender" is only well-defined per entry, and the pre-filter
+must reproduce exactly that per-entry conjunction over all senders.
+
+Why a pre-filter is behaviour-safe here. If every sender drops the entry,
+every sender is a **cache miss** (a drop caches nothing — `handler.go:
+282-287`), so every decision is the step-4 live decision on the effective
+entry and the ruling-2 cache-hit rule is never reached. In that all-drop
+scenario the ruling-1 effective extras of sender *s* are static: the union
+in config order of **all** senders before *s* plus its own. The pre-filter
+therefore evaluates `Decide_s(effective unit, effective priority)` for each
+sender with those static all-drop extras, and prunes only when every one
+returns drop. Field filters are irrelevant to it — Python applies
+`unit_log_level` **before** `filter_fields` (`journalpump.py:771` vs
+`:781`), so a field filter that removes or keeps `PRIORITY` cannot change a
+cache-miss decision; it matters only on cache hits, which do not occur
+when everything drops. Key resolution is the same shared helper `EmitJSON`
+uses (leading-`_` strip; an entry carrying both `_SYSTEMD_UNIT` and
+`SYSTEMD_UNIT` resolves by the same rule as emission), so the pre-filter
+cannot see a different field than the emitter would.
+
+#### 2.6.1 In-process cheap check (recommended; in Task 32 scope)
+
+Two tiers, both computed at sender construction, both zero-alloc at
+runtime, both placed at step 3b — **after** searches, match and secret
+filters, whose hit counters and metrics Python increments for every entry
+regardless of the unit-level outcome.
+
+- **Tier A — unit-agnostic floor (~20-50 ns).** For each sender take the
+  level of its catch-all glob (`service_glob` exactly `*`; a `*` glob
+  makes condition (iii) hold for every non-empty unit, and
+  most-restrictive-wins means other globs can only drop more). If every
+  sender has one, the global floor `F` is the **maximum** (most
+  permissive) of those levels; if any sender lacks a `*` glob or has no
+  `unit_log_level` at all, there is **no floor and no pruning**. At
+  runtime: look up the effective `PRIORITY` and `SYSTEMD_UNIT` views in the
+  index (two ≤32-compare scans, or the extras fragment value when an
+  all-drop effective extra overrides either key — in which case the
+  override is constant and the check degenerates at construction to
+  "always prune"/"never prune" for that sender). Prune iff the priority
+  bytes are a canonical decimal (`[1-9][0-9]*`, so `0` and anything
+  non-canonical fall through), the value is `> F`, and the unit view is
+  non-empty. Non-canonical priorities (`0006`, whitespace, `+6`) and
+  repeated `PRIORITY` fields (a list in Python — truthy but non-numeric →
+  pass) are **not** pruned by tier A; they fall through to tier B or to
+  step 4, which handle them exactly as today (`pythonIntString`,
+  `asPythonNumber`). With `F` for `INFO` only `PRIORITY=7` is pruned; for
+  `WARNING`, 5-7.
+- **Tier B — exact all-senders decision (~0.3-1 µs).** When tier A does
+  not prune (no floor, or the entry's unit/priority shape is outside tier
+  A's fast path), run the real `UnitLogLevel.Decide` of every sender over
+  the effective views with the all-drop extras. This is the *same*
+  computation step 4 would do for each cache-miss sender, done once
+  before emission instead of interleaved with it; it saves `EmitJSON`
+  and the per-sender work whenever all senders drop and costs one extra
+  glob regex pass per sender when they do not. Enable tier B only when
+  every sender has a `unit_log_level` (otherwise it can never prune);
+  compile a literal `*` glob to a constant-true matcher so tier B over
+  catch-all configs costs the same as tier A.
+
+Preserved Python rules, each pinned by a test: absent `PRIORITY` passes;
+`PRIORITY=0` passes (falsy); non-numeric or repeated `PRIORITY` passes;
+absent or empty `SYSTEMD_UNIT` passes (kernel entries have no
+`_SYSTEMD_UNIT` and are **never** pruned, whatever their priority); a
+sender without `unit_log_level`, or without a `*` glob for tier A,
+disables pruning for that tier; an extras override of `PRIORITY` or
+`SYSTEMD_UNIT` is honoured per ruling 1; searches hit counters and the
+secret-filter metric still count pruned entries; the return value of
+`Process` for a pruned entry equals today's all-dropped result (no
+`IncLineStats`, `hasBytes` true, 0 bytes, no sender cursor advance). The
+property test in §5.2 step 4 runs random configs/entries through the
+pre-filter and the old handler and asserts prune ⇒ old handler enqueued
+nothing to any sender.
+
+#### 2.6.2 journald-side PRIORITY match (assessed; NOT recommended)
+
+The reader already adds `sd_journal_add_match` constraints for
+`units_to_match` and `journald_filters` (`journalpump.py:480-483`,
+`sdjournal.go:71-75`). libsystemd's match language is: matches on the
+same field are OR'd, different fields are AND'd, `add_disjunction` ORs
+whole groups, `add_conjunction` ANDs them. Adding `PRIORITY=0` … `PRIORITY=F`
+would be OR'd among themselves and AND'd with the existing matches — the
+right shape, and entries above the floor would never leave libsystemd
+(saving the ~2 µs libsystemd work and the index build too). It is the
+cheapest possible option and it is **not behaviour-preserving**:
+
+- **Absence cannot be expressed.** Matches are positive tests against
+  data objects; there is no negation, no "field unset", and no
+  match-anything-including-absent form. An entry without `PRIORITY`
+  (Python passes) would be dropped. Checked alternatives: OR-ing a
+  disjunction for "no PRIORITY" is impossible; `journalctl -p` has the
+  same limitation (it hides entries lacking `PRIORITY`); matching on a
+  different always-present field via `add_disjunction` ORs the *whole*
+  group and so disables the priority restriction rather than
+  complementing it.
+- **Unit condition cannot be expressed.** Python drops only when
+  `SYSTEMD_UNIT` is present and glob-matched; a journald match would also
+  drop high-priority entries with no unit (kernel messages, `_TRANSPORT=
+  kernel`) and entries whose unit matches no glob when the floor is not
+  from a `*` glob.
+- **Value forms differ.** journald matches bytes: `PRIORITY=0006` or a
+  non-numeric value would not match `PRIORITY=6` and would be dropped,
+  where Python converts or passes.
+- **Side effects differ.** Pruned-at-source entries are never read, so
+  `journal.read_lines`/`read_bytes` gauges, searches hit counters and the
+  secret-filter metric no longer count them; `journal.sent_lines` is
+  unchanged. Operator-visible.
+
+Recommendation: **do not implement it in Task 32.** It could only ever be
+an explicit operator opt-in (e.g. `journald_priority_prefilter: true`)
+whose documentation lists the four differences above — that is a charter
+§2 deviation and needs a user ruling if it is ever requested; it is
+recorded here so that the question is not re-opened by accident. The
+in-process tiers deliver most of the saving (see §2.6.3) with none of the
+differences.
+
+#### 2.6.3 Quantification
+
+Per entry in the §5.1 model (16 fields, ASCII): libsystemd ~2.0 µs +
+index ~0.4 µs + searches/match/secret ≤0.3 µs are spent before step 3b
+regardless; emission and the per-sender path (`EmitJSON` ~1.7 µs, handler
+glue ~0.7 µs, payload alloc + GC ~0.3 µs, enqueue, file write) are
+~2.5-3 µs. A pruned entry therefore costs **~2.5-3 µs instead of ~5-6 µs**
+(≈50 % saving, ≈3 µs) in the streaming design, and the check itself is
+~20-50 ns (tier A) or ~0.3-1 µs (tier B) — negligible against the
+~20 µs transform of the *current* code and small against the design's
+~5-6 µs. Journald-side pruning would save a further ~2.4 µs (libsystemd +
+index) but is rejected above.
+
+How many entries: with every sender at `INFO` only `PRIORITY=7` entries
+are pruned; at `WARNING`, 5-7 — on most hosts `NOTICE`/`INFO` dominate and
+`DEBUG` is a few percent unless a service logs at debug, so a **mixed
+workload saves f × ~3 µs** per entry for pruned fraction f (a 10 %
+debug share saves ~5 % of CPU); a **DEBUG-only or debug-heavy workload**
+(a verbose service with senders at `INFO`) approaches the full ~50 %
+saving, and against today's code it saves ~20 of 28.7 µs. The Task 31
+bench fixture has no `unit_log_level`, so the pre-filter is inactive in
+the committed baseline and the §5.1 gate is measured without it; a
+separate debug-heavy micro-benchmark (`transform_bench_test.go` variant
+with a `*`/`INFO` config and `PRIORITY=7` entries) records the pruned-path
+figure so the saving is measured, not asserted.
+
+#### 2.6.4 Interaction with rulings 1 and 2
+
+- **Ruling 1.** The floor and every tier-B decision use the **effective**
+  entry: for sender *s* in the all-drop scenario, the configured raw
+  fields overlaid with the union of extras of all senders before *s* plus
+  its own. An extra that sets `PRIORITY` (e.g. a constant `"PRIORITY": 3`)
+  makes that sender's priority a constant for every entry, and the
+  pre-filter folds it at construction (constant below the sender's levels
+  → that sender never drops → no pruning at all; constant above → that
+  sender's decision reduces to the unit test). An extra that sets
+  `SYSTEMD_UNIT` is folded the same way. The pre-filter never reads the
+  raw field name when an effective extra overrides it.
+- **Ruling 2.** Not reached: pruning only happens when every sender is a
+  cache miss. When pruning does **not** happen the step-4 path runs
+  unchanged, including the decision record and the cache-hit rule, so the
+  pre-filter cannot alter a cache-hit outcome.
+- **Field filters.** Irrelevant to pruning (unit level precedes field
+  filtering in Python); a filter that drops `PRIORITY` only affects cache
+  hits, which require a prior keep.
+
+#### 2.6.5 Two-reader partition — one reader for the "has unit+PRIORITY"
+#### set, one for the complement (assessed 2026-10-13; REJECTED)
+
+A later proposal refined §2.6.2: instead of matching `PRIORITY` on the
+*main* reader, open **two** readers — one matching records that carry
+**both** `SYSTEMD_UNIT` and `PRIORITY` (the fast path), and a second
+reader for the **complement** (records missing either field). The
+question is whether the complement is expressible as a journald match
+at all. It is not, and the Match API was probed empirically to show it.
+
+Empirical result (`sd_journal_add_match` via the FFI's dlopen
+`libsystemd.so.0`, libsystemd 0.41.0, against the systest fixtures; two
+fixtures used, `rotated_logs` where all 40 records have `PRIORITY=6`, and
+`bad_msg` where 10 of 20 records carry `PRIORITY=6` and the other 10
+carry **no** `PRIORITY` at all):
+
+| match data | rc | matching entries |
+|---|---|---|
+| `PRIORITY=6` | 0 | 40 / 10 (the records that have it) |
+| `PRIORITY=` (empty value) | 0 | **0** — literal empty value, **not** "present" |
+| `PRIORITY` (field only, no `=`) | **-EINVAL** | rejected |
+| `PRIORITY=*` (wildcard) | 0 | 0 — `*` has no wildcard meaning, matched literally |
+| `PRIORITY!=6` (negation) | **-EINVAL** | rejected |
+| `NULL` data / empty string | **-EINVAL** | rejected |
+
+So there is **no existence match, no wildcard, no negation, and no
+"field absent" predicate**. The only expressible predicate is
+*"key has exactly this byte value"*, and matches are only ever a
+positive conjunction/OR; the `bad_msg` complement of `PRIORITY=6` (10
+records without the field) cannot be selected by any `add_match`
+expression. The partition therefore cannot be done in journald: the
+second reader could only ever be the *unmatched* main reader, i.e. the
+design reduces back to §2.6.2's single main-reader match plus the
+in-process complement handling it already rejects.
+
+Two further reasons, independent of the Match API:
+
+- **No fast path exists to gain from.** In the streaming design an
+  absent field is simply an absent byte range — nothing "promotes" or
+  synthesises a default for a missing-field record (§2.4: the emitter
+  renders only the fields present, and `unit_log_level` treats absent
+  `PRIORITY`/`SYSTEMD_UNIT` as *pass*, `internal/filter/unit_log_level.go`).
+  A missing-field record is therefore *cheaper* to process, not more
+  expensive; a reader-level partition would put the cheap records on the
+  slow reader and the expensive ones on the fast reader, the wrong way
+  round.
+- **State-file and cursor semantics.** The reader/pump assumes one
+  resume cursor per source (`state`/`tail_entry_*`, the single
+  `ResumeCursor` in `OpenConfig`). Two readers mean two cursors, two
+  positions, two resume records, two wait/poll loops and a merge — for a
+  partition whose two halves would still both be read on every poll. The
+  extra machinery buys nothing.
+
+It also subsumes **nothing** of §2.6.1: the two-reader split is a
+journald-side *drop* (§2.6.2's four operator-visible differences all
+apply — gauges, hit counters, secret-filter metric, and above-floor
+entries never leaving libsystemd), whereas §2.6.1's tier A/B pre-filter
+is in-process and behaviour-preserving and already gets the ~2.5-3 µs
+saving. §2.6.1 is unaffected and remains the recommended mechanism.
+
+Recommendation: **reject.** Recorded here, alongside §2.6.2, so the
+question is not re-opened by accident. No operator opt-in is proposed.
+
 ## 3. Serialisation
 
 ### 3.1 `EmitJSON`
@@ -299,6 +576,9 @@ type EmitOptions struct {
 // so the common case is exactly one allocation with no growth.
 func EmitJSON(dst []byte, e *reader.RawEntry, o *EmitOptions) ([]byte, error)
 ```
+
+`o.Extras` is the sender's **effective** extras per §2.3 (ruling 1), not
+its configured extras alone.
 
 Algorithm, per field in index order, skipping duplicates-of-earlier:
 
@@ -345,12 +625,12 @@ fastest). If none: `dst = append(dst, '"'); append(dst, v...); append('"')`
 
 ### 3.3 What "equivalent output" means, and what we keep for free
 
-**Contract (what tests assert):** each payload is valid JSON (RFC 8259),
-one object per entry, with the same key set and the same values as the
-reference — strings equal after decoding, numbers equal as `float64` (or
-as decimal strings when either side is beyond 2^53), `null`/arrays/nested
-objects structurally equal. Key order, whitespace, escaping form and float
-spelling are *not* part of the contract.
+**Contract (what tests assert; ruling 3, §7):** each payload is valid JSON
+(RFC 8259), one object per entry, with the same key set and the same values
+as the reference — strings equal after decoding, numbers equal as `float64`
+(or as decimal strings when either side is beyond 2^53), `null`/arrays/
+nested objects structurally equal. Key order, whitespace, escaping form and
+float spelling are *not* part of the contract.
 
 **Policy:** Python formatting is kept wherever it costs nothing, because the
 byte-exact reference serializer already hits 1.7 µs and keeping it leaves
@@ -370,7 +650,9 @@ logplex `application/logplex-1` octet-counted RFC5424 frames and headers,
 rsyslog RFC5424/3164/RFC6587 framing in `internal/syslogframing`, ES
 `_bulk` NDJSON action lines and mapping, websocket NUL-joined/snappy
 frames, file `payload + "\n"`, CloudWatch and GCL request shapes. None of
-these read our JSON bytes except to embed or parse them.
+these read our JSON bytes except to embed or parse them. In one line: sink
+**protocols** stay exact; the message-content JSON they carry becomes
+semantically-equivalent.
 
 ## 4. What still matters vs what is now free
 
@@ -386,11 +668,18 @@ Preserved exactly (not touched by this design):
   statsd metric names/tags, journald log output;
 - filter semantics and order: searches (raw keys) → match → secret filters
   → per-sender unit_log_level → field filter; `add_match` unit filters;
+  the §2.6 pre-filter sits inside the per-sender unit_log_level step's
+  observable envelope (it only short-circuits an all-drop outcome);
 - entry ordering (libsystemd's), chunking and poll pacing, INVALIDATE
   reopen, `ErrBadMessage` accounting, data-threshold truncation;
 - the json-cache quirk pinned by `systest/test_groundtruth_json_cache.py`
   (second filterless sender gets the first's payload, its own extras
   ignored) — falls out of the cache key unchanged;
+- the **cross-sender extras contamination** (`handler.go:148-154`; ruling
+  1) and the **cache-hit unit_log_level outcome** (`handler.go:337-358`;
+  ruling 2) — emulated via effective extras and the decision record
+  (§2.3), Python-identical in every case including the drop-then-re-miss
+  corner;
 - the values of every field, including `REALTIME_TIMESTAMP`, `SEQNUM`,
   `timestamp`, int/uuid/float conversions and the repr fallback.
 
@@ -412,11 +701,19 @@ done), ordering of synthesised keys.
 | handler glue, fieldMaps, SetField, file line copy, statsd | ~2.9 | ~0.7 | no maps, Item by value, write+`\n` |
 | GC (16% of CPU) | ~4.5 | ~0.3 | 158 → ~4 allocs, 12.5 KB → ~1 KB |
 | **total** | **28.7** | **≈5-6** | gate: ≤ 8 µs |
+| entry pruned by §2.6 | 28.7 | ≈2.5-3 | no emission; check ≤ 50 ns (tier A) |
+
+Rulings 1 and 2 add nothing to this table: the effective-extras list is a
+few pointer appends per entry and the cache-hit decision reads three words
+already in cache; the `filterByLogLevel` JSON re-parse that today costs a
+full decode per cache-hit sender is gone. The §2.6 pre-filter is inactive
+in the bench baseline config (no `unit_log_level`) and is measured by its
+own micro-benchmark.
 
 Allocations per entry: payload (1 per filter key, exact size), cursor
 string (1), rare repr/secret scratch, plus whatever the sender channel
 boxing costs today (target total ≤ 4, gate ≤ 8). Bytes/entry ≈ payload
-(~0.8 KB) + cursor (~130 B).
+(~0.8 KB) + cursor (~130 B). A pruned entry allocates nothing.
 
 Transform micro-benchmark (`internal/journal/transform_bench_test.go`):
 18-20 µs → ~2 µs (Python 6-13 µs).
@@ -427,6 +724,8 @@ CPU, worse than Python's 8.94 because of GC and cgo spinning) should fall
 to ~2-3 s — that is the headline a user sees in `top`.
 
 ### 5.2 Migration outline (each step is one or two builder dispatches)
+
+Carried into the plan as Task 32 sub-steps (a)–(g).
 
 1. **reader: C batch loop.** `ffi.go` gets `jp_api` + `jp_read_batch`;
    `sdjournal.go` gets `ReadRaw(max int) (*Batch, error)`. Keep today's
@@ -442,19 +741,37 @@ to ~2-3 s — that is the headline a user sees in `top`.
    stays as a byte canary.
 3. **filters: byte-slice entry points.** `Searcher.MatchRaw`,
    `UnitLogLevel.Decide(unit, prio []byte)`, `FieldFilter.KeepKey`,
-   `SecretFilters.ApplyRaw(msg []byte, scratch []byte)`. Table tests mirror
-   the existing string-based ones.
+   `SecretFilters.ApplyRaw(msg []byte, scratch []byte)`; a literal `*`
+   glob compiles to a constant-true matcher. Table tests mirror the
+   existing string-based ones.
 4. **handler: process `RawEntry`.** Rewrite `Handler.Process` over the
-   batch, per-filter-key cache, effective-extras precompute (§7 Q1),
-   `Item.IndexDate`. Delete `fieldMap`. Proof: `handler_test.go` ported to
-   semantic assertions; `pump_test.go` unchanged.
+   batch, per-filter-key cache with the decision record (ruling 2),
+   effective-extras fragment list (ruling 1), the §2.6 pre-filter (tier A
+   floor + tier B exact, computed at construction from the all-drop
+   effective extras), `Item.IndexDate`. Delete `fieldMap` and the
+   `filterByLogLevel` re-parse. Proof: `handler_test.go` ported to
+   semantic assertions, plus quirk-lock tests that run the OLD handler as
+   oracle: (i) three senders with distinct filter keys and distinct extras
+   — sender C's payload carries A's and B's extras; (ii) a first-of-key
+   sender whose unit_log_level drops the entry followed by a same-key
+   sender — the second emits with its own extras appended, and a
+   cache-hit sender after a filter that removed `PRIORITY` passes; (iii)
+   the §2.6.1 preserved-rules table (absent/zero/non-numeric/repeated
+   `PRIORITY`, absent unit, no-`*`-glob sender, no-unit_log_level sender,
+   extras overriding `PRIORITY`/`SYSTEMD_UNIT`, searches counters still
+   incremented) and a property test — random configs and entries, prune
+   ⇒ the old handler enqueued nothing to any sender, and no prune ⇒ the
+   two handlers' per-sender outputs are semantically equal. Both oracles
+   are Python-identical today. `pump_test.go` unchanged.
 5. **senders.** file: write payload then `\n` (no copy); ES: use
    `IndexDate`. logplex/rsyslog unchanged.
 6. **tests + bench.** systest fixtures compared semantically (§6.1);
    `make bench-baseline` re-recorded; `bench-check` tripwire re-armed at
-   the new baseline; micro-benchmark rewired to `EmitJSON`.
+   the new baseline; micro-benchmark rewired to `EmitJSON`, plus the
+   debug-heavy pruned-path variant (§2.6.3).
 7. **cleanup.** Delete the adapter, old chain, `enumBufPool`; update
-   `perf-root-cause.md` ledger; NEWS entry for the quirk rulings (§7).
+   `perf-root-cause.md` ledger; NEWS entry for ruling 3 only (rulings 1
+   and 2 and the §2.6 pre-filter are behaviour-preserving and get none).
 
 Order matters: 1 and 2 are independent and can be built in parallel; 4
 needs both; 6 before 7.
@@ -481,10 +798,12 @@ needs both; 6 before 7.
   the canary (`t.Logf` on byte diff, fail only on semantic diff);
   `TestPythonFloatRepr`/`TestPythonJSONString` stay as unit tests of the
   helpers we keep. Expected outcome: zero fixture regeneration.
-- **Charter wording.** The charter checklist says "golden serialization
-  output byte-identical to Python". This design asks to amend that line to
-  "semantically identical; byte-identical where free" — a user decision,
-  recorded in NEWS.
+- **Charter wording — AMENDED (ruling 3).** The charter checklist said
+  "golden serialization output byte-identical to Python". By user
+  directive of 2026-10-13 that requirement now reads
+  **"semantically-equivalent, byte-identical where free"**. The builder
+  records the amendment in the charter via its dedicated docs commit (Task
+  32) and Task 28 carries the NEWS entry.
 
 ### 6.2 Streaming-design risks
 
@@ -493,7 +812,10 @@ needs both; 6 before 7.
   Mitigation: `string(view)` for the cursor at the handler boundary (the
   one allocation we accept), the poison build tag in tests, and `go vet`-
   style review rule that no `RawEntry`/`RawField` type appears outside
-  `reader` and `journal`.
+  `reader` and `journal`. The ruling-2 decision record stores unit/priority
+  **views** into the batch buffer; it lives in the per-entry cache that is
+  discarded before the handler returns, so it is inside the contract — the
+  poison build covers it.
 - **Filter semantics over repeated fields.** Python's searches/secret
   filters operate on `entry.get(field)`, which is a *list* for repeated
   fields (regex on a list raises/skips). Today's Go port already has a
@@ -518,28 +840,67 @@ needs both; 6 before 7.
   Python only for adversarial journals carrying literal
   `_REALTIME_TIMESTAMP`/`_SEQNUM`/`timestamp` fields; cosmetic, coordinator
   rules with a veto mention.
+- **Emulated quirks are now load-bearing.** Rulings 1 and 2 keep two
+  behaviours that exist only because Python mutates a shared dict. They
+  are documented here and pinned by the §5.2 step-4 quirk-lock tests so
+  that a future "fix" is a deliberate, NEWS-recorded decision and not an
+  accidental drift in either direction.
+- **Pre-filter drift.** The §2.6 pre-filter duplicates the all-drop
+  outcome of step 4; if `UnitLogLevel.Decide` or the extras rules change
+  later, the two can diverge silently. Mitigation: the pre-filter calls the
+  same `Decide` and the same key-resolution helper (no second
+  implementation of the rule), and the step-4 property test compares it
+  against the full per-sender path on every run. The wrong direction
+  (pruning an entry a sender would keep) is a data-loss bug; the test
+  asserts that direction specifically.
 
-## 7. Open decisions for the user
+## 7. Rulings (user, 2026-10-13)
 
-1. **Cross-sender extras contamination** (`handler.go:148-154`): sender B
-   (filter F) today receives sender A's `extra_field_values` because the
-   processed slice is shared and mutated. Options: (a) preserve by
-   precomputing per sender the "effective extras" (union in sender order of
-   extras from cache-miss senders up to it) — zero runtime cost, keeps the
-   bug; (b) drop it: each sender gets exactly its own extras. Recommend
-   **(b)** as the operator-intended behaviour; it is operator-visible, so it
-   is the user's call. The json-cache quirk (same filter key, second
-   sender's extras ignored) is kept either way because its systest pins it.
+The three questions this design put to the user are closed as follows.
+Options not chosen are kept for the record.
+
+1. **Cross-sender extras contamination** (`handler.go:148-154`) — **ruled
+   (a): EMULATE.** Sender B (filter F2) continues to receive the
+   `extra_field_values` of every earlier cache-miss sender, because Python's
+   shared `new_entry` dict is mutated in sender order. Implementation:
+   per-sender precomputed extras fragments; the emitting sender's effective
+   extras are the union, in config order, of the fragments of the earlier
+   cache-miss (first-of-their-key) senders plus its own (§2.3). Zero runtime
+   cost beyond appending a fragment-list reference per cache-miss sender.
+   **No deviation, no NEWS entry.** User rationale: it costs nothing to
+   keep, and fixing it could break consumers that have come to rely on the
+   extra keys. Option (b) — each sender gets exactly its own extras — was
+   the architect's recommendation and is NOT taken. The json-cache quirk
+   (same filter key, second sender's extras ignored) is unaffected and
+   stays pinned by `systest/test_groundtruth_json_cache.py`.
 2. **unit_log_level after a cache hit** (`filterByLogLevel`,
-   `handler.go:341-358`): today a later sender re-parses the *cached JSON*
-   to decide the drop, so if the first sender's field filter removed
-   `PRIORITY`/`SYSTEMD_UNIT`, the second sender cannot drop. The design
-   evaluates on the real entry for every sender. Recommend **evaluate on the
-   real entry** (removes a sender-order dependence). Operator-visible in a
-   corner; user's call.
-3. **Charter amendment** on byte-identical serialization → semantic
-   equivalence with free byte-identity (§6.1), plus the `ensure_ascii`
-   option existing at all (default true, Python form).
+   `handler.go:337-358`) — **ruled (a′): cheap emulation, Python-identical
+   outcome.** On a cache hit the sender's unit-level decision is taken from
+   the live entry **only if the emitting (first) sender's field filter kept
+   BOTH `PRIORITY` and `SYSTEMD_UNIT`**; presence and value are taken from
+   that sender's **effective entry** (its field view after the ruling-1
+   effective extras have been applied, so an extras override of either key
+   is honoured). If either key was filtered out, the entry **passes** — the
+   same outcome Python produces when it `json.loads` the cached payload and
+   finds the key absent. No JSON re-parse (§2.3 decision record). **No
+   deviation, no NEWS entry.** Option (b) — evaluate on the real entry for
+   every sender, removing the sender-order dependence — was the architect's
+   recommendation and is NOT taken.
+3. **Charter amendment** — **ruled: amended.** The charter's
+   "byte-identical" serialization requirement becomes
+   **"semantically-equivalent, byte-identical where free"** (user directive
+   2026-10-13; §3.3 contract and §6.1 test changes). The `ensure_ascii`
+   option exists, default true (Python form). This is the one
+   operator-visible policy change in the design and the only one that gets
+   a NEWS entry (Task 28). The charter text itself is updated by the builder
+   in its dedicated docs commit, per the charter's own rule.
+
+No ruling is needed for §2.6.1 (in-process pre-filter, behaviour-
+preserving, in scope). §2.6.2 (journald-side PRIORITY match) is **not**
+implemented; if an operator opt-in is ever wanted it is a charter §2
+deviation requiring a user ruling at that time. §2.6.5 (two-reader
+partition) is **rejected** — the complement set is inexpressible as a
+journald match (empirically verified), so there is no opt-in to offer.
 
 Everything else in this design is behaviour-preserving and needs no
 ruling.
