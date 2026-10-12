@@ -3175,9 +3175,14 @@ Proxy selection (quirk-lock, `httpx.Httplib2Proxy`):
   with no port for an https target defaults to 443), `socks5://`/`socks://`
   map to SOCKS5, and `http://`, `https://` and any unknown scheme all become a
   plain HTTP proxy — an `https://` proxy URL is an ordinary CONNECT proxy, not
-  TLS-to-proxy. `TestHttplib2ProxyHandshake` drives a real HTTPS request
-  through a recording CONNECT proxy (set as an `https://` URL) and asserts the
-  proxy received a plain `CONNECT host:port` and the body round-tripped.
+  TLS-to-proxy. `socks4://` is REJECTED with an error at selection time
+  (`TestNormalizeHttplib2Proxy` socks4_rejected,
+  `TestHttplib2ProxySocks4Rejected`): Go has no SOCKS4 dialer and would
+  otherwise treat it as a plain HTTP proxy and emit a CONNECT handshake, so no
+  connection is attempted. `TestHttplib2ProxyHandshake` drives a real HTTPS
+  request through a recording CONNECT proxy (set as an `https://` URL) and
+  asserts the proxy received a plain `CONNECT host:port` and the body
+  round-tripped.
 
 Credentials and config:
 
@@ -3211,7 +3216,11 @@ Credentials and config:
   in-flight token fetch; that fetch is instead bounded by the shared
   transport's inactivity timeout, and the credential context must be
   LONG-LIVED (a bounded construction context would be canceled as soon as
-  `New` returned and every later fetch would fail "context canceled").
+  `New` returned and every later fetch would fail "context canceled"). On the
+  transport axis GCE/Compute METADATA credentials are the exception: their
+  `computeSource` calls `metadata.Get` through the metadata package's own
+  client, ignoring `oauth2.HTTPClient`, so the proxy/trust/timeout policy
+  applies only to the service-account and authorized-user token sources.
   `TestTokenFetchAfterConstructionAndAuthSend` proves a token is minted after
   construction and carried on a send; `TestTokenFetchUsesProxyTransport`
   proves the fetch honors `Httplib2Proxy` (oauth2.Transport.Base governs only
@@ -3220,18 +3229,28 @@ Credentials and config:
   a stalled token endpoint cannot hang the fetch.
 - Socket timeout: `googleapiclient.http.build_http` supplies
   `httplib2.Http(timeout=socket.getdefaulttimeout() or 60)`, so the shared
-  transport is built with `httpx.IdleTimeoutDialer(socketTimeout)` (60 s
-  connect plus per-read/write INACTIVITY, not a total deadline). 
+  transport is built with the phase-aware `httpx.InactivityClient`
+  (`RequestTimeout = socketTimeout`; 60 s connect plus per-read/write
+  INACTIVITY, not a total deadline) rather than the fixed-dial
+  `IdleTimeoutDialer`. A dial-baked deadline is armed when net/http's
+  background read on an IDLE pooled connection begins, so a request reusing
+  that connection shortly before the deadline inherits the remaining time and
+  can fail a healthy send; the phase-aware path clears the deadline at each
+  request boundary and arms it only for the response read
+  (`TestReusedConnectionGetsFreshDeadline` idles the connection for 200 ms of
+  a 300 ms timeout, then takes another 250 ms to respond, asserting the
+  request succeeds AND the connection was reused).
   `TestAPIInactivityTimeoutBounds` drives the production-built transport
   through a stalled response, a stalled TLS handshake (both error, bounded)
   and a slow-but-progressing transfer whose total time exceeds the timeout
   (succeeds).
-- Trust: `HTTPLIB2_CA_CERTS`, when set, is honored as the trust bundle for
-  BOTH API and token traffic (validated as a file —
-  `TestHTTPLIB2CACertsTrust`, `TestTokenFetchHonorsCACerts`,
-  `TestHTTPLIB2CACertsInvalid`). With it unset Go uses the system roots where
-  Python uses certifi/the bundled CA list — the same documented
-  default-trust deviation as the ES/OS senders.
+- Trust: `HTTPLIB2_CA_CERTS` distinguishes UNSET from EMPTY: when PRESENT it
+  must name a real file (a missing path, a directory and an EMPTY value are
+  all rejected) and is honored as the trust bundle for BOTH API and token
+  traffic — `TestHTTPLIB2CACertsTrust`, `TestTokenFetchHonorsCACerts`,
+  `TestHTTPLIB2CACertsInvalid`, `TestHTTPLIB2CACertsEmptyRejected`. With it
+  unset Go uses the system roots where Python uses certifi/the bundled CA
+  list — the same documented default-trust deviation as the ES/OS senders.
 
 Send (`google_cloud_logging.py:68-131`):
 
@@ -3294,8 +3313,11 @@ the sanctioned custom-fake/httptest route applies):
 - Construction regressions (through the production `newBaseClient` /
   `buildAuthorizedClient`): `TestTokenFetchAfterConstructionAndAuthSend`,
   `TestTokenFetchUsesProxyTransport`, `TestStalledTokenFetchIsBounded`,
-  `TestAPIInactivityTimeoutBounds`, `TestHTTPLIB2CACertsTrust`,
-  `TestTokenFetchHonorsCACerts`, `TestHTTPLIB2CACertsInvalid`.
+  `TestAPIInactivityTimeoutBounds`, `TestReusedConnectionGetsFreshDeadline`,
+  `TestHTTPLIB2CACertsTrust`, `TestTokenFetchHonorsCACerts`,
+  `TestHTTPLIB2CACertsInvalid`, `TestHTTPLIB2CACertsEmptyRejected`,
+  `TestNewEmptyServiceAccountSelectsADC` (the empty-object / null / omitted
+  cases selecting ADC with the configured project id preserved).
 - The real loop: `TestLoopRepeatedFailuresThenRecovery`.
 
 Stated deviations (also in charter §2):
@@ -3319,14 +3341,19 @@ Stated deviations (also in charter §2):
   than reproduced; operator-visible, ruled by the coordinator.
 - Token acquisition shares the transport but not the send's cancellation
   (`oauth2.TokenSource.Token()` takes no context); bounded by the transport's
-  inactivity timeout instead.
-- Go has no SOCKS4 dialer, so a `socks4://` proxy URL is returned as-is and
-  fails at dial time where httplib2 (via PySocks) would use it. PySocks is not
-  installed in the reference environment, so httplib2 there would silently
-  bypass every configured proxy — an environment property, not reproduced.
+  inactivity timeout instead. WARNING: GCE/Compute metadata credentials also
+  bypass the shared transport (their `computeSource` ignores
+  `oauth2.HTTPClient`), so the policy reaches only the SA and
+  authorized-user token sources.
+- Go has no SOCKS4 dialer, so a `socks4://` proxy URL is REJECTED with an
+  error at selection time (no connection attempted) where httplib2 (via
+  PySocks) would use it. PySocks is not installed in the reference
+  environment, so httplib2 there would silently bypass every configured proxy
+  — an environment property, not reproduced.
 - `HTTPLIB2_CA_CERTS` is honored as the trust bundle for API and token
-  traffic; with it unset Go uses the system roots where Python uses
-  certifi/the bundled CA list (same class as the ES/OS senders).
+  traffic when present (empty and non-file values rejected); with it unset Go
+  uses the system roots where Python uses certifi/the bundled CA list (same
+  class as the ES/OS senders).
 
 Execution (UNCACHED): `go test -race -count=1 ./...` PASS;
 `golangci-lint run ./...` 0 issues; `go vet ./...` clean; `go test -race
