@@ -735,6 +735,269 @@ against the injected transport where they fall short, porting
 from `test/data.py`); update parity checklist.
 Depends on: Task 13, Task 23 (shared HTTP helper).
 
+## Phase 4b — Performance and resource baseline (inserted 2026-10-12)
+
+Ordering note: this phase runs AFTER the sender phases (so the baseline is
+taken on the feature-complete binary) and BEFORE Phase 5 (so Task 28's
+NEWS can cite measured numbers and Task 30 can wire the optional CI job).
+The task is numbered 31 — the plan's numbering is strictly sequential and
+ordering is carried by the "Dependency order and milestones" section, the
+same convention the Task 23 shared-HTTP-helper block used ("no task
+renumbering"). Tasks 27–30 keep their numbers.
+
+Rationale (audit, 2026-10-12): the repo has NO performance or resource
+comparison of any kind — no Go benchmarks, no pytest-benchmark, no
+throughput/CPU/RSS assertion, no perf task in this plan, no CI perf job.
+Every existing test is correctness/parity. The migration's value claim
+includes speed and footprint, so the user directed that it be measured,
+not assumed.
+
+Revision notes (2026-10-12, three cross-review rounds): round 1 removed
+the Python-only storage-probe shim from the fixture, the gauge-based
+timing, and the "bench-check must pass" contradiction. Round 2 simplified
+the method itself: the first drafts tried to isolate "when processing
+finished" with file-growth heuristics and mid-run windows, and every
+remaining finding came from that. The PRIMARY comparison is now the WHOLE
+RUN (spawn → clean exit) and steady-state figures are optional,
+clearly-labelled secondaries that never gate anything. Round 3 corrected
+the framing of that whole-run number: the SIGTERM trigger is observed
+through a 10 s reporting throttle, so wall is an INSTRUMENTED measurement
+carrying up to one interval of observer-induced wait that is NOT equal
+between the two runs; verdicts must respect that uncertainty band. It
+also fixed the baseline invocation (`make bench-baseline`, not an
+unsupported `make` option).
+
+### Task 31. Go-vs-Python performance and resource benchmark harness + baseline
+Files: `bench/journalpump_bench.py` (driver), `bench/gen_journal.py`
+(fixture generator), `bench/report.py` (table + ratios + comparator +
+canonical-config hashing), `bench/config.json.tmpl` (the ONE config both
+binaries run), `bench/results/baseline-<YYYY-MM-DD>-<host>.json`
+(committed baseline), `docs/perf-baseline.md` (rendered table +
+environment block), `Makefile` targets `bench`, `bench-go`,
+`bench-python`, `bench-baseline`, `bench-check`, `bench-fixture`,
+`bench-test`; a small reviewed extension of
+`systest/journalpump_process.py` (see "Process ownership").
+- **Fixture — must open in BOTH unmodified production binaries**. Both
+  implementations refuse to start unless libsystemd reports
+  `sd_journal_has_persistent_files || sd_journal_has_runtime_files`
+  (`journalpump.py:432`; `internal/reader/sdjournal.go:184-194`), and
+  libsystemd derives those flags from the path prefix of the files it
+  opened (`/var/...` → persistent, `/run/...` → runtime). The Task 11
+  fixtures dodge this with a Python-only `sitecustomize` shim and a Go
+  `-tags systest` override (`files_available_systest.go`) — NEITHER is
+  admissible here: the bench runs the production `make build-go` binary
+  and an unshimmed `python3 -m journalpump`. The generated journal
+  therefore lives under a probe-accepted prefix: default
+  `BENCH_JOURNAL_DIR=/run/user/$UID/journalpump-bench/<run-id>/` (tmpfs,
+  user-writable, runtime flag), fallback
+  `/var/tmp/journalpump-bench/<run-id>/` (persistent flag), selected via
+  `journal_path` in the shared config. The prefix rule is confirmed
+  empirically by a **preflight**: the driver starts each production
+  binary unshimmed against the fixture, requires `READY=1` and non-zero
+  growth of the output file within 10 s, and aborts the whole run with a
+  diagnostic if either implementation rejects the layout.
+  `gen_journal.py` emits a deterministic journal export stream (seeded
+  PRNG; `MESSAGE` 80–400 B, `_SYSTEMD_UNIT`, `PRIORITY`, `_PID`,
+  `SYSLOG_IDENTIFIER`, a handful of custom fields, every 1000th entry
+  invalid-UTF-8 to exercise the D8 repr path) and builds `.journal`
+  files with `systemd-journal-remote -o` (root-free). Default
+  `BENCH_ENTRIES=200000`; the journal is not committed (size), the
+  generator + seed are, and every result records the export stream's
+  SHA-256. No live-journald generation, no shim fallback of any kind.
+- **Workload and fairness**: identical `journalpump.json` rendered from
+  the template for both — one reader (`journal_path` → fixture dir,
+  `initial_position: head`), one **file sender** with `file_output` on
+  tmpfs (`/dev/shm` or `$BENCH_TMPFS`), `statsd` pointed at the bench's
+  own UDP listener, `log_level: WARNING`. The file sender is the lightest
+  sink in both implementations, so the number measures reader +
+  filtering + JSON serialization + the shared flush loop — the parts the
+  port changed — not a sink. Its buffering is recorded in the report, not
+  altered: neither implementation fsyncs; Python's `open(..., "ab")`
+  default `BufferedWriter`, Go's 128 KiB `bufio.Writer`
+  (`file.go:33,329`); both flush on buffer fill and at shutdown. Go
+  binary = production `make build-go` output, NOT the `-race -tags
+  systest` systest build; no `JOURNALPUMP_POLL_INTERVAL_MS` /
+  `JOURNALPUMP_FILES_AVAILABLE` shims (the driver asserts they are
+  unset). Same env, same cgroup, cold start each run; the driver records
+  the CPU governor and refuses to run unless it is `performance` or
+  `BENCH_ALLOW_ANY_GOVERNOR=1`.
+- **Process ownership and rusage**: `systest/journalpump_process.py`
+  reaps its child via `Popen.poll()/wait()`, after which `os.wait4` can
+  no longer recover rusage. The bench reuses ONLY the harness's command
+  selection and environment construction (`JOURNALPUMP_BIN` → argv;
+  `RUNTIME_DIRECTORY`, abstract `NOTIFY_SOCKET` listener,
+  `PYTHONUNBUFFERED`) and OWNS spawning and the single reap: one
+  `os.wait4(pid, 0)` call, never `poll()`/`wait()`/`communicate()` on
+  that pid. A reviewed harness extension is authorized: factor the
+  argv/env/notify-listener construction out of `JournalpumpProcess.start`
+  into importable helpers with no behavior change for the systests
+  (their suites are the regression gate). `python3 -m journalpump` is the
+  direct child in both cases, so rusage covers the whole implementation.
+- **Run protocol — the whole run is the unit of measurement**. Per run:
+  `t_spawn` → wait for `READY=1` (`t_ready`) → wait until the
+  implementation's own terminal gauge `journal.sent_lines`, received on
+  the bench's statsd listener, equals `BENCH_ENTRIES` (`t_confirm`;
+  this is a CORRECTNESS confirmation that everything was processed, and
+  the SIGTERM trigger — it is not a timing boundary) → SIGTERM
+  (`t_sigterm`) → `wait4` returns (`t_exit`, rusage). Wall deliberately
+  INCLUDES shutdown: Go's D9 grace-flush and final file flush, Python's
+  daemon-thread exit — that is the operator-visible cost of a complete
+  run. Post-exit correctness (a FAILED run, never a silently reported
+  one): exit code 0; output line count == `BENCH_ENTRIES` for Go, and
+  for Python ≥ `BENCH_ENTRIES` minus one buffer's worth of entries
+  (Python drops its unflushed tail on SIGTERM, D9) — the exact Python
+  count is recorded. Hard timeout `BENCH_TIMEOUT` (default 600 s) → run
+  FAILED, not hung.
+- **Measurement uncertainty — stated, not assumed away**. The gauge that
+  triggers SIGTERM is emitted through a 10 s per-reader throttle in both
+  implementations (`inc_line_stats`), so SIGTERM lands anywhere from ~0 s
+  to ~one reporting interval after processing actually finished,
+  depending on where the finish falls in the throttle phase. That wait is
+  OBSERVER-INDUCED, it is part of the measured wall, and it is NOT equal
+  between the two implementations or between two runs of the same one;
+  `t_confirm − t_ready` is recorded but does not isolate it, and the
+  phase effect need not show up in min/max ranges. Consequently wall and
+  every figure derived from it (entries/s, MB/s) are labelled
+  **INSTRUMENTED whole-run measurements** in the table and the JSON, with
+  the uncertainty bound printed beside them: ≈ one reporting interval
+  (10 s), which at the baseline's 60 s minimum wall is ≤ 1/6 of wall.
+  CPU and peak RSS are NOT subject to this bound in the same way (an
+  idle wait burns negligible CPU and does not raise peak RSS); they carry
+  only the min/max noise band.
+- **PRIMARY metrics (per run, from the driver, no code change to either
+  implementation)**: total wall = `t_exit − t_spawn` (instrumented, see
+  above); startup = `t_ready − t_spawn` (reported, informational); total
+  CPU user+sys and peak RSS (`ru_maxrss`) from `wait4` rusage over the
+  whole lifetime; end-to-end throughput = `BENCH_ENTRIES / wall`
+  (entries/s) and output bytes / wall (MB/s) (instrumented). These need
+  no completion heuristic and directly answer "is Go faster and lighter
+  than Python on the same work" within the stated uncertainty. Runs: 1
+  warm-up (discarded) then `BENCH_RUNS=5` measured per implementation;
+  report median plus min/max per metric.
+- **SECONDARY metrics (optional, labelled, never gating)**: the driver
+  samples output-file size and `/proc/<pid>/status` `VmRSS` every 100 ms
+  for the run's lifetime. From the OBSERVED growth samples it reports
+  steady-state throughput = least-squares slope over the middle 50 % of
+  growth samples (between first and last observed growth), and
+  steady-state RSS = median `VmRSS` over the same sample range. If fewer
+  than 20 growth samples exist (short runs, smoke test) both are reported
+  as `unavailable` with the sample count — never a failure, never a
+  comparison input. Their caveat (file grows only on buffer fill, so the
+  slope is quantised by the 128 KiB / `BufferedWriter` flush size) is
+  printed with them. `bench-check` ignores them entirely.
+- **Ratio direction (explicit)**: every ratio is `Go / Python` of
+  medians. For wall, startup, CPU and RSS a ratio < 1 means Go is better;
+  for entries/s and MB/s a ratio > 1 means Go is better. The table carries
+  a per-row "better when" column (`<1` / `>1`) and a derived
+  "improvement" column computed with the correct direction, so no reader
+  has to invert. `bench/report.py` tests cover both directions,
+  ratio = 1, and a Go-worse case.
+- **Two separate comparisons, two separate outcomes**:
+  (1) **Go-vs-Python result** — always REPORTED (table + ratios +
+  per-metric verdict), NEVER a failure. The verdict for each metric is
+  one of "Go better" / "Python better" / "within measurement uncertainty
+  — no clear difference", and it MUST account for the uncertainty above:
+  for the instrumented metrics (wall, entries/s, MB/s) a difference of
+  medians is only called a win when it exceeds the reporting-interval
+  bound (|Go wall − Python wall| > one interval, and correspondingly for
+  the derived rates) AND the two min/max ranges do not overlap; for CPU
+  and RSS the non-overlap test alone applies. Anything else is reported
+  as "within measurement uncertainty — no clear difference", never as a
+  Go or Python win. If Go loses on any metric the task still completes;
+  the finding goes in the report and the charter ledger row for a user
+  decision. (2) **Baseline regression tripwire** — Go-current vs
+  Go-baseline, PRIMARY metrics only; exits non-zero ONLY when a Go
+  primary metric regresses by more than 50 % in the worse direction
+  relative to the baseline median (one threshold constant in
+  `bench/report.py`; at the 60 s minimum wall the 10 s bound is well
+  inside that margin), and only when the two results are **compatible**.
+  Compatibility key = (host label, fixture SHA-256, `BENCH_ENTRIES`,
+  **canonical config hash**, CPU model + online count, cgroup `cpu.max`
+  and `memory.max` of the bench's own cgroup, governor, kernel release).
+  Any mismatch downgrades the comparison to INFORMATIONAL with the
+  differing keys listed — never a failure.
+- **Canonical config hash**: the hash is NOT of the rendered file (which
+  carries run-local paths and ports) but of a canonical form produced by
+  `bench/report.py`: parse the rendered config, replace `journal_path`,
+  `file_output`, the statsd `host`/`port`, and any `RUNTIME_DIRECTORY`-
+  derived path with fixed placeholders, keep every behavior-affecting
+  key (filters, `max_send_interval`, `msg_buffer_max_length`,
+  `initial_position`, `log_level`, …), then `json.dumps(sort_keys=True,
+  separators=(",", ":"))` → SHA-256. Two independently rendered runs with
+  different run-ids/ports MUST hash equal; changing any behavior key MUST
+  change the hash — both are unit-tested, so `bench-check`'s
+  self-comparison against the committed baseline can actually succeed.
+- **Baseline**: `make bench-baseline` (a dedicated target that invokes
+  the driver with `--baseline`; `make bench` never does) writes
+  `bench/results/baseline-<date>-<host>.json` plus `docs/perf-baseline.md`
+  and refuses unless `BENCH_ENTRIES ≥ 200000` (constant `BASELINE_MIN_
+  ENTRIES`) AND the measured Go median wall is ≥ 60 s (constant
+  `BASELINE_MIN_WALL_S`), so the 10 s reporting-interval bound is ≤ 1/6
+  of wall and the secondaries are available; the result records the full
+  compatibility key plus Go/Python/python-systemd/systemd versions and
+  `git describe`.
+- **Non-goals**: not a correctness gate; not a PR blocker; `bench-check`
+  is not in the required CI set (Task 30 may add it as an informational
+  `workflow_dispatch`/nightly job); no `testing.B` micro-benchmarks (a
+  later task may add them where this harness points at a hot spot); no
+  tuning work; no change to either implementation; no attempt to
+  isolate "processing finished" more finely than the whole run, and no
+  attempt to subtract the observation wait from wall.
+Acceptance: `make bench-baseline` on the defined machine produces
+`docs/perf-baseline.md` with the Go-vs-Python PRIMARY table (total wall,
+startup, CPU user+sys, peak RSS, entries/s, MB/s, output bytes, exit
+code, `t_confirm − t_ready`) in which wall and the derived rates are
+labelled INSTRUMENTED with the ≈ one-interval uncertainty bound printed
+beside them, correctly directed ratios, and a per-metric verdict that
+follows the uncertainty rule above; the SECONDARY table (steady-state
+entries/s, steady-state RSS, or `unavailable` with sample count) under
+its caveat; and the environment/compatibility block filled; the baseline
+JSON is committed; `make bench-check` re-run against the committed
+baseline on the same host reports a COMPATIBLE comparison with no
+regression (tripwire self-consistency) and reports the Go-vs-Python
+outcome whatever it is — a Go loss or a "no clear difference" is a
+recorded result, not an acceptance failure; `BENCH_ENTRIES=5000
+BENCH_RUNS=1 BENCH_WARMUP=0 make bench` completes without timeout (no
+fixed wall-clock acceptance number).
+Tests (all collected by the new `make bench-test` target, which runs
+`make build-go` first so the production binary exists, then `python3 -m
+pytest bench/ systest/test_bench_smoke.py`; neither `make unittest`
+(targets `test/`) nor `make systest` collects `bench/`, and no perf
+threshold is asserted anywhere in this target):
+`systest/test_bench_smoke.py` — runs the driver with `BENCH_ENTRIES=2000`,
+`BENCH_RUNS=1`, `BENCH_WARMUP=0` against BOTH binaries (`JOURNALPUMP_BIN`
+parametrized like the other dual-implementation suites; the preflight is
+exercised as part of it) and asserts per-field validity — exit code 0,
+timestamps monotone `t_spawn ≤ t_ready ≤ t_confirm ≤ t_sigterm ≤ t_exit`
+(lifecycle ordering via timestamps, not "one phase outlasts another"),
+durations finite and ≥ 0, entries/s and MB/s > 0, peak RSS > 0, CPU ≥ 0,
+output line-count rule above, the instrumented label and uncertainty
+bound present on wall/rates, secondaries either numeric or `unavailable`
+with a sample count; NO threshold on any timing. `bench/test_report.py` —
+median/min/max, ratio arithmetic in both directions, per-metric verdict
+including the uncertainty rule (a wall difference smaller than one
+interval → "within measurement uncertainty" even with non-overlapping
+ranges; a difference larger than one interval with overlapping ranges →
+also "within measurement uncertainty"; both conditions met → a win in the
+correct direction; CPU/RSS verdicts use the non-overlap test only),
+comparator on regressed / improved / compatible-no-change /
+incompatible-informational inputs, secondaries ignored by the comparator,
+environment-mismatch listing, canonical config hash (equal across two
+renders with different run-local values; changed by a behavior key;
+placeholder set covers every run-local key the template emits).
+`bench/test_gen_journal.py` — deterministic for a seed (SHA-256 stable
+across two generations), exactly N entries, the invalid-UTF-8 cadence
+present.
+Parity checklist: `docs/go-test-parity.md` gains a `## Task 31` section
+recording all three as `go-native` (reason: performance harness, no
+Python counterpart; outside the ~127 Python parity set Task 29 counts).
+Charter ledger row 31 via the builder-only docs commit as usual.
+Depends on: Task 18 (Milestone A — working Go binary, file sender,
+`make build-go`), Task 10 (`JOURNALPUMP_BIN` selection + notify listener
+helpers), Task 13 (`journal.sent_lines` gauge from the shared sender
+loop); ordered after Tasks 25/26 so the baseline is taken on the
+feature-complete binary.
+
 ## Phase 5 — Packaging, docs, cutover
 
 ### Task 27. Packaging on the branch (D1, D7)
@@ -845,5 +1108,12 @@ Depends on: Task 18.
   closes with the shared HTTP helper extraction (logplex + ES refactor).
 - 25/26 (Phase 4, parallelizable, need 13; 26 also needs the Task 23
   shared HTTP helper).
+- **31 (Phase 4b, inserted 2026-10-12) runs after 25/26 and BEFORE 27** —
+  hard prerequisites are 18, 10 and 13; the after-25/26 ordering is so
+  the committed baseline measures the feature-complete binary. Task 28
+  cites its numbers in NEWS; Task 30 may add `make bench-check` as an
+  informational `workflow_dispatch`/nightly job and `make bench-test` to
+  the correctness systest job, never a perf threshold as a required
+  check. Numbered 31 to avoid renumbering 27–30.
 - 27→28→29→30 (Phase 5). **Milestone C** after 30: installable
   golang-marked packages + full CI parity.
