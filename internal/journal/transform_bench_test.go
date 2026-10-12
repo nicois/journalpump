@@ -239,3 +239,75 @@ func BenchmarkMaterializeAlike(b *testing.B) {
 		}
 	}
 }
+
+// benchBatch encodes the fixture fields as one jp_read_batch entry record
+// and parses it, giving EmitJSON the real raw representation.
+func benchBatch() *Batch {
+	raw := benchRawFields(benchMessage())
+	cursor := raw[0].Value.([]byte)
+	realtime := uint64(1600000299999000)
+	buf := make([]byte, 0, 1024)
+	put := func(v uint64, n int) {
+		for i := 0; i < n; i++ {
+			buf = append(buf, byte(v>>(8*i)))
+		}
+	}
+	put(realtime, 8)
+	put(uint64(len(cursor)), 2)
+	buf = append(buf, cursor...)
+	put(uint64(len(raw)), 4)
+	for _, field := range raw {
+		tuple := append([]byte(field.Key), '=')
+		tuple = append(tuple, field.Value.([]byte)...)
+		put(uint64(len(tuple)), 4)
+		buf = append(buf, tuple...)
+	}
+	b := &Batch{Buf: buf}
+	if _, err := ParseBatch(b, len(buf), 1); err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// BenchmarkEmitJSON is the streaming emitter over the same fixture: the
+// number the whole-run read path now pays for the transform half.
+func BenchmarkEmitJSON(b *testing.B) {
+	batch := benchBatch()
+	entry := &batch.Entries[0]
+	opts := &EmitOptions{}
+	dst := make([]byte, 0, 512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var err error
+	for i := 0; i < b.N; i++ {
+		dst, err = EmitJSON(dst[:0], batch, entry, opts)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = dst
+}
+
+// BenchmarkEmitJSONWithSender adds a field filter and a few extras, the
+// realistic per-sender shape.
+func BenchmarkEmitJSONWithSender(b *testing.B) {
+	batch := benchBatch()
+	entry := &batch.Entries[0]
+	sender := SenderTarget{ExtraFieldValues: []Field{
+		{Key: "env", Value: "prod"},
+		{Key: "region", Value: "eu-1"},
+		{Key: "cluster", Value: "bench"},
+	}}
+	opts := &EmitOptions{Extras: targetExtraFragments(sender)}
+	dst := make([]byte, 0, 512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var err error
+	for i := 0; i < b.N; i++ {
+		dst, err = EmitJSON(dst[:0], batch, entry, opts)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = dst
+}
