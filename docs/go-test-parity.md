@@ -3168,9 +3168,16 @@ Proxy selection (quirk-lock, `httpx.Httplib2Proxy`):
   a present-but-empty lowercase value DISABLING that scheme with no uppercase
   fallback, `no_proxy` lowercase-then-uppercase with `*` bypassing everything,
   case-sensitive bare-hostname matching and no `ALL_PROXY` fallback
-  (`internal/httpx/httpx_test.go:TestHttplib2Proxy`). The oauth2 token source
-  is wrapped over the same httpx base transport, so token fetches share the
-  policy.
+  (`internal/httpx/httpx_test.go:TestHttplib2Proxy`). The selected proxy URL
+  is then normalized to httplib2's `proxy_info_from_url` rules
+  (`normalizeHttplib2Proxy`, `TestNormalizeHttplib2Proxy`): the port defaults
+  from the DESTINATION scheme (`https`→443, `http`→80, so an `http://` proxy
+  with no port for an https target defaults to 443), `socks5://`/`socks://`
+  map to SOCKS5, and `http://`, `https://` and any unknown scheme all become a
+  plain HTTP proxy — an `https://` proxy URL is an ordinary CONNECT proxy, not
+  TLS-to-proxy. `TestHttplib2ProxyHandshake` drives a real HTTPS request
+  through a recording CONNECT proxy (set as an `https://` URL) and asserts the
+  proxy received a plain `CONNECT host:port` and the body round-tripped.
 
 Credentials and config:
 
@@ -3185,12 +3192,46 @@ Credentials and config:
   OVERRIDES the configured one (`TestNewServiceAccountOverridesProjectID`
   uses the `test/data.py` GCP key fixture copied to
   `internal/sender/gcl/testdata/gcp_private_key.pem`). Otherwise application
-  default credentials are found. The log-write scope is requested explicitly
-  (Python passes no scopes to google-auth).
+  default credentials are found. An EMPTY
+  `google_service_account_credentials` object is treated as absent (Python
+  `if google_service_account:` is falsey for `{}`), so ADC is selected.
+  The log-write scope (`logging.write`) is requested explicitly. Python's
+  EFFECTIVE scopes differ: the caller passes no `client_options.scopes`, but
+  `discovery.build` then applies the Logging v2 discovery document's scope
+  list to any credentials whose `requires_scopes` is true — `cloud-platform`,
+  `cloud-platform.read-only`, `logging.admin`, `logging.read`,
+  `logging.write` — so a Python service account ends up with the WIDER set
+  while Go requests the narrower `logging.write` (sufficient to write;
+  documented, not reproduced).
 - Cancellation: the generated `Entries.Write` call takes the request context
   everywhere (`...Write(req).Context(ctx).Do()`), so a batch in flight is
-  cancellable at shutdown — no sarama/gorilla-class cancellation gap. Flagged
-  early per the task and confirmed clean.
+  cancellable at shutdown — no sarama/gorilla-class cancellation gap for API
+  requests. Token ACQUISITION is the exception: `oauth2.TokenSource.Token()`
+  takes no context, so a send's cancellable context does not reach an
+  in-flight token fetch; that fetch is instead bounded by the shared
+  transport's inactivity timeout, and the credential context must be
+  LONG-LIVED (a bounded construction context would be canceled as soon as
+  `New` returned and every later fetch would fail "context canceled").
+  `TestTokenFetchAfterConstructionAndAuthSend` proves a token is minted after
+  construction and carried on a send; `TestTokenFetchUsesProxyTransport`
+  proves the fetch honors `Httplib2Proxy` (oauth2.Transport.Base governs only
+  the API request, so the fetch is pointed at the shared transport via the
+  `oauth2.HTTPClient` context value); `TestStalledTokenFetchIsBounded` proves
+  a stalled token endpoint cannot hang the fetch.
+- Socket timeout: `googleapiclient.http.build_http` supplies
+  `httplib2.Http(timeout=socket.getdefaulttimeout() or 60)`, so the shared
+  transport is built with `httpx.IdleTimeoutDialer(socketTimeout)` (60 s
+  connect plus per-read/write INACTIVITY, not a total deadline). 
+  `TestAPIInactivityTimeoutBounds` drives the production-built transport
+  through a stalled response, a stalled TLS handshake (both error, bounded)
+  and a slow-but-progressing transfer whose total time exceeds the timeout
+  (succeeds).
+- Trust: `HTTPLIB2_CA_CERTS`, when set, is honored as the trust bundle for
+  BOTH API and token traffic (validated as a file —
+  `TestHTTPLIB2CACertsTrust`, `TestTokenFetchHonorsCACerts`,
+  `TestHTTPLIB2CACertsInvalid`). With it unset Go uses the system roots where
+  Python uses certifi/the bundled CA list — the same documented
+  default-trust deviation as the ES/OS senders.
 
 Send (`google_cloud_logging.py:68-131`):
 
@@ -3203,9 +3244,17 @@ Send (`google_cloud_logging.py:68-131`):
   appended; if the recomputed entry still exceeds the quota — or the entry has
   no `MESSAGE` — the entry becomes the MESSAGE-only DEFAULT replacement. A
   non-string `MESSAGE` on the oversized path is an error (Python's slice would
-  raise). `TestBigLogEntryIsTruncated` (the Python fixture's `257_00` is below
-  the quota, so the MESSAGE passes through), `TestBigLogEntrySendsDefault`,
-  `TestTruncatedMessageAppendsMarker`, `TestMissingMessageOnOversizedEntry`.
+  raise). The recompute reproduces Python's
+  `json.dumps(msg, ensure_ascii=False).encode("utf-8")` byte count
+  (`pythonJSONSize`), including its `", "/": "` separators and its raw-UTF-8
+  treatment of U+2028/U+2029 — encoding/json escapes those into six bytes
+  even with `SetEscapeHTML(false)`, which would over-count a message of
+  U+2028/U+2029 runes past the quota and DISCARD content by swapping in the
+  DEFAULT replacement (`TestUnicodeLineSeparatorSizeMatchesPython`,
+  `TestPythonJSONSize`). `TestBigLogEntryIsTruncated` (the Python fixture's
+  `257_00` is below the quota, so the MESSAGE passes through),
+  `TestBigLogEntrySendsDefault`, `TestTruncatedMessageAppendsMarker`,
+  `TestMissingMessageOnOversizedEntry`.
 - Entry build: `timestamp` and `PRIORITY` are popped; a present string
   timestamp is cut to 26 characters with `Z` appended
   (`TestCorrectTimestamp`, `TestTimestampTruncatedTo26Chars`); `PRIORITY`
@@ -3222,6 +3271,12 @@ Send (`google_cloud_logging.py:68-131`):
   does not wait twice (`TestFailurePathOrderAndBackoff`,
   `TestBadRequestNotMarkedSent`, `TestWriteHTTPErrorFailsBatch`). Never marked
   sent on failure — the loop retries the batch.
+  `TestLoopRepeatedFailuresThenRecovery` drives this through the REAL
+  `sender.Loop` under synctest: repeated failures produce a NON-escalating
+  backoff (≥7 attempts in 10 virtual seconds where an escalating schedule
+  would give ~4), the sent count stays 0 and the failed-batch cursor stays
+  unchanged, health reports `disconnected` with the error recorded, and on
+  recovery the sent count, cursor and `connected` health all converge.
 
 Tests (Go's `logging/v2` ships no generated mock, so — as with CloudWatch —
 the sanctioned custom-fake/httptest route applies):
@@ -3236,26 +3291,44 @@ the sanctioned custom-fake/httptest route applies):
   `TestBigLogEntryIsTruncated`, `TestBigLogEntrySendsDefault` (all seven
   Python cases), plus `TestParseConfig`, `TestNewMissingProjectID`,
   `TestInvalidJSONMessageFailsBatch`, `TestMaintenanceOperationsIsNoOp`.
+- Construction regressions (through the production `newBaseClient` /
+  `buildAuthorizedClient`): `TestTokenFetchAfterConstructionAndAuthSend`,
+  `TestTokenFetchUsesProxyTransport`, `TestStalledTokenFetchIsBounded`,
+  `TestAPIInactivityTimeoutBounds`, `TestHTTPLIB2CACertsTrust`,
+  `TestTokenFetchHonorsCACerts`, `TestHTTPLIB2CACertsInvalid`.
+- The real loop: `TestLoopRepeatedFailuresThenRecovery`.
 
 Stated deviations (also in charter §2):
 
-- Compact-JSON size approximation: the recomputed entry size that decides the
-  DEFAULT fallback is measured against compact JSON rather than Python's
-  `", "/": "` separators, so the threshold can differ by a couple of bytes per
-  field. The raw-message quota gate is byte-identical. (The Python source
-  concedes the same "not exactly 256KB" approximation.)
-- Optimistic-reconnect final health state — FLAGGED for the coordinator →
-  user. Python marks disconnected, backs off and then unconditionally calls
-  `mark_connected()`, so a persistently failing GCL sender reports health
-  `connected`, clears its error ring and never escalates its backoff. The Go
-  sender reproduces the non-escalating backoff (it re-marks connected through
-  the loop's connection seam before returning a `BackoffError`, resetting the
-  shared exponent), but the shared loop owns the connected flag and the
-  disconnected/error-ring bookkeeping, so after a failed batch the state file
-  reports `disconnected` with the error recorded until the next successful
-  batch. Documented rather than reproduced; operator-visible.
+- Quota size probe: the recomputed-entry size that decides the DEFAULT
+  fallback reproduces Python's `json.dumps(msg, ensure_ascii=False)` byte
+  count — separators and raw-UTF-8 U+2028/U+2029 included. The only residual
+  difference is NUMBER spelling (Python re-serializes floats via `repr`, Go
+  re-emits `json.Number` literals), which the quota probe does not reproduce.
+  The raw-message quota gate is byte-identical.
+- Optimistic-reconnect final health state — RETAINED by coordinator ruling
+  (Python's false-success reset is incorrect). Python marks disconnected,
+  backs off and then unconditionally calls `mark_connected()`, so a
+  persistently failing GCL sender reports health `connected`, clears its
+  error ring and never escalates its backoff. The Go sender reproduces the
+  non-escalating backoff (it re-marks connected through the loop's connection
+  seam before returning a `BackoffError`, resetting the shared exponent), but
+  the shared loop owns the connected flag and the disconnected/error-ring
+  bookkeeping, so after a failed batch the state file reports `disconnected`
+  with the error recorded until the next successful batch. Documented rather
+  than reproduced; operator-visible, ruled by the coordinator.
+- Token acquisition shares the transport but not the send's cancellation
+  (`oauth2.TokenSource.Token()` takes no context); bounded by the transport's
+  inactivity timeout instead.
+- Go has no SOCKS4 dialer, so a `socks4://` proxy URL is returned as-is and
+  fails at dial time where httplib2 (via PySocks) would use it. PySocks is not
+  installed in the reference environment, so httplib2 there would silently
+  bypass every configured proxy — an environment property, not reproduced.
+- `HTTPLIB2_CA_CERTS` is honored as the trust bundle for API and token
+  traffic; with it unset Go uses the system roots where Python uses
+  certifi/the bundled CA list (same class as the ES/OS senders).
 
 Execution (UNCACHED): `go test -race -count=1 ./...` PASS;
 `golangci-lint run ./...` 0 issues; `go vet ./...` clean; `go test -race
--count=1 -tags systest ./systest-go/...` PASS (144.8 s). Ledger row 26 stays
+-count=1 -tags systest ./systest-go/...` PASS. Ledger row 26 stays
 `review`.
