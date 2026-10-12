@@ -3045,16 +3045,11 @@ stays `review`.
   `AWS_ACCESS_KEY`/`AWS_SECRET_KEY` in `resolveConfig`, but the SDK's OWN
   credential chain still reads them, and `config.resolveCredentialChain` picks
   the environment branch (aliases included) whenever no explicit profile is
-  set. So an implicit default-profile identity could be replaced by the
-  aliases. The resolver now ALWAYS passes an explicit static provider — the
-  config pair, else the env pair (`AWS_ACCESS_KEY_ID` only), else the
-  default/selected profile's static pair, resolved per botocore precedence — so
-  the SDK never performs its own source selection and never mutates the
-  process-global environment. `TestSDKCredentialLegacyAliasesIgnored` drives
-  `resolveConfig` → `loadAWSConfig` → `Retrieve` with ACTUAL environment
-  variables and an implicit default profile: a bare SDK chain selects the
-  aliases (asserted non-vacuously), while the resolved provider yields the
-  profile identity; the canonical env pair still wins.
+  set. Round 4 addressed this by ALWAYS passing an explicit static provider
+  (config pair, else env pair, else the profile's static pair) plus a forced
+  default profile. That was SUPERSEDED in round 5 (see below): it broke the
+  web-identity branch, and the residual alias behavior is now a documented §2
+  deviation instead. Kept here for history.
 - **Item 2 — profile resolution (`client.go`).** The hand-rolled shared-config
   scanner is replaced by `config.LoadSharedConfigProfile` (the SDK's own
   loader), which exposes `CustomCABundle`, `RetryMaxAttempts`, and `RetryMode`.
@@ -3081,3 +3076,44 @@ Execution after the round-4 code commit (UNCACHED): `go test -race -count=1
 green; `go test -race -count=1 -tags systest ./systest-go/...` PASS (144.4 s);
 `JOURNALPUMP_BIN=go python -m pytest -q systest/` 38 passed; `python -m
 pytest -q test/` 160 passed. Ledger row 25 stays `review`.
+
+### Task 25 review round 5 (coordinator ruling: use the native credential chain)
+
+- **Reverted the round-4 credential injection.** The hand-injected static
+  provider and the forced `WithSharedConfigProfile("default")` are removed.
+  `resolveConfig` and `loadOptions` now inject ONLY the journalpump config pair
+  (the native chain cannot see journalpump config keys); every other source —
+  the environment pair, web identity
+  (`AWS_WEB_IDENTITY_TOKEN_FILE`/`AWS_ROLE_ARN`), container credentials, IMDS,
+  and shared-config profiles — is resolved by the SDK's native chain. The forced
+  default profile was what broke the web-identity branch (it skipped the
+  `envConfig.WebIdentityTokenFilePath` case); the provider injection had also
+  reintroduced alias handling that was worse than leaving the chain alone.
+- **Verification (`TestSDKCredentialNativeChain`, production loader).** Four
+  subtests drive `resolveConfig` → `loadAWSConfig` → `Retrieve`: the standard
+  env pair with session token; web identity (local STS via
+  `AWS_ENDPOINT_URL_STS`, since the provider builds its STS call before the
+  config BaseEndpoint resolver runs); container `FULL_URI`; and IMDS via
+  `AWS_EC2_METADATA_SERVICE_ENDPOINT`. `TestBuildSDKClientDiscoveryBounded`
+  continues to cover the bounded IMDS discovery path.
+  `TestSDKCredentialConfigAndProfilePrecedence` covers the injected config pair,
+  an explicit `AWS_PROFILE`, and env-over-default-profile.
+- **Residual differences documented, not chased (charter §2 a/b).**
+  (a) the SDK honours the legacy `AWS_ACCESS_KEY`/`AWS_SECRET_KEY` aliases
+  (`TestSDKCredentialLegacyAliasDeviation` pins the deviation: with the aliases
+  set and no canonical pair, the alias identity wins over the default profile,
+  where botocore's `EnvProvider` would ignore them); (b) when
+  `AWS_PROFILE`/`AWS_DEFAULT_PROFILE` is set the SDK resolves credentials from
+  that profile and skips the environment pair, whereas botocore's env provider
+  takes precedence over the profile.
+- **Per-case disposition.** Standard env / web identity / container / IMDS:
+  verified working via the native chain (no fix needed). Legacy aliases: not
+  fixable via an SDK extension point without re-breaking web identity (the only
+  hook is the provider injection that caused the regression) → documented.
+  Env-vs-explicit-profile precedence: same reasoning → documented.
+
+Execution after the round-5 code commit (UNCACHED): `go test -race -count=1
+./...` PASS; `make lint-go` 0 issues; `make build-go` green; `go test -race
+-count=1 -tags systest ./systest-go/...` PASS (144.0 s); `JOURNALPUMP_BIN=go
+python -m pytest -q systest/` 38 passed; `python -m pytest -q test/` 160
+passed. Ledger row 25 stays `review`.
