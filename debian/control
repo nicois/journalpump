@@ -2,20 +2,13 @@ Source: journalpump
 Maintainer: Hannu Valtonen <hannu.valtonen@ohmu.fi>
 Section: python
 Priority: optional
-Build-Depends: debhelper (>= 8), dh-python, dh-systemd,
- python3-all (>= 3.13), python3-setuptools,
- python3-requests, python3-systemd
-X-Python3-Version: >= 3.13
+Build-Depends: debhelper (>= 13), golang-go (>= 2:1.21~), gcc
 Standards-Version: 3.9.4
 Homepage: https://github.com/aiven/journalpump
 
 Package: journalpump
-Architecture: all
-Depends: ${misc:Depends}, ${python3:Depends}, adduser,
- python3-elasticsearch, python3-kafka,
- python3-requests, python3-systemd,
- python3-botocore, python3-googleapi,
- python3-websockets, python3-aiohttp-socks, python3-snappy
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser, libsystemd0, ca-certificates
 Description: daemon that takes log messages from journald and pumps them
  to a given output.  Currently supported outputs are Elasticsearch, Kafka,
  Websocket, logplex, AWS CloudWatch and Google Cloud Logging. It reads

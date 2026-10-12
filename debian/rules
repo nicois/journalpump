@@ -1,6 +1,44 @@
 #!/usr/bin/make -f
 
-export PYBUILD_NAME=journalpump
+export DH_VERBOSE=1
+# Keep the Go module/build caches inside the build tree: dpkg-buildpackage
+# runs with a minimal environment (HOME may be unset), and the distro Go has
+# to be able to fetch the go.mod-pinned modules (and, when the distro toolchain
+# is older than the go.mod directive, the pinned toolchain) from the network.
+# This is a maintainer build, not a network-isolated one.
+export GOPATH=$(CURDIR)/.gopath
+export GOCACHE=$(CURDIR)/.gocache
+export GOFLAGS=-mod=mod
+# The declared build dependency only guarantees a Go new enough to support
+# toolchain switching (golang-go >= 2:1.21); GOTOOLCHAIN=auto lets that Go
+# fetch and run the go.mod-pinned toolchain (now 1.27) instead of failing on
+# the version mismatch.
+export GOTOOLCHAIN=auto
+
+VERSION := $(shell dpkg-parsechangelog -SVersion)
 
 %:
-	dh $@ --with python3 --with systemd --buildsystem=pybuild
+	dh $@
+
+override_dh_auto_clean:
+	$(MAKE) clean
+	$(RM) -r .gopath .gocache
+
+override_dh_auto_build:
+	$(MAKE) build-go VERSION=$(VERSION)
+
+# The Go build has no in-tree test step here; the packaging tests (the
+# package build smoke test and the container install-and-start check) are
+# run by scripts/check-packaging and scripts/systest-package-on-podman.
+override_dh_auto_test:
+
+# The built binary is installed via debian/install.  The unchanged unit must
+# ship as journalpump.service, but the in-tree source is journalpump.unit and
+# dh_install cannot rename files, so install it here with the service name.
+override_dh_auto_install:
+	install -Dm0644 journalpump.unit debian/journalpump/usr/lib/systemd/system/journalpump.service
+
+# Go's DWARF uses compressed sections that dwz cannot process ("Found
+# compressed .debug_aranges section"); skip the optional DWARF compression
+# step (the binary is still stripped by dh_strip).
+override_dh_dwz:

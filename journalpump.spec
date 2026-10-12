@@ -1,29 +1,28 @@
 Name:           journalpump
 Version:        %{major_version}
-Release:        %{minor_version}%{?dist}
+Release:        %{minor_version}.golang%{?dist}
 Url:            http://github.com/aiven/journalpump
 Summary:        Pump messages from systemd journal to Elasticsearch, Kafka, Logplex or AWS CloudWatch
 License:        ASL 2.0
 Source0:        journalpump-rpm-src.tar.gz
-Requires:       python3-kafka, systemd-python3, python3-requests, python3-botocore, python3-google-api-client
-Requires:       python3-google-auth, python3-geoip2
-Requires:	python3-websockets, python3-aiohttp-socks, python3-snappy
-BuildRequires:  python3-kafka, systemd-python3, python3-requests, python3-botocore, python3-google-api-client
-BuildRequires:  python3-devel, python3-pytest, python3-pylint python3-responses
-BuildRequires:	python3-websockets, python3-aiohttp-socks, python3-snappy
-BuildArch:      noarch
+# The sd-journal reader dlopens libsystemd.so.0 at runtime, which the RPM
+# dependency generator cannot see; require the soname provide explicitly
+# (rather than the systemd-libs package, which rpmlint rejects as an explicit
+# library dependency).  The soname provide is arch-coloured "(64bit)", which
+# is wrong on 32-bit targets, so the build is constrained to the 64-bit
+# architectures the cgo journal reader is built and tested for.
+Requires:       libsystemd.so.0()(64bit)
+ExclusiveArch:  x86_64 aarch64
+BuildRequires:  golang
+BuildRequires:  gcc
 Obsoletes:      kafkajournalpump
-
-# The dependency generator uses names which are not compatible with
-# Fedora Packaging naming guidelines
-%{?python_disable_dependency_generator}
 
 %description
 journalpump is a daemon that takes log messages from journald and pumps them
-to a given output. Currently supported outputs are Elasticsearch, Kafka, Websocket,
-logplex, AWS CloudWatch and Google Cloud Logging.  It reads messages from journald
-and optionally checks if they match a config rule and forwards them as JSON
-messages to the desired output.
+to a given output.  Currently supported outputs are Elasticsearch, Kafka,
+Websocket, logplex, AWS CloudWatch and Google Cloud Logging.  It reads
+messages from journald and optionally checks if they match a config rule and
+forwards them as JSON messages to the desired output.
 
 
 %prep
@@ -31,27 +30,32 @@ messages to the desired output.
 
 
 %build
-# Nothing to do, shut up rpmlint
+# The Go toolchain needs a writable module cache and build cache; defaulting
+# them under the build directory keeps the rpmbuild hermetic-ish and avoids
+# depending on the invoking user's HOME.  Modules are fetched from the network
+# at build time, so this is a maintainer build, not a network-isolated one.
+#
+# The distro Go may be older than the go.mod directive (Fedora currently ships
+# 1.26 and sets GOTOOLCHAIN=local in its go.env); GOTOOLCHAIN=auto lets the
+# build fetch the pinned toolchain instead of failing on the version mismatch.
+export GOPATH=%{_builddir}/gopath
+export GOCACHE=%{_builddir}/gocache
+export GOTOOLCHAIN=auto
+make build-go VERSION=%{version}-%{release}
 
 
 %install
-python3 setup.py install --prefix=%{_prefix} --root=%{buildroot}
-sed -e "s@#!/bin/python@#!%{_bindir}/python@" -i %{buildroot}%{_bindir}/*
+%{__install} -Dm0755 build/journalpump %{buildroot}%{_bindir}/journalpump
 %{__install} -Dm0644 journalpump.unit %{buildroot}%{_unitdir}/journalpump.service
 %{__mkdir_p} %{buildroot}%{_localstatedir}/lib/journalpump
-
-
-%check
-make test
 
 
 %files
 %defattr(-,root,root,-)
 %doc LICENSE README.rst journalpump.json
-%{_bindir}/journalpump*
+%{_bindir}/journalpump
 %{_unitdir}/journalpump.service
 %{_localstatedir}/lib/journalpump
-%{python3_sitelib}/*
 
 
 %changelog

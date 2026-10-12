@@ -83,10 +83,18 @@ clean:
 	$(RM) -r *.egg-info/ build/ dist/
 	$(RM) ../journalpump_* test-*.xml coverage.xml
 
+# The golang marker in the version makes the Go build distinguishable from
+# the Python package built from the main branch (the rpm release ID gains
+# the equivalent marker in journalpump.spec).  The `~` sorts the golang
+# build below the pristine upstream version, the Debian convention for a
+# non-upstream build variant.
+# -B builds the architecture-dependent binary only: the Go package is
+# Architecture: any (the Python package was Architecture: all, hence its
+# historical -A).
 deb:
 	cp debian/changelog.in debian/changelog
-	dch -v $(long_ver) "Automatically built package"
-	dpkg-buildpackage -A -uc -us
+	dch -v $(long_ver)~golang "Automatically built package (golang build)"
+	dpkg-buildpackage -B -uc -us
 
 rpm:
 	git archive --output=journalpump-rpm-src.tar.gz --prefix=journalpump/ HEAD
@@ -96,6 +104,21 @@ rpm:
 		--define 'major_version $(shell git describe --tags --abbrev=0 | cut -f1-)' \
 		--define 'minor_version $(subst -,.,$(shell git describe --tags --long | cut -f2- -d-))'
 	$(RM) journalpump-rpm-src.tar.gz
+
+# Package build smoke test (plan Task 27): build the rpm and deb and assert
+# the Go binary and the unchanged systemd unit are packaged under the golang
+# release marker.  See scripts/check-packaging.
+.PHONY: check-packaging
+check-packaging:
+	./scripts/check-packaging
+
+# Install-and-start check in the podman systest environment: install the
+# built rpm in a privileged Fedora container with systemd and assert
+# journalpump.service reaches active (Type=notify READY=1).  See
+# scripts/systest-package-on-podman.
+.PHONY: systest-package-on-podman
+systest-package-on-podman:
+	./scripts/systest-package-on-podman
 
 build-dep-fed:
 	sudo dnf -y --best --allowerasing install \

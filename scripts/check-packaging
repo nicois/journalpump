@@ -1,0 +1,257 @@
+#!/bin/bash
+# Package build smoke test (plan Task 27).
+#
+# Builds the golang-marked rpm and deb from the COMMITTED tree and asserts
+# the packaged payload:
+#   - the release/version visibly marks the golang build;
+#   - the package is architecture-specific (not noarch / Architecture: all);
+#   - /usr/bin/journalpump is the Go ELF binary;
+#   - the shipped unit is BYTE-IDENTICAL to the in-tree journalpump.unit
+#     (the plan requires the unit be unchanged);
+#   - the retained payload and the Debian postinst match expected manifests;
+#   - rpmlint / lintian report no errors beyond the narrowly allowlisted,
+#     documented diagnostics -- and a linter that fails to run also fails
+#     this check (see the linter-gate self-test).
+#
+# Both builds run in podman containers (a Fedora container for the rpm, a
+# Debian container for the deb) so the check works on any host with podman.
+# The Debian container installs ONLY the declared Build-Depends (notably
+# golang-go from the distro, whose GOTOOLCHAIN=auto fetches the go.mod-pinned
+# toolchain); no separate Go is injected.  The rpm target sources `git archive
+# HEAD` and the deb runs from a git clone, so the check validates the
+# committed tree only -- commit before running.
+#
+# The container scripts are passed as an argv (-c), not on stdin, because
+# `make deb` invokes dch, which reads stdin; feeding the script on stdin
+# would let dch swallow the assertions.
+#
+# Environment overrides:
+#   RPM_IMAGE  (default registry.fedoraproject.org/fedora:latest)
+#   DEB_IMAGE  (default docker.io/library/debian:trixie)
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+repo=$PWD
+
+if ! command -v podman >/dev/null; then
+    echo "podman is required for check-packaging" >&2
+    exit 1
+fi
+
+rpm_image=${RPM_IMAGE:-registry.fedoraproject.org/fedora:latest}
+deb_image=${DEB_IMAGE:-docker.io/library/debian:trixie}
+
+# ---------------------------------------------------------------------------
+# Fail-closed linter gates.
+#
+# Each gate returns non-zero if the linter did not actually run, or if it
+# reported an E: line not on the narrow allowlist.  The allowlists name only
+# the documented diagnostics; a negative control (below) proves an unexpected
+# error or a failed linter run is rejected.
+# ---------------------------------------------------------------------------
+
+# rpmlint diagnostics that are inherent to the package and documented:
+#   - summary-too-long: the Summary is the ORIGINAL wording inherited from
+#     the Python spec (the metadata-adjudication ruling requires restoring
+#     it); at 85 chars it exceeds rpmlint's 80-char limit.
+#   - spelling-error on the technology names systemd (Summary), journald and
+#     logplex (description) -- rpmlint's dictionary false positives.
+RPM_E_ALLOW=": E: (summary-too-long|spelling-error \('(systemd|journald|logplex)')"
+# The deb carries no allowlisted diagnostics.
+DEB_E_ALLOW='$^'
+
+_unexpected_e() {
+    # $1 output file, $2 allow regex; prints the offending E: lines.
+    grep -E '(^|[[:space:]])E: ' "$1" | grep -vE "$2" || true
+}
+
+rpmlint_gate() {
+    local out=$1 bad
+    if ! grep -qF 'rpmlint session starts' "$out"; then
+        echo "rpmlint did not run (no session banner); treating as failure" >&2
+        return 1
+    fi
+    bad=$(_unexpected_e "$out" "$RPM_E_ALLOW")
+    if [ -n "$bad" ]; then
+        echo "rpmlint reported unexpected errors:" >&2
+        printf '%s\n' "$bad" >&2
+        return 1
+    fi
+}
+
+lintian_gate() {
+    local out=$1 bad
+    if grep -qE 'No packages selected|is not a Debian format archive|internal error|Traceback' "$out"; then
+        echo "lintian failed to process the package; treating as failure" >&2
+        return 1
+    fi
+    bad=$(_unexpected_e "$out" "$DEB_E_ALLOW")
+    if [ -n "$bad" ]; then
+        echo "lintian reported unexpected errors:" >&2
+        printf '%s\n' "$bad" >&2
+        return 1
+    fi
+}
+
+selftest_gates() {
+    local t
+    t=$(mktemp)
+    # allowlisted rpmlint output passes
+    cat >"$t" <<'EOF'
+rpmlint session starts
+journalpump.x86_64: E: summary-too-long Pump messages from systemd journal
+journalpump.x86_64: E: spelling-error ('journald', '%description -l en_US journald -> journals')
+journalpump.x86_64: E: spelling-error ('logplex', 'complex') and ('systemd', 'systems')
+EOF
+    rpmlint_gate "$t" || { echo "gate self-test: allowlisted input rejected" >&2; rm -f "$t"; return 1; }
+    # an unexpected E: must fail
+    printf 'rpmlint session starts\nfoo.x86_64: E: unexpected-tag bar\n' >"$t"
+    if rpmlint_gate "$t"; then echo "gate self-test: unexpected error accepted" >&2; rm -f "$t"; return 1; fi
+    # a linter that did not run (no banner) must fail
+    printf 'rpmlint: internal error\n' >"$t"
+    if rpmlint_gate "$t"; then echo "gate self-test: failed rpmlint run accepted" >&2; rm -f "$t"; return 1; fi
+    # lintian: an E: must fail
+    printf 'E: journalpump: bogus-tag foo\n' >"$t"
+    if lintian_gate "$t"; then echo "gate self-test: lintian error accepted" >&2; rm -f "$t"; return 1; fi
+    # lintian: a processing failure must fail
+    printf 'No packages selected.\n' >"$t"
+    if lintian_gate "$t"; then echo "gate self-test: lintian processing failure accepted" >&2; rm -f "$t"; return 1; fi
+    rm -f "$t"
+    echo "linter gate self-test: PASS"
+}
+
+selftest_gates
+
+read -r -d '' rpm_script <<'RPM_SCRIPT' || true
+dnf -y install rpm-build golang gcc make git tar rpm cpio file rpmlint findutils
+git config --global --add safe.directory /src
+# Clear any rpm/ left by an earlier run; otherwise the find below could select
+# a stale package instead of the one just built.
+rm -rf rpm
+make rpm
+
+# journalpump-[0-9]* selects the main package, not the auto-generated
+# -debuginfo / -debugsource subpackages.
+rpmfile=$(find rpm/RPMS -name 'journalpump-[0-9]*.rpm' -print -quit)
+test -n "$rpmfile" || { echo "no rpm produced"; exit 1; }
+
+release=$(rpm -qp --qf '%{RELEASE}' "$rpmfile")
+case "$release" in
+    *golang*) ;;
+    *) echo "release lacks the golang marker: $release"; exit 1 ;;
+esac
+arch=$(rpm -qp --qf '%{ARCH}' "$rpmfile")
+test "$arch" != noarch || { echo "rpm is noarch: $arch"; exit 1; }
+echo "rpm: $rpmfile  (release=$release arch=$arch)"
+
+# Expected runtime payload manifest (the %doc files are additional).
+rpmfiles=$(rpm -qlp "$rpmfile")
+for want in /usr/bin/journalpump \
+            /usr/lib/systemd/system/journalpump.service \
+            /var/lib/journalpump; do
+    grep -qx "$want" <<<"$rpmfiles" || { echo "rpm missing $want"; exit 1; }
+done
+
+# The Requires must carry the runtime soname the cgo reader dlopens.
+rpmreqs=$(rpm -qp --qf '[%{REQUIRENAME}\n]' "$rpmfile")
+grep -qx 'libsystemd.so.0()(64bit)' <<<"$rpmreqs" || {
+    echo "rpm lacks the libsystemd.so.0 soname requirement"; exit 1;
+}
+
+work=$(mktemp -d)
+cd "$work"
+rpm2cpio "/src/$rpmfile" | cpio -idm --quiet
+kind=$(file usr/bin/journalpump)
+grep -q 'ELF' <<<"$kind" || { echo "packaged binary is not an ELF"; exit 1; }
+# The plan requires the unit UNCHANGED: compare byte-for-byte.
+cmp usr/lib/systemd/system/journalpump.service /src/journalpump.unit || {
+    echo "shipped unit differs from journalpump.unit"; exit 1;
+}
+
+rpmlint "/src/$rpmfile" >/tmp/rpmlint.out 2>&1 || true
+echo "=== rpmlint output ==="; cat /tmp/rpmlint.out
+rpmlint_gate /tmp/rpmlint.out
+echo "rpmlint: clean (only the allowlisted summary-too-long / technology-name spelling diagnostics)"
+RPM_SCRIPT
+
+# The gate functions are used inside the containers; pass their definitions
+# and the allowlist constants (via -e) into each container's shell.
+gates=$(declare -f _unexpected_e rpmlint_gate lintian_gate)
+
+read -r -d '' deb_script <<'DEB_SCRIPT' || true
+export DEBIAN_FRONTEND=noninteractive
+# dch (run by `make deb`) derives the changelog entry's author from
+# DEBEMAIL/DEBFULLNAME, falling back to user@hostname; without these the
+# generated changelog trips lintian's bogus-mail-host-in-debian-changelog.
+# Use the package Maintainer from debian/control for a reproducible build.
+export DEBEMAIL="hannu.valtonen@ohmu.fi"
+export DEBFULLNAME="Hannu Valtonen"
+apt-get update -qq
+# Install the DECLARED Build-Depends (golang-go comes from the distro, whose
+# GOTOOLCHAIN=auto fetches the go.mod-pinned toolchain) plus lintian/file for
+# inspection.  ca-certificates is a build-time need here (the Go toolchain and
+# modules are fetched over HTTPS); the RUNTIME ca-certificates dependency is
+# checked by the install-and-start test, not here.
+apt-get install -y -qq --no-install-recommends \
+    build-essential debhelper devscripts golang-go gcc git ca-certificates lintian file
+git config --global --add safe.directory /src
+# Clone so dpkg-buildpackage writes its output into /build, not / (the
+# parent of the mounted source).
+git clone --quiet /src /build/journalpump
+cd /build/journalpump
+make deb < /dev/null
+
+shopt -s nullglob
+debs=(/build/journalpump_*.deb)
+shopt -u nullglob
+debfile=${debs[0]:-}
+test -n "$debfile" || { echo "no deb produced"; exit 1; }
+
+version=$(dpkg-deb -f "$debfile" Version)
+case "$version" in
+    *golang*) ;;
+    *) echo "version lacks the golang marker: $version"; exit 1 ;;
+esac
+arch=$(dpkg-deb -f "$debfile" Architecture)
+test "$arch" != all || { echo "deb is architecture-independent: $arch"; exit 1; }
+echo "deb: $debfile  (version=$version arch=$arch)"
+
+# Expected payload manifest.
+debfiles=$(dpkg-deb -c "$debfile")
+for want in usr/bin/journalpump usr/lib/systemd/system/journalpump.service; do
+    grep -qE "[[:space:]]\./$want\$" <<<"$debfiles" || { echo "deb missing $want"; exit 1; }
+done
+
+work=$(mktemp -d)
+dpkg-deb -x "$debfile" "$work"
+kind=$(file "$work/usr/bin/journalpump")
+grep -q 'ELF' <<<"$kind" || { echo "packaged binary is not an ELF"; exit 1; }
+# The plan requires the unit UNCHANGED: compare byte-for-byte.
+cmp "$work/usr/lib/systemd/system/journalpump.service" /src/journalpump.unit || {
+    echo "shipped unit differs from journalpump.unit"; exit 1;
+}
+
+# The adduser postinst must be shipped verbatim.
+ctl=$(mktemp -d)
+dpkg-deb -e "$debfile" "$ctl"
+cmp "$ctl/postinst" /src/debian/postinst || {
+    echo "shipped postinst differs from debian/postinst"; exit 1;
+}
+
+lintian "$debfile" >/tmp/lintian.out 2>&1 || true
+echo "=== lintian output ==="; cat /tmp/lintian.out
+lintian_gate /tmp/lintian.out
+echo "lintian: clean (no E: lines)"
+DEB_SCRIPT
+
+echo "== rpm =="
+podman run --rm -v "$repo:/src:Z" -w /src \
+    -e RPM_E_ALLOW="$RPM_E_ALLOW" -e DEB_E_ALLOW="$DEB_E_ALLOW" \
+    "$rpm_image" bash -euo pipefail -c "$gates; $rpm_script"
+
+echo "== deb =="
+podman run --rm -v "$repo:/src:Z" \
+    -e RPM_E_ALLOW="$RPM_E_ALLOW" -e DEB_E_ALLOW="$DEB_E_ALLOW" \
+    "$deb_image" bash -euo pipefail -c "$gates; $deb_script"
+
+echo "check-packaging: PASS"

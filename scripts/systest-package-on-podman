@@ -1,0 +1,210 @@
+#!/bin/bash
+# Install-and-start check in the podman systest environment (plan Task 27).
+#
+# Builds the golang rpm and deb from the committed tree, installs each in a
+# privileged container running systemd as PID 1, and asserts that
+# journalpump.service reaches active -- which, for the unchanged Type=notify
+# unit, only happens after the Go binary sends READY=1.  The package's own
+# postinst runs on install, creating the journalpump user and its working
+# directory.
+#
+# The base Fedora/Debian images do not ship systemd, so a tiny derived image
+# is built for each that installs systemd; the container then boots
+# /sbin/init.  (scripts/systest-on-podman runs journald directly instead of
+# under systemd; this check needs the real service manager to exercise the
+# packaged unit.)
+#
+# The Debian leg installs the deb with apt so its declared Depends are
+# resolved -- in particular ca-certificates, which must NOT be pre-installed
+# (that would mask a missing runtime dependency for the TLS senders).
+#
+# The build targets source `git archive HEAD` / a git clone, so the check
+# validates the committed tree only -- commit before running.
+#
+# Environment overrides:
+#   PACKAGE_IMAGE      (default registry.fedoraproject.org/fedora:latest)
+#   PACKAGE_DEB_IMAGE  (default docker.io/library/debian:trixie)
+#   PACKAGE_KEEP=1 leave the containers and derived images in place (debugging)
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+repo=$PWD
+
+rpm_container=journalpump-package-systest
+deb_container=journalpump-package-systest-deb
+rpm_image=${PACKAGE_IMAGE:-registry.fedoraproject.org/fedora:latest}
+deb_image=${PACKAGE_DEB_IMAGE:-docker.io/library/debian:trixie}
+rpm_systemd_image=journalpump-package-systest-init
+deb_systemd_image=journalpump-package-systest-init-deb
+keep=${PACKAGE_KEEP:-0}
+
+if ! command -v podman >/dev/null; then
+    echo "podman is required for systest-package-on-podman" >&2
+    exit 1
+fi
+
+cleanup() {
+    local rc=$?
+    if [[ "$keep" != 1 ]]; then
+        podman rm --force "$rpm_container" >/dev/null 2>&1 || true
+        podman rm --force "$deb_container" >/dev/null 2>&1 || true
+        podman rmi --force "$rpm_systemd_image" >/dev/null 2>&1 || true
+        podman rmi --force "$deb_systemd_image" >/dev/null 2>&1 || true
+    fi
+    # The deb build runs as root in a container, so its output in the work
+    # directory may be root-owned; a plain rm can fail.  Remove it in a
+    # throwaway container (and never let cleanup fail the script).
+    if [[ -n "${debwork:-}" ]]; then
+        podman run --rm -v "$debwork:/work:Z" "$deb_image" rm -rf /work >/dev/null 2>&1 \
+            || rm -rf "$debwork" >/dev/null 2>&1 || true
+        rm -rf "$debwork" >/dev/null 2>&1 || true
+    fi
+    return $rc
+}
+trap cleanup EXIT
+
+# Derive an image that has systemd (the base images do not ship it).
+build_init_image() {
+    local base=$1 target=$2 run=$3 ctx
+    ctx=$(mktemp -d)
+    printf 'FROM %s\nRUN %s\n' "$base" "$run" >"$ctx/Containerfile"
+    podman build -t "$target" "$ctx"
+    rm -rf "$ctx"
+}
+
+# Wait for the systemd service manager to come up before exec'ing into it.
+wait_systemd() {
+    local container=$1 state
+    for _ in $(seq 120); do
+        # is-system-running exits non-zero for "degraded" (and for "starting"),
+        # so keep its output regardless of exit status.
+        state=$(podman exec "$container" systemctl is-system-running 2>/dev/null || true)
+        case "$state" in
+            running|degraded) return 0 ;;
+        esac
+        sleep 1
+    done
+    echo "systemd did not come up in $container (last state: $state)" >&2
+    podman ps -a --filter "name=$container" >&2 || true
+    podman logs "$container" >&2 || true
+    return 1
+}
+
+# Start journalpump.service and assert it reaches active (Type=notify READY=1).
+assert_service_active() {
+    local container=$1
+    # Pick up the just-installed unit file.
+    podman exec "$container" systemctl daemon-reload
+    podman exec "$container" systemctl start journalpump.service
+    for _ in $(seq 30); do
+        [[ "$(podman exec "$container" systemctl is-active journalpump.service || true)" == active ]] && break
+        sleep 1
+    done
+    if [[ "$(podman exec "$container" systemctl is-active journalpump.service || true)" != active ]]; then
+        podman exec "$container" systemctl status journalpump.service --no-pager || true
+        podman exec "$container" journalctl -u journalpump.service --no-pager || true
+        echo "journalpump.service did not reach active in $container" >&2
+        return 1
+    fi
+    local execline kind
+    execline=$(podman exec "$container" systemctl show -p ExecStart journalpump.service)
+    grep -q /usr/bin/journalpump <<<"$execline"
+    kind=$(podman exec "$container" file /usr/bin/journalpump)
+    grep -q ELF <<<"$kind" || {
+        echo "installed /usr/bin/journalpump is not an ELF binary" >&2
+        return 1
+    }
+    podman exec "$container" systemctl stop journalpump.service
+}
+
+# ---------------------------------------------------------------------------
+# RPM leg.
+# ---------------------------------------------------------------------------
+
+read -r -d '' rpm_build <<'BUILD' || true
+dnf -y install rpm-build golang gcc make git tar findutils
+git config --global --add safe.directory /src
+# Clear any rpm/ left by an earlier run so the host picks the fresh package.
+rm -rf rpm
+make rpm
+BUILD
+
+echo "== rpm: build =="
+podman run --rm -v "$repo:/src:Z" -w /src "$rpm_image" bash -euo pipefail -c "$rpm_build"
+
+rpmfile=$(find "$repo/rpm/RPMS" -name 'journalpump-[0-9]*.rpm' -print -quit)
+test -n "$rpmfile" || { echo "no rpm produced" >&2; exit 1; }
+echo "installing $rpmfile"
+
+echo "== rpm: install and start =="
+build_init_image "$rpm_image" "$rpm_systemd_image" \
+    'dnf -y install systemd systemd-udev procps-ng file && dnf clean all'
+
+podman rm --force "$rpm_container" >/dev/null 2>&1 || true
+podman run -d --name "$rpm_container" \
+    --privileged --systemd=always --tmpfs /run \
+    -v "$rpmfile:/tmp/journalpump.rpm:Z" \
+    "$rpm_systemd_image" /sbin/init
+wait_systemd "$rpm_container"
+
+podman exec "$rpm_container" dnf -y install /tmp/journalpump.rpm
+# The rpm ships the working directory (the spec has no adduser %post, and the
+# unit runs as root); add the config the unit reads (neither package ships a
+# production config -- see the parity doc).
+podman exec "$rpm_container" test -d /var/lib/journalpump
+podman exec "$rpm_container" sh -c "printf '{}' >/var/lib/journalpump/journalpump.json"
+assert_service_active "$rpm_container"
+echo "rpm install-and-start: PASS"
+
+# ---------------------------------------------------------------------------
+# Debian leg.
+# ---------------------------------------------------------------------------
+
+read -r -d '' deb_build <<'BUILD' || true
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends \
+    build-essential debhelper devscripts golang-go gcc git ca-certificates file
+git config --global --add safe.directory /src
+git clone --quiet /src /build/journalpump
+cd /build/journalpump
+make deb < /dev/null
+BUILD
+
+echo "== deb: build =="
+debwork=$(mktemp -d)
+podman run --rm -v "$repo:/src:Z" -v "$debwork:/build:Z" "$deb_image" \
+    bash -euo pipefail -c "$deb_build"
+
+debfile=$(find "$debwork" -name 'journalpump_*.deb' -print -quit)
+test -n "$debfile" || { echo "no deb produced" >&2; exit 1; }
+echo "installing $debfile"
+
+echo "== deb: install and start =="
+build_init_image "$deb_image" "$deb_systemd_image" \
+    'apt-get update -qq && apt-get install -y -qq --no-install-recommends systemd systemd-sysv procps file && apt-get clean'
+
+podman rm --force "$deb_container" >/dev/null 2>&1 || true
+podman run -d --name "$deb_container" \
+    --privileged --systemd=always --tmpfs /run \
+    -v "$debfile:/tmp/journalpump.deb:Z" \
+    "$deb_systemd_image" /sbin/init
+wait_systemd "$deb_container"
+
+# ca-certificates must NOT be present before the install: it has to arrive as
+# a dependency of the package, or a minimal install would have no system roots
+# for the TLS senders.
+if podman exec "$deb_container" dpkg -s ca-certificates >/dev/null 2>&1; then
+    echo "ca-certificates pre-installed in the image; runtime dependency would be masked" >&2
+    exit 1
+fi
+
+podman exec "$deb_container" apt-get install -y /tmp/journalpump.deb
+podman exec "$deb_container" getent passwd journalpump >/dev/null
+podman exec "$deb_container" test -d /var/lib/journalpump
+podman exec "$deb_container" test -e /etc/ssl/certs/ca-certificates.crt
+podman exec "$deb_container" sh -c "printf '{}' >/var/lib/journalpump/journalpump.json"
+assert_service_active "$deb_container"
+echo "deb install-and-start: PASS"
+
+echo "systest-package-on-podman: PASS"
