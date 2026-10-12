@@ -565,7 +565,39 @@ def render_markdown(result: dict[str, Any]) -> str:
     ]
 
     go_runs = result["implementations"].get("go", {}).get("runs", [])
-    go_peak = _format_value("peak_rss_bytes", statistics.median([run["peak_rss_bytes"] for run in go_runs])) if go_runs else "unavailable"
+    go_peak_bytes = statistics.median([run["peak_rss_bytes"] for run in go_runs]) if go_runs else None
+    go_peak = _format_value("peak_rss_bytes", go_peak_bytes) if go_peak_bytes else "unavailable"
+    entries = result.get("entries")
+    fixture_text = f"a {entries:,}-entry fixture" if isinstance(entries, int) else "this fixture"
+    governor = host.get("governor", "unknown")
+
+    # Everything below is derived from THIS result: the fixture size, the
+    # governor and the measured peak RSS all come from the run, so a render
+    # of a different fixture size or governor cannot assert another run's
+    # numbers (the earlier hard-coded 300k/powersave/7-10x text did).
+    queue_band_mib = (25.0, 35.0)  # counted queue bytes, memory-...-backpressure.md
+    if go_peak_bytes:
+        ratio_low = go_peak_bytes / (queue_band_mib[1] * 1024 * 1024)
+        ratio_high = go_peak_bytes / (queue_band_mib[0] * 1024 * 1024)
+        ratio_text = f"about {ratio_low:.0f}-{ratio_high:.0f}x that"
+    else:
+        ratio_text = "well above that"
+
+    if governor == "performance":
+        governor_bullet = (
+            "- The host ran the CPU governor as `performance`, and the CPU"
+            " figures still show run-to-run spread (see the min/max columns):"
+            " treat the CPU comparison as indicative, not precise."
+        )
+    else:
+        governor_bullet = (
+            f"- The host ran the CPU governor as `{governor}`, not"
+            " `performance`, so the absolute CPU figures are governor-limited"
+            " and would move with the governor; the CPU comparison still shows"
+            " run-to-run spread (see the min/max columns) and is indicative, not"
+            " precise."
+        )
+
     out += [
         "",
         "## Interpretation limits",
@@ -575,25 +607,24 @@ def render_markdown(result: dict[str, Any]) -> str:
         " are valid for comparing the two on that path; they are NOT evidence"
         " of either implementation's maximum throughput capacity, which a"
         " saturated, pacing-free setup would measure.",
-        f"- Go whole-process peak RSS was {go_peak}. That does NOT establish a"
-        " violation of the bounded-queue expectation: peak RSS includes the"
-        " journal file mappings the reader holds, the language runtime and"
-        " allocator slack, not just sender buffers. Do not read a memory bound"
-        " (or a memory regression) out of this metric; that needs a"
-        " memory-attribution or scaling measurement.",
-        "- Reconciliation with the earlier analytical note in"
+        f"- Go whole-process peak RSS was {go_peak}. A difference here IS a"
+        " real whole-process memory difference, and the primary table treats"
+        " it as one; what peak RSS does NOT establish is a bounded-QUEUE"
+        " violation, because it includes the journal file mappings the reader"
+        " holds, the language runtime and allocator slack, not just sender"
+        " buffers. Attributing a change to the queue (or to any one component)"
+        " needs a memory-attribution or scaling measurement.",
+        f"- Reconciliation with the earlier analytical note in"
         " `docs/superpowers/specs/memory-under-multi-sender-backpressure.md`:"
-        " that note bounds COUNTED queue bytes at roughly 25-35 MB of Go heap"
-        " for two slow senders at the default budget. The measured peak RSS"
-        " here is about 7-10x that, because it is whole-process RSS over a"
-        " 300,000-entry fixture whose journal the reader mmap-s, and this"
-        " harness uses a single file sender with no backpressure at all. The"
-        " two numbers measure different things; the gap is flagged as needing"
-        " a dedicated memory-attribution measurement, not explained by this"
-        " harness.",
-        "- The host ran the CPU governor in its default `powersave` state and"
-        " the CPU figures show run-to-run spread (see the min/max columns):"
-        " treat the CPU comparison as indicative, not precise.",
+        " that note bounds COUNTED queue bytes at roughly"
+        f" {queue_band_mib[0]:.0f}-{queue_band_mib[1]:.0f} MB of Go heap for two"
+        " slow senders at the default budget. The measured peak RSS here is"
+        f" {ratio_text}, because it is whole-process RSS over {fixture_text}"
+        " whose journal the reader mmap-s, and this harness uses a single file"
+        " sender with no backpressure at all. The two numbers measure"
+        " different things; the gap is flagged as needing a dedicated"
+        " memory-attribution measurement, not explained by this harness.",
+        governor_bullet,
         "",
         "## Acceptance",
         "",

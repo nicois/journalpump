@@ -72,14 +72,27 @@ var newLogger = func(stdout io.Writer, level int64) *journaldlog.Log {
 //     READY=1 is notified once by the config load and once by main
 //     (Python notifies twice at startup), and the run loop drives until
 //     SIGTERM/SIGINT.
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdout, stderr io.Writer) (code int) {
 	// Profiling is env-gated and inert unless JOURNALPUMP_CPU_PROFILE /
 	// JOURNALPUMP_MEM_PROFILE are set (bench/profile.go); the defer fires
 	// on every return path, so a clean SIGTERM shutdown flushes the
 	// profile. os.Exit in main would skip a defer here, hence the hook
 	// lives in run().
-	stopProfiling := startProfiling()
-	defer stopProfiling()
+	stopProfiling, err := startProfiling()
+	if err != nil {
+		// An env-gated profiling run whose profile cannot be created must
+		// fail the run, not silently produce no profile (bench/profile.go).
+		_, _ = fmt.Fprintf(stderr, "Journalpump failed to start: %v\n", err)
+		return exitErr
+	}
+	defer func() {
+		if err := stopProfiling(); err != nil {
+			// The deferred stop runs after the return value is set, so a
+			// failed profile flush must override the exit code explicitly.
+			_, _ = fmt.Fprintf(stderr, "Journalpump failed to stop profiling: %v\n", err)
+			code = exitErr
+		}
+	}()
 
 	if len(args) != 1 {
 		_, _ = fmt.Fprintln(stdout, "config file argument required")

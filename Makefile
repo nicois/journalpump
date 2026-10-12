@@ -128,10 +128,14 @@ bench-profile: build-go
 # default.pgo automatically when it sits in the main package directory, so
 # the packaging builds (which run make build-go) pick it up.  See
 # docs/perf-profile-findings.md for provenance and how to refresh.
+# The driver deletes stale profiles and fails if the run captured none, and
+# the explicit check below keeps the committed profile untouched on failure.
 .PHONY: bench-pgo
 bench-pgo: build-go
 	BENCH_TMPFS=$(BENCH_TMPFS) BENCH_ENTRIES=$${BENCH_ENTRIES:-300000} BENCH_RUNS=1 BENCH_WARMUP=0 \
 		$(PYTHON) bench/journalpump_bench.py --profile --profile-dir $(BENCH_TMPFS)/work/profiles
+	@test -s $(BENCH_TMPFS)/work/profiles/go-cpu-measured.prof || \
+		{ echo "bench-pgo: no usable CPU profile captured; leaving cmd/journalpump/default.pgo unchanged" >&2; exit 1; }
 	cp $(BENCH_TMPFS)/work/profiles/go-cpu-measured.prof cmd/journalpump/default.pgo
 	@echo "refreshed cmd/journalpump/default.pgo; run make build-go to apply"
 

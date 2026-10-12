@@ -30,6 +30,7 @@ def fake_result(
     py_overrides: dict | None = None,
     entries=200000,
     config_hash="abc",
+    governor="powersave",
 ) -> dict:
     def implementation(wall, cpu, overrides):
         runs = []
@@ -67,7 +68,7 @@ def fake_result(
             "cpu_model": "Test CPU",
             "cpu_online": "8",
             "kernel": "1.0",
-            "governor": "powersave",
+            "governor": governor,
             "cpu_max": "800000 100000",
             "memory_max": "max",
         },
@@ -390,3 +391,40 @@ def test_baseline_comparison_incompatible_fixture_is_informational_success():
 def test_result_json_round_trips():
     result = fake_result()
     assert json.loads(json.dumps(result))["entries"] == 200000
+
+# --- Interpretation limits are derived from the result ----------------------
+
+
+def test_interpretation_limits_name_the_actual_fixture_size_and_governor():
+    result = fake_result(entries=5000, governor="performance")
+    text = report.render_markdown(result)
+    assert "5,000-entry fixture" in text
+    assert "`performance`" in text
+    # A render of one run must not assert another run's fixture or governor.
+    assert "300,000" not in text
+    assert "powersave" not in text
+    assert "7-10x" not in text
+
+
+def test_interpretation_limits_report_a_non_performance_governor():
+    text = report.render_markdown(fake_result(governor="schedutil"))
+    assert "`schedutil`" in text
+    assert "governor-limited" in text
+
+
+def test_peak_rss_caveat_is_scoped_to_queue_bounds():
+    text = report.render_markdown(fake_result())
+    # Peak RSS keeps its role as a whole-process memory comparison ...
+    assert "A difference here IS a real whole-process memory difference" in text
+    # ... and the caveat is limited to the queue / attribution question.
+    assert "bounded-QUEUE violation" in text
+    assert "Do not read a memory bound (or a memory regression)" not in text
+
+
+def test_rss_reconciliation_ratio_is_computed_from_the_measured_peak():
+    result = fake_result()
+    runs = result["implementations"]["go"]["runs"]
+    result["implementations"]["go"]["runs"] = [dict(run, peak_rss_bytes=200 * 1024 * 1024) for run in runs]
+    text = report.render_markdown(result)
+    # 200 MiB against the 25-35 MB counted-queue band: 200/35 .. 200/25.
+    assert "about 6-8x that" in text

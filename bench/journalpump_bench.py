@@ -45,7 +45,12 @@ disk fixture fallback cannot move the measured sink onto disk), and
 see ``cmd/journalpump/profile.go``) and GODEBUG=gctrace=1, then prints
 ``go tool pprof -top`` for the captured CPU and heap profiles. GOMAXPROCS is
 inherited from the environment, so ``GOMAXPROCS=1`` measures a single-core
-Go build.
+Go build. Stale profiles are deleted before the run and the captured ones
+are required to exist, be non-empty, be fresh and parse under pprof — a
+profiled run that captures nothing FAILS rather than reporting success
+(``make bench-pgo`` would otherwise commit a stale profile). ``--profile``
+runs the Go binary alone, so it refuses to combine with ``--baseline`` or
+``--check``, which must measure both implementations.
 """
 
 from __future__ import annotations
@@ -727,16 +732,71 @@ def run_implementation(
     return {"preflight": preflight, "runs": measured[warmup:]}
 
 
-def print_profiles(profile_dir: Path) -> None:
-    """``go tool pprof -top`` over the profiles a profiled run captured, so
-    ``make bench-profile`` is repeatable end to end."""
-    for label, name in (("CPU (measured run)", "go-cpu-measured.prof"), ("HEAP (measured run)", "go-mem-measured.prof")):
+# The profiles a profiled run must produce: the measured ones are the PGO
+# source (make bench-pgo copies go-cpu-measured.prof into cmd/journalpump/
+# default.pgo), so their absence or staleness must never read as success.
+PROFILE_FILES = (
+    ("CPU (measured run)", "go-cpu-measured.prof"),
+    ("HEAP (measured run)", "go-mem-measured.prof"),
+)
+_OTHER_PROFILES = ("go-cpu-preflight.prof", "go-mem-preflight.prof")
+
+
+def clear_profiles(profile_dir: Path) -> None:
+    """Delete every profile a previous run left behind, so a missing or
+    failed capture cannot be mistaken for a fresh one."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    for name in [name for _, name in PROFILE_FILES] + list(_OTHER_PROFILES):
+        (profile_dir / name).unlink(missing_ok=True)
+
+
+def pprof_top(path: Path) -> str:
+    """``go tool pprof -top`` output for one profile; raises on failure."""
+    if not path.exists():
+        raise BenchmarkError(f"no profile at {path}")
+    try:
+        completed = subprocess.run(
+            ["go", "tool", "pprof", "-top", "-nodecount=30", str(path)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BenchmarkError(f"go tool pprof could not run on {path}: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise BenchmarkError(f"go tool pprof could not read {path}: {detail}")
+    return completed.stdout
+
+
+def verify_profiles(profile_dir: Path, started_at: float) -> None:
+    """Require FRESH, readable profiles from the profiled run.
+
+    A missing file, an empty file, a file older than this run, or one pprof
+    rejects is a hard error: reporting success without a usable profile
+    would let ``make bench-pgo`` commit a stale default.pgo.
+    """
+    for label, name in PROFILE_FILES:
         path = profile_dir / name
         if not path.exists():
-            continue
+            raise BenchmarkError(f"profiled run produced no {label} profile at {path}")
+        if path.stat().st_size == 0:
+            raise BenchmarkError(f"{label} profile {path} is empty")
+        if path.stat().st_mtime < started_at:
+            raise BenchmarkError(f"{label} profile {path} was not written by this run (stale)")
+        pprof_top(path)  # raises if pprof cannot parse it
+
+
+def print_profiles(profile_dir: Path) -> None:
+    """``go tool pprof -top`` over the profiles a profiled run captured, so
+    ``make bench-profile`` is repeatable end to end. Raises when a profile
+    is missing or unreadable (see verify_profiles)."""
+    for label, name in PROFILE_FILES:
+        path = profile_dir / name
         print(f"\n=== go tool pprof -top ({label}): {path} ===", flush=True)
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(["go", "tool", "pprof", "-top", "-nodecount=30", str(path)], cwd=REPO_ROOT)
+        output = pprof_top(path)
+        print(output, end="" if output.endswith("\n") else "\n")
 
 
 def build_result(
@@ -786,6 +846,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.profile and (args.baseline or args.check):
+        # A baseline or a check must measure BOTH implementations, but
+        # --profile selects the Go binary only: combining them would silently
+        # write a Go-only baseline (or compare a Go-only run against a
+        # two-implementation one). Reject before anything runs or is written.
+        parser.error(
+            "--profile cannot be combined with --baseline or --check: a baseline "
+            "or a check measures BOTH implementations, while --profile runs the Go "
+            "binary alone. Run them separately."
+        )
+
     check_governor()
     assert_no_shims()
 
@@ -817,6 +888,11 @@ def main(argv: list[str] | None = None) -> int:
 
     work_dir = resolve_work_dir()
     profile_dir = (args.profile_dir or (work_dir / "profiles")) if args.profile else None
+    if profile_dir is not None:
+        # Drop any earlier profile first: verify_profiles then only has to
+        # prove freshness, and a stale file can never masquerade as this run.
+        clear_profiles(profile_dir)
+    profile_started_at = time.time()
     implementations: dict[str, Any] = {}
 
     for implementation in impls:
@@ -833,6 +909,11 @@ def main(argv: list[str] | None = None) -> int:
             stop_timeout_s=args.stop_timeout,
             profile_dir=profile_dir,
         )
+
+    if profile_dir is not None:
+        # Fail BEFORE the result is written: a run that reports success with
+        # no usable profile would let make bench-pgo commit a stale one.
+        verify_profiles(profile_dir, profile_started_at)
 
     result = build_result(
         implementations=implementations,

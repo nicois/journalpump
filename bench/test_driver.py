@@ -178,3 +178,60 @@ def test_resolve_work_dir_refuses_a_disk_backed_directory(monkeypatch):
             driver.resolve_work_dir()
     finally:
         shutil.rmtree(disk, ignore_errors=True)
+
+# --- profiling capture ------------------------------------------------------
+
+
+def test_main_rejects_profile_combined_with_baseline_or_check(capsys):
+    # A baseline or a check must measure BOTH implementations; --profile runs
+    # the Go binary alone, so the combination would silently write a Go-only
+    # baseline. It is rejected before anything runs or is written.
+    for flags in (["--profile", "--baseline"], ["--profile", "--check"]):
+        with pytest.raises(SystemExit) as excinfo:
+            driver.main(flags)
+        assert excinfo.value.code == 2
+        assert "--profile cannot be combined" in capsys.readouterr().err
+
+
+def test_clear_profiles_removes_every_known_profile(tmp_path):
+    for _, name in driver.PROFILE_FILES:
+        (tmp_path / name).write_bytes(b"stale")
+    driver.clear_profiles(tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_verify_profiles_rejects_a_missing_profile(tmp_path):
+    driver.clear_profiles(tmp_path)
+    with pytest.raises(driver.BenchmarkError, match="produced no"):
+        driver.verify_profiles(tmp_path, time.time())
+
+
+def test_verify_profiles_rejects_an_empty_profile(tmp_path):
+    driver.clear_profiles(tmp_path)
+    (tmp_path / "go-cpu-measured.prof").write_bytes(b"")
+    with pytest.raises(driver.BenchmarkError, match="is empty"):
+        driver.verify_profiles(tmp_path, time.time())
+
+
+def test_verify_profiles_rejects_a_stale_profile(tmp_path):
+    driver.clear_profiles(tmp_path)
+    path = tmp_path / "go-cpu-measured.prof"
+    path.write_bytes(b"not a profile")
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    with pytest.raises(driver.BenchmarkError, match="stale"):
+        driver.verify_profiles(tmp_path, time.time() - 60)
+
+
+def test_verify_profiles_rejects_a_profile_pprof_cannot_read(tmp_path):
+    driver.clear_profiles(tmp_path)
+    for _, name in driver.PROFILE_FILES:
+        (tmp_path / name).write_bytes(b"garbage, not a pprof profile")
+    with pytest.raises(driver.BenchmarkError, match="could not read"):
+        driver.verify_profiles(tmp_path, time.time() - 1)
+
+
+def test_print_profiles_raises_when_a_profile_is_missing(tmp_path):
+    driver.clear_profiles(tmp_path)
+    with pytest.raises(driver.BenchmarkError, match="no profile at"):
+        driver.print_profiles(tmp_path)

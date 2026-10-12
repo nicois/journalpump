@@ -71,6 +71,18 @@ def runtime_dir(name: str) -> Path:
     return Path(f"/run/user/{os.getuid()}") / f"jp-bench-{name}-{os.getpid()}"
 
 
+def isolated_env(work: Path) -> dict[str, str]:
+    """Environment for one smoke test.
+
+    BOTH the fixture directory and the work directory (where the generated
+    per-run configs and the sink are written) are per-test: ``--profile``
+    and the plain smoke test run through the same default work directory
+    otherwise, so a concurrent ``make bench-test`` / systest pair would
+    overwrite each other's configs and fail the preflight.
+    """
+    return bench_env(BENCH_JOURNAL_DIR=str(work), BENCH_WORK_DIR=str(work / "work"))
+
+
 @pytest.mark.skipif(not GO_BINARY.exists(), reason="build/journalpump is missing; run make build-go")
 def test_bench_driver_smoke_runs_both_implementations():
     work = runtime_dir("smoke")
@@ -78,7 +90,7 @@ def test_bench_driver_smoke_runs_both_implementations():
     try:
         completed = subprocess.run(
             [sys.executable, str(BENCH_DRIVER), "--out", str(work / "result.json")],
-            env=bench_env(BENCH_JOURNAL_DIR=str(work)),
+            env=isolated_env(work),
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -142,7 +154,7 @@ def test_bench_driver_profile_writes_go_profiles():
     try:
         completed = subprocess.run(
             [sys.executable, str(BENCH_DRIVER), "--profile", "--profile-dir", str(profile_dir), "--out", str(work / "r.json")],
-            env=bench_env(BENCH_JOURNAL_DIR=str(work)),
+            env=isolated_env(work),
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
