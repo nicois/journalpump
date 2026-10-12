@@ -55,6 +55,7 @@ typedef int      (*fn_seek_monotonic)(sd_journal*, go_id128_t, uint64_t);
 typedef int      (*fn_id128_get_boot)(go_id128_t*);
 typedef int      (*fn_wait)(sd_journal*, uint64_t);
 typedef int      (*fn_enumerate_data)(sd_journal*, const void**, size_t*);
+typedef void     (*fn_restart_data)(sd_journal*);
 typedef int      (*fn_get_cursor)(sd_journal*, char**);
 typedef int      (*fn_get_fd)(sd_journal*);
 typedef int      (*fn_get_realtime)(sd_journal*, uint64_t*);
@@ -117,6 +118,114 @@ static int call_get_realtime(void* f, sd_journal* j, uint64_t* out) { return ((f
 static int call_has_persistent(void* f, sd_journal* j) { return ((fn_has_persistent)f)(j); }
 static int call_has_runtime(void* f, sd_journal* j) { return ((fn_has_runtime)f)(j); }
 static void call_close(void* f, sd_journal* j) { ((fn_close)f)(j); }
+
+// jp_api is the resolved function-pointer table for the batch read loop.
+// Resolved once (jp_api_init) instead of per call, deleting the per-call
+// dlsym map+mutex lookup that the profile charged ~0.51 s to.
+typedef struct {
+	fn_step         next;
+	fn_step         previous;
+	fn_restart_data restart_data;
+	fn_enumerate_data enumerate_data;
+	fn_get_realtime get_realtime;
+	fn_get_cursor   get_cursor;
+	fn_seek_cursor  seek_cursor;
+} jp_api;
+
+static void jp_api_init(jp_api* a, void* next, void* previous, void* restart_data,
+                        void* enumerate_data, void* get_realtime, void* get_cursor,
+                        void* seek_cursor) {
+	a->next = (fn_step)next;
+	a->previous = (fn_step)previous;
+	a->restart_data = (fn_restart_data)restart_data;
+	a->enumerate_data = (fn_enumerate_data)enumerate_data;
+	a->get_realtime = (fn_get_realtime)get_realtime;
+	a->get_cursor = (fn_get_cursor)get_cursor;
+	a->seek_cursor = (fn_seek_cursor)seek_cursor;
+}
+
+static void jp_put_u16(uint8_t* p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
+static void jp_put_u32(uint8_t* p, uint32_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
+static void jp_put_u64(uint8_t* p, uint64_t v) { for (int i=0;i<8;i++) { p[i]=(uint8_t)(v>>(8*i)); } }
+
+// jp_read_batch reads up to max_entries entries, each atomic, into buf.
+// It returns the number of entry records written; *used is the bytes
+// written; *status is 0 (buffer full or max_entries reached), 1 (end of
+// journal) or a negative -errno from the call that failed.
+//
+// PER-ENTRY LAYOUT (little-endian):
+//   u64 realtime_usec
+//   u16 cursor_len, cursor bytes
+//   u32 nfields, then per field: u32 len, bytes (KEY=value)
+//
+// On a buffer overflow mid-entry the bytes of that entry are discarded and
+// the position is rewound with sd_journal_seek_cursor to just BEFORE the
+// entry (the cursor is read up front and kept for this), so a retry with a
+// larger buffer re-reads it. A mid-entry libsystemd error keeps the
+// fully-written entries, rewinds the partial one and leaves the position
+// before the failing entry.
+static int jp_read_batch(const jp_api* api, sd_journal* j, uint8_t* buf, size_t buflen,
+                         int max_entries, size_t* used_out, int* status) {
+	size_t used = 0;
+	int count = 0;
+	*status = 0;
+	while (count < max_entries) {
+		int rc = api->next(j);
+		if (rc == 0) { *status = 1; break; }
+		if (rc < 0) { *status = rc; break; }
+		size_t entry_start = used;
+		uint64_t rt = 0;
+		api->get_realtime(j, &rt); // a failure leaves rt zero, as today's zero-value would
+		char* cursor = NULL;
+		api->get_cursor(j, &cursor);
+		size_t clen = cursor ? strlen(cursor) : 0;
+		if (clen > 0xffff) { clen = 0xffff; }
+		// Prologue: u64 realtime + u16 cursor_len + cursor + u32 nfields.
+		if (used + 10 + clen + 4 > buflen) {
+			if (cursor) { api->seek_cursor(j, cursor); }
+			else { api->previous(j); }
+			free(cursor);
+			used = entry_start;
+			break;
+		}
+		size_t hdr = used;
+		used += 10;
+		jp_put_u64(buf + hdr, rt);
+		jp_put_u16(buf + hdr + 8, (uint16_t)clen);
+		if (clen) { memcpy(buf + used, cursor, clen); }
+		used += clen;
+		size_t nfields_pos = used;
+		used += 4;
+		uint32_t nfields = 0;
+		api->restart_data(j);
+		int failed = 0;
+		for (;;) {
+			const void* p = NULL;
+			size_t l = 0;
+			rc = api->enumerate_data(j, &p, &l);
+			if (rc == 0) { break; }
+			if (rc < 0) { failed = 2; *status = rc; break; }
+			if (used + 4 + l > buflen) { failed = 1; break; }
+			jp_put_u32(buf + used, (uint32_t)l);
+			used += 4;
+			memcpy(buf + used, p, l);
+			used += l;
+			nfields++;
+		}
+		if (failed) {
+			if (cursor) { api->seek_cursor(j, cursor); }
+			else { api->previous(j); }
+			free(cursor);
+			used = entry_start;
+			break;
+		}
+		free(cursor);
+		jp_put_u32(buf + nfields_pos, nfields);
+		count++;
+	}
+	*used_out = used;
+	return count;
+}
 */
 import "C"
 
@@ -418,6 +527,68 @@ func (h *ffiJournal) hasRuntimeFiles() (int, error) {
 		return 0, err
 	}
 	return int(C.call_has_runtime(f, h.j)), nil
+}
+
+// batchAPINames is the resolved function-pointer table for the batch read
+// loop, initialised once.
+var batchAPINames = [...]string{
+	"sd_journal_next",
+	"sd_journal_previous",
+	"sd_journal_restart_data",
+	"sd_journal_enumerate_data",
+	"sd_journal_get_realtime_usec",
+	"sd_journal_get_cursor",
+	"sd_journal_seek_cursor",
+}
+
+var (
+	batchAPIOnce sync.Once
+	batchAPIPtr  unsafe.Pointer
+	batchAPIErr  error
+)
+
+// resolvedBatchAPI resolves the batch-loop symbols once and fills the C
+// side table, deleting the per-call ffiSymbol map+mutex lookup the read
+// loop used to pay for every field. The table lives in C memory so that
+// passing it to the C loop never hands cgo a Go pointer to Go pointers.
+func resolvedBatchAPI() (*C.jp_api, error) {
+	batchAPIOnce.Do(func() {
+		var ptrs [7]unsafe.Pointer
+		for i, name := range batchAPINames {
+			p, err := ffiSymbol(name)
+			if err != nil {
+				batchAPIErr = err
+				return
+			}
+			ptrs[i] = p
+		}
+		ptr := C.malloc(C.size_t(unsafe.Sizeof(C.jp_api{})))
+		if ptr == nil {
+			batchAPIErr = errors.New("cannot allocate the batch API table")
+			return
+		}
+		C.jp_api_init((*C.jp_api)(ptr), ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6])
+		batchAPIPtr = ptr
+	})
+	if batchAPIErr != nil {
+		return nil, batchAPIErr
+	}
+	return (*C.jp_api)(batchAPIPtr), nil
+}
+
+// readBatchRaw runs one jp_read_batch call, returning the entry count, the
+// bytes written and the status (0 buffer full / max reached, 1 end of
+// journal, <0 -errno).
+func (h *ffiJournal) readBatchRaw(buf []byte, limit int) (count, used, status int, err error) {
+	api, err := resolvedBatchAPI()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	var cused C.size_t
+	var cstatus C.int
+	ptr := (*C.uint8_t)(unsafe.Pointer(&buf[0])) //nolint:gocritic // false positive on cgo-generated pointer check
+	count = int(C.jp_read_batch(api, h.j, ptr, C.size_t(len(buf)), C.int(limit), &cused, &cstatus))
+	return count, int(cused), int(cstatus), nil
 }
 
 func (h *ffiJournal) close() {

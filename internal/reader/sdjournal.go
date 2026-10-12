@@ -24,6 +24,11 @@ import (
 // shape.
 type SDJournal struct {
 	h *ffiJournal
+	// rawBuf and rawBatch are the reusable buffer and index behind
+	// ReadRaw (Task 32). They grow to the largest batch seen and are not
+	// safe for concurrent use (matching the single-pump-thread shape).
+	rawBuf   []byte
+	rawBatch journal.Batch
 }
 
 // PositionMode selects the initial_position behavior
@@ -390,27 +395,6 @@ func (s *SDJournal) Wait(ctx context.Context, timeout time.Duration) (Event, err
 			return Event(rc), nil
 		}
 	}
-}
-
-// ReadBatch implements Reader.ReadBatch: up to n entries from the
-// current position. It returns the entries read so far together with
-// the failure when the batch ended on one (ErrBadMessage for corrupt
-// data the caller counts, errFieldWithoutEquals and others for the
-// Task 16 broad handler), and fewer entries than requested when the
-// journal is exhausted.
-func (s *SDJournal) ReadBatch(n int) ([]journal.Entry, error) {
-	out := make([]journal.Entry, 0, n)
-	for i := 0; i < n; i++ {
-		entry, ok, err := s.readNext()
-		if err != nil {
-			return out, err
-		}
-		if !ok {
-			return out, nil
-		}
-		out = append(out, entry)
-	}
-	return out, nil
 }
 
 // Seek implements Reader.Seek.
