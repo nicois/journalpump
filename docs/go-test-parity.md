@@ -3006,11 +3006,35 @@ for a user decision — the current SDK-resolved retry state is left unchanged.
   actually reached AND that the ctx deadline bounds completion. The charter §2
   claim is corrected to match.
 - **Item 5 — HOLDOFF.** Retry defaults (botocore 5 vs SDK 3) and the
-  `AWS_RETRY_MODE=legacy` rejection boundary are unchanged this round; the §2
-  note stands pending the user ruling.
+  `AWS_RETRY_MODE=legacy` rejection boundary were left unchanged this round
+  pending the user ruling; resolved in the round-4 note below.
 
 Execution after `330d238` (UNCACHED): `go test -race -count=1 ./...` PASS;
 `make lint-go` 0 issues; `make build-go` green; `go test -race -count=1 -tags
 systest ./systest-go/...` PASS (145.1 s); `JOURNALPUMP_BIN=go python -m pytest
+-q systest/` 38 passed; `python -m pytest -q test/` 160 passed. Ledger row 25
+stays `review`.
+
+### Task 25 item 5 — retry defaults (user decision 2026-10-12)
+
+Implemented in the round-4 code commit. When neither the environment nor the
+selected profile overrides retry, the sender now applies botocore's 5-attempt
+default (the SDK's standard default is 3) via `config.WithRetryMaxAttempts`.
+`AWS_MAX_ATTEMPTS` and the profile `max_attempts` win; an explicit
+`standard`/`adaptive` mode keeps botocore's 3-attempt default. The single
+documented deviation is that an explicit `AWS_RETRY_MODE=legacy` (or any
+unknown value) fails construction with the SDK's own error
+(LoadDefaultConfig always runs the env loader; `aws.ParseRetryMode` rejects
+`legacy`; no exported hook intercepts it).
+
+`TestSDKRetryResolution` resolves the real client's retryer for each case:
+default 5, `AWS_MAX_ATTEMPTS=9` → 9, profile `max_attempts=7` → 7,
+`standard`/`adaptive` → 3, and `AWS_RETRY_MODE=legacy` → load error.
+`TestResolveConfigCABundlePrecedence`/`TestClientCustomCATrustSet` are
+unchanged by this.
+
+Execution after `2f614e3` (UNCACHED): `go test -race -count=1 ./...` PASS;
+`make lint-go` 0 issues; `make build-go` green; `go test -race -count=1 -tags
+systest ./systest-go/...` PASS (143.5 s); `JOURNALPUMP_BIN=go python -m pytest
 -q systest/` 38 passed; `python -m pytest -q test/` 160 passed. Ledger row 25
 stays `review`.

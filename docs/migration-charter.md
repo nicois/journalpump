@@ -546,18 +546,21 @@ NEWS entry — plan Task 28):
   through the SDK's `awshttp.BuildableClient` so the SDK itself injects the
   custom CA (`config.WithCustomCABundle`) and owns the transport; botocore's
   60 s connect, read-inactivity and TLS-handshake timeouts are applied through
-  it. Retry is left
-  to the SDK's own env/profile resolution: standard/adaptive default to 3
-  attempts and `AWS_MAX_ATTEMPTS`/profile `max_attempts` win. Recorded
+  it. Retry (user decision 2026-10-12) matches botocore's defaults: when
+  neither the environment nor the selected profile overrides the attempt count
+  or the mode, botocore's 5-attempt default is used (the SDK's standard default
+  is 3); `AWS_MAX_ATTEMPTS` and the profile `max_attempts` win, and an explicit
+  `standard`/`adaptive` mode keeps botocore's 3-attempt default. Recorded
   deviations rather than reproductions: (a) the DEFAULT trust set uses Go's
   system roots where botocore uses its certifi bundle — same class as the
   ES/OS default-trust deviation (coincides in the reference RPM deployment,
-  differs for deb/pip or extra trust inputs); (b) the RETRY strategy is the
-  SDK's standard mode, not botocore's legacy policy — and `AWS_RETRY_MODE=
-  legacy` is INFEASIBLE to honor: the SDK's environment loader eagerly rejects
-  the value before any `WithRetryMode` option can apply, so an explicit
-  `legacy` fails construction (botocore's legacy is its default), while unset
-  / `standard` / `adaptive` work; (c) an `AWS_REGION` value is still honored
+  differs for deb/pip or extra trust inputs); (b) an explicit
+  `AWS_RETRY_MODE=legacy` (or any unknown value) fails construction with the
+  SDK's own clear error rather than silently using a different policy: the
+  SDK has no legacy mode, `LoadDefaultConfig` always runs its environment
+  loader, and `aws.ParseRetryMode` rejects `legacy` before any `WithRetryMode`
+  option applies (no exported hook intercepts it); unset / `standard` /
+  `adaptive` all behave as botocore; (c) an `AWS_REGION` value is still honored
   by the SDK when `AWS_DEFAULT_REGION` is unset (botocore would ignore it).
   Cancellation: every SDK request call takes `ctx` and propagates it, but
   `aws.CredentialsCache` performs its own background credential retrieval and
