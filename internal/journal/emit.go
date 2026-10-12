@@ -35,6 +35,29 @@ type EmitOptions struct {
 	// pre-rendered as JSON fragments. An extra whose key matches a raw or
 	// synthesised key overrides it in place; the rest are appended in order.
 	Extras []ExtraFragment
+	// MessageOverride replaces the MESSAGE field's value with the given
+	// raw bytes (a secret-filter redaction, rendered as a JSON string).
+	// Extras still win over it, matching Python's data.update running
+	// after the redaction. When nil the MESSAGE field is emitted as-is.
+	MessageOverride []byte
+}
+
+// NewExtraFragments renders a sender's extra_field_values (in document
+// order) as pre-escaped JSON fragments for the raw emission path. It is
+// called once at sender construction, not per entry.
+func NewExtraFragments(fields []Field) []ExtraFragment {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]ExtraFragment, 0, len(fields))
+	for _, field := range fields {
+		var buf bytes.Buffer
+		if err := appendPythonJSON(&buf, field.Key, field.Value); err != nil {
+			continue
+		}
+		out = append(out, ExtraFragment{Key: field.Key, JSON: buf.Bytes()})
+	}
+	return out
 }
 
 // EmitJSON appends one JSON object for the raw entry to dst, using the
@@ -83,6 +106,10 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 			continue
 		}
 		emitKey(key)
+		if len(opts.MessageOverride) > 0 && bytes.Equal(key, messageKey) {
+			dst = appendJSONString(dst, opts.MessageOverride)
+			continue
+		}
 		var err error
 		dst, err = appendFieldValue(dst, b, e, i)
 		if err != nil {
@@ -352,6 +379,7 @@ var (
 	realtimeTimestampKey = []byte("REALTIME_TIMESTAMP")
 	seqnumKey            = []byte("SEQNUM")
 	timestampKey         = []byte("timestamp")
+	messageKey           = []byte("MESSAGE")
 )
 
 // stripUnderscore returns key without its leading underscores (Python

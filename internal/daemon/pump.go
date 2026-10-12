@@ -450,6 +450,7 @@ type resolvedSender struct {
 	fieldFilter      *filter.FieldFilter
 	unitLogLevels    *filter.UnitLogLevel
 	extraFieldValues []journal.Field
+	extraFragments   []journal.ExtraFragment
 }
 
 // ReaderRuntime is the runtime half of JournalReader (journalpump.py
@@ -827,6 +828,7 @@ func (rt *ReaderRuntime) resolveSender(senderName string, raw any) (resolvedSend
 			return resolved, fmt.Errorf("readers.%s.senders.%s.extra_field_values: %w", rt.name, senderName, err)
 		}
 		resolved.extraFieldValues = extras
+		resolved.extraFragments = journal.NewExtraFragments(extras)
 	}
 	return resolved, nil
 }
@@ -1145,6 +1147,9 @@ func (rt *ReaderRuntime) readMessages(ctx context.Context) (exhausted bool, line
 // 1005-1017): ONE entry per call; the broad exception handler wraps
 // BOTH the read and the processing.
 func (rt *ReaderRuntime) readSingleMessage(ctx context.Context) (hasMore bool, bytesRead int, hasBytes bool, err error) {
+	if raw, ok := rt.journaldReader.(rawReader); ok {
+		return rt.readSingleRaw(ctx, raw)
+	}
 	entries, batchErr := rt.journaldReader.ReadBatch(1)
 	if errors.Is(batchErr, reader.ErrBadMessage) {
 		// Python read_next: corrupted_log_entry + None → (False, None)
@@ -1180,6 +1185,43 @@ func (rt *ReaderRuntime) readSingleMessage(ctx context.Context) (hasMore bool, b
 	return hasMore, bytesRead, hasBytes, nil
 }
 
+// rawReader is the optional raw-batch reader the streaming pipeline uses
+// when available (*reader.SDJournal). Keeping it optional lets the
+// converted-entry fakes keep exercising the old path.
+type rawReader interface {
+	ReadRaw(n int) (*journal.Batch, error)
+}
+
+// readSingleRaw is readSingleMessage over a raw batch entry: the
+// streaming counterpart of the converted path above. A field-less entry
+// is treated as exhaustion, matching the converted adapter's skip.
+func (rt *ReaderRuntime) readSingleRaw(ctx context.Context, raw rawReader) (hasMore bool, bytesRead int, hasBytes bool, err error) {
+	batch, batchErr := raw.ReadRaw(1)
+	if errors.Is(batchErr, reader.ErrBadMessage) {
+		rt.stats.CorruptedEntry()
+		return false, 0, false, nil
+	}
+	if batchErr != nil {
+		rt.broadHandler(batchErr)
+		return false, 0, false, nil
+	}
+	if len(batch.Entries) == 0 || len(batch.Entries[0].Fields) == 0 {
+		return false, 0, false, nil
+	}
+	entry := &batch.Entries[0]
+	cursor := string(batch.Cursor(entry))
+	if cursor != "" {
+		rt.setCursor(cursor)
+		rt.stats.NoteCursor()
+	}
+	hasMore, bytesRead, hasBytes, processErr := rt.processRaw(ctx, batch, entry)
+	if processErr != nil {
+		rt.broadHandler(processErr)
+		return false, 0, false, nil
+	}
+	return hasMore, bytesRead, hasBytes, nil
+}
+
 // broadHandler ports read_single_message's except-arm
 // (journalpump.py:1012-1017): log (Python's log.exception renders the
 // traceback; Go renders the error), the unexpected_exception counter,
@@ -1196,6 +1238,30 @@ func (rt *ReaderRuntime) broadHandler(err error) {
 // constructed per message): the live senders become the targets, in
 // initialization order (Python reader.senders insertion order).
 func (rt *ReaderRuntime) process(ctx context.Context, entry journal.Entry) (bool, int, bool, error) {
+	enqueueErr, targets, handler := rt.pipeline(ctx)
+	hasMore, bytesRead, hasBytes, err := handler.Process(entry, targets)
+	if err == nil && *enqueueErr != nil {
+		// Enqueue only fails on context cancellation (shutdown): stop
+		// reading, exactly like a ctx-done Wait would.
+		return false, 0, false, nil
+	}
+	return hasMore, bytesRead, hasBytes, err
+}
+
+// processRaw is process over a raw batch entry (Task 32).
+func (rt *ReaderRuntime) processRaw(ctx context.Context, batch *journal.Batch, entry *journal.RawEntry) (bool, int, bool, error) {
+	enqueueErr, targets, handler := rt.pipeline(ctx)
+	hasMore, bytesRead, hasBytes, err := handler.ProcessRaw(batch, entry, targets)
+	if err == nil && *enqueueErr != nil {
+		return false, 0, false, nil
+	}
+	return hasMore, bytesRead, hasBytes, err
+}
+
+// pipeline builds the live sender targets, the handler config and the
+// enqueue-error sink shared by the converted (process) and raw
+// (processRaw) paths.
+func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.SenderTarget, *journal.Handler) {
 	var enqueueErr error
 	// Read the CURRENT pump-level settings (Python's handler consults
 	// self.pump per entry), so a reload's global match/stats/tag changes
@@ -1225,6 +1291,7 @@ func (rt *ReaderRuntime) process(ctx context.Context, entry journal.Entry) (bool
 			FieldFilter:      resolved.fieldFilter,
 			UnitLogLevels:    resolved.unitLogLevels,
 			ExtraFieldValues: resolved.extraFieldValues,
+			ExtraFragments:   resolved.extraFragments,
 			AddItem: func(item []byte, cursor string) {
 				// Python msg_buffer.add_item never fails; Enqueue blocks
 				// only past the gate and returns on ctx cancellation
@@ -1254,13 +1321,7 @@ func (rt *ReaderRuntime) process(ctx context.Context, entry journal.Entry) (bool
 		// Python logging.getLogger(self.__class__.__name__) == "JournalObjectHandler".
 		Log: namedLogger(rt.pump.log, "JournalObjectHandler"),
 	})
-	hasMore, bytesRead, hasBytes, err := handler.Process(entry, targets)
-	if err == nil && enqueueErr != nil {
-		// Enqueue only fails on context cancellation (shutdown): stop
-		// reading, exactly like a ctx-done Wait would.
-		return false, 0, false, nil
-	}
-	return hasMore, bytesRead, hasBytes, err
+	return &enqueueErr, targets, handler
 }
 
 // recordHits ports the read_messages tail (journalpump.py:1046-1047):

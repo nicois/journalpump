@@ -114,6 +114,10 @@ type SenderTarget struct {
 	// document order (empty when absent, empty, or warned as a
 	// non-object at wiring time).
 	ExtraFieldValues []Field
+	// ExtraFragments is ExtraFieldValues pre-rendered as JSON fragments
+	// for the raw emission path (nil falls back to rendering
+	// ExtraFieldValues per call, which the tests rely on).
+	ExtraFragments []ExtraFragment
 	// AddItem admits one serialized payload with the entry's cursor
 	// (Python msg_buffer.add_item(item=..., cursor=...)).
 	AddItem func(item []byte, cursor string)
