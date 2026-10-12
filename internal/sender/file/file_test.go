@@ -99,8 +99,8 @@ func TestFileSenderGoldenPipeline(t *testing.T) {
 	target := journal.SenderTarget{
 		Name:             "s",
 		ExtraFieldValues: extras,
-		AddItem: func(item []byte, cursor string) {
-			if err := buf.Enqueue(ctx, sender.Item{Payload: item, Cursor: cursor}); err != nil {
+		AddItem: func(item []byte, cursor string, indexDate [10]byte) {
+			if err := buf.Enqueue(ctx, sender.Item{Payload: item, Cursor: cursor, IndexDate: indexDate}); err != nil {
 				t.Errorf("enqueue: %v", err)
 			}
 		},

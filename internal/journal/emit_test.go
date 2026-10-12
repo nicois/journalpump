@@ -240,6 +240,67 @@ func TestEmitJSONMatchesSerializeSemantically(t *testing.T) {
 	}
 }
 
+// TestEmitJSONIndexDate pins the Elasticsearch index-date sidecar (design
+// §2.4): it holds the synthesised timestamp's first 10 bytes when the
+// payload carries it, and stays zero when the timestamp is filtered out or
+// overridden by an extra, so a consumer parses rather than trusting a
+// mismatched date.
+func TestEmitJSONIndexDate(t *testing.T) {
+	cursor := "s=x;i=1a2b;b=1;m=2;t=3;x=4"
+	realtime := uint64(1700000000500000) // 2023-11-14T22:13:20.500000+00:00 UTC
+	timestamp, err := TimestampFromRealtime(float64(realtime) / 1e6)
+	if err != nil {
+		t.Fatalf("TimestampFromRealtime: %v", err)
+	}
+	want := pythonISOFormat(timestamp)[:10]
+
+	t.Run("filled", func(t *testing.T) {
+		b := buildBatch(t, realtime, cursor, "MESSAGE=hello", "PRIORITY=6")
+		var got [10]byte
+		if _, err := EmitJSON(nil, b, &b.Entries[0], &EmitOptions{IndexDate: &got}); err != nil {
+			t.Fatalf("EmitJSON: %v", err)
+		}
+		if string(got[:]) != want {
+			t.Fatalf("index date = %q, want %q", got[:], want)
+		}
+	})
+
+	t.Run("timestamp filtered out", func(t *testing.T) {
+		b := buildBatch(t, realtime, cursor, "MESSAGE=hello")
+		var got [10]byte
+		if _, err := EmitJSON(nil, b, &b.Entries[0], &EmitOptions{
+			Filter:    blacklistFilter(t, "timestamp"),
+			IndexDate: &got,
+		}); err != nil {
+			t.Fatalf("EmitJSON: %v", err)
+		}
+		if got != ([10]byte{}) {
+			t.Fatalf("index date = %q, want zero (timestamp filtered)", got[:])
+		}
+	})
+
+	t.Run("extra overrides timestamp", func(t *testing.T) {
+		b := buildBatch(t, realtime, cursor, "MESSAGE=hello")
+		var got [10]byte
+		if _, err := EmitJSON(nil, b, &b.Entries[0], &EmitOptions{
+			Extras:    extraFragments(t, []Field{{Key: "timestamp", Value: "2000-01-01T00:00:00"}}),
+			IndexDate: &got,
+		}); err != nil {
+			t.Fatalf("EmitJSON: %v", err)
+		}
+		if got != ([10]byte{}) {
+			t.Fatalf("index date = %q, want zero (extra override)", got[:])
+		}
+	})
+
+	t.Run("nil sidecar is safe", func(t *testing.T) {
+		b := buildBatch(t, realtime, cursor, "MESSAGE=hello")
+		if _, err := EmitJSON(nil, b, &b.Entries[0], &EmitOptions{}); err != nil {
+			t.Fatalf("EmitJSON: %v", err)
+		}
+	})
+}
+
 // TestEmitJSONStaysByteIdenticalForTheCommonCases is the byte canary: the
 // cases where byte-identity is free must still be byte-for-byte the old
 // output (no fixture churn while the contract is relaxed).

@@ -473,8 +473,27 @@ func (s *Sender) disconnected(err error) {
 	}
 }
 
-// SendMessages ports _EsOsLogSenderBase.send_messages.
+// SendMessages ports _EsOsLogSenderBase.send_messages for bare payloads
+// (no index-date sidecar): it reconstructs Items with zero sidecars, so
+// every message takes the parsing path.
 func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) error {
+	items := make([]sender.Item, len(batch))
+	for i, msg := range batch {
+		items[i] = sender.Item{Payload: msg}
+	}
+	return s.send(ctx, items)
+}
+
+// SendMessagesWithIndexDate is the Item-taking entry point (design §2.4):
+// a message whose producer supplied the sidecar skips parseMessage on the
+// common path (index already known); a zero sidecar falls back to the
+// parsing path, which preserves the missing/invalid timestamp behaviour.
+func (s *Sender) SendMessagesWithIndexDate(ctx context.Context, batch []sender.Item, _ string) error {
+	return s.send(ctx, batch)
+}
+
+// send ports _EsOsLogSenderBase.send_messages.
+func (s *Sender) send(ctx context.Context, batch []sender.Item) error {
 	start := time.Now()
 	if err := s.loadIndices(ctx); err != nil {
 		s.logWarn("Waiting for connection for %s", s.cfg.senderType)
@@ -482,17 +501,33 @@ func (s *Sender) SendMessages(ctx context.Context, batch [][]byte, _ string) err
 	}
 	var buf bytes.Buffer
 	var lastName string
-	for _, msg := range batch {
-		message, err := parseMessage(msg)
-		if err != nil {
-			return err
-		}
-		idxDate, err := s.indexDate(message)
-		if err != nil {
-			return err
+	for _, item := range batch {
+		msg := item.Payload
+		var message map[string]any
+		var idxDate string
+		if item.IndexDate != ([10]byte{}) {
+			idxDate = string(item.IndexDate[:])
+		} else {
+			parsed, err := parseMessage(msg)
+			if err != nil {
+				return err
+			}
+			message = parsed
+			date, err := s.indexDate(message)
+			if err != nil {
+				return err
+			}
+			idxDate = date
 		}
 		idxName := s.cfg.indexName + "-" + idxDate
 		if _, ok := s.indices[idxName]; !ok {
+			if message == nil {
+				parsed, err := parseMessage(msg)
+				if err != nil {
+					return err
+				}
+				message = parsed
+			}
 			s.createIndexAndMapping(ctx, idxName, message)
 		}
 		header, err := s.messageHeader(idxName)

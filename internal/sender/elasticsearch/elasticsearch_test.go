@@ -466,6 +466,39 @@ func TestSendMessagesUsesTimestampForIndexName(t *testing.T) {
 	}
 }
 
+// TestSendMessagesWithIndexDateSkipsParsing pins the sidecar fast path
+// (design §2.4): a message carrying a non-zero IndexDate is indexed without
+// parseMessage, so an otherwise unparseable payload is accepted when the
+// index is already known; the zero-sidecar path still parses and errors.
+func TestSendMessagesWithIndexDateSkipsParsing(t *testing.T) {
+	srv := newCaptureServer(t)
+	s := newTestSender(t, opensearch, srv.URL, discardLogger{})
+	s.version = &version{major: 8, minor: 0, patch: 0}
+	idx := defaultIndexPrefix + "-2025-06-26"
+	s.indices[idx] = struct{}{}
+
+	payload := []byte(`not json at all`)
+	var sidecar [10]byte
+	copy(sidecar[:], "2025-06-26")
+	if err := s.SendMessagesWithIndexDate(
+		context.Background(), []sender.Item{{Payload: payload, Cursor: "c1", IndexDate: sidecar}}, "c1",
+	); err != nil {
+		t.Fatalf("SendMessagesWithIndexDate: %v", err)
+	}
+	posts := srv.requestsWith(http.MethodPost, "/"+idx+"/_bulk")
+	if len(posts) != 1 {
+		t.Fatalf("bulk POST to %s = %d, want 1", idx, len(posts))
+	}
+	if !bytes.Contains(posts[0].Body, payload) {
+		t.Errorf("bulk body %q missing the raw payload", posts[0].Body)
+	}
+
+	// The same payload with no sidecar takes the parsing path and fails.
+	if err := s.SendMessages(context.Background(), [][]byte{payload}, "c1"); err == nil {
+		t.Fatal("SendMessages accepted an unparseable payload without a sidecar")
+	}
+}
+
 func TestBulkBodyAndHeaders(t *testing.T) {
 	srv := newCaptureServer(t)
 	s := newTestSender(t, opensearch, srv.URL, discardLogger{})

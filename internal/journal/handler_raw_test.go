@@ -19,12 +19,51 @@ func collectTargets(targets []SenderTarget, got *[][]byte) []SenderTarget {
 	for i := range targets {
 		target := targets[i]
 		idx := i
-		target.AddItem = func(item []byte, _ string) {
+		target.AddItem = func(item []byte, _ string, _ [10]byte) {
 			(*got)[idx] = append([]byte(nil), item...)
 		}
 		out[i] = target
 	}
 	return out
+}
+
+// TestProcessRawIndexDateSidecar pins that the raw pipeline threads the
+// Elasticsearch index date from the emitter to AddItem (design §2.4): the
+// synthesised timestamp's first 10 bytes when the payload carries it, and
+// zero when the sender's filter removes the timestamp key.
+func TestProcessRawIndexDateSidecar(t *testing.T) {
+	cursor := "s=x;i=1a2b;b=1;m=2;t=3;x=4"
+	realtime := uint64(1700000000500000)
+	timestamp, err := TimestampFromRealtime(float64(realtime) / 1e6)
+	if err != nil {
+		t.Fatalf("TimestampFromRealtime: %v", err)
+	}
+	want := pythonISOFormat(timestamp)[:10]
+
+	capture := func(t *testing.T, filter *filter.FieldFilter) [10]byte {
+		t.Helper()
+		b := buildBatch(t, realtime, cursor, "MESSAGE=hello", "PRIORITY=6")
+		var got [10]byte
+		calls := 0
+		tgt := SenderTarget{Name: "s", FieldFilter: filter, AddItem: func(_ []byte, _ string, id [10]byte) {
+			got = id
+			calls++
+		}}
+		if _, _, _, err := NewHandler(HandlerConfig{}).ProcessRaw(b, &b.Entries[0], []SenderTarget{tgt}); err != nil {
+			t.Fatalf("ProcessRaw: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("AddItem calls = %d, want 1", calls)
+		}
+		return got
+	}
+
+	if got := capture(t, nil); string(got[:]) != want {
+		t.Fatalf("index date = %q, want %q", got[:], want)
+	}
+	if got := capture(t, blacklistFilter(t, "timestamp")); got != ([10]byte{}) {
+		t.Fatalf("index date = %q, want zero when the filter drops timestamp", got[:])
+	}
 }
 
 func runBoth(t *testing.T, fields []string, targets []SenderTarget) (raw, old [][]byte) {

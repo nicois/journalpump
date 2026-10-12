@@ -43,6 +43,9 @@ type rawCacheEntry struct {
 	// decision.
 	unit     string
 	priority any
+	// indexDate is the Elasticsearch index date (timestamp[:10]) of the
+	// payload, or zero when it must be recovered by parsing (design §2.4).
+	indexDate [10]byte
 }
 
 // ProcessRaw is Process over a raw batch entry. Semantics are exactly
@@ -126,7 +129,7 @@ func (h *Handler) emitRaw(b *Batch, e *RawEntry, targets []SenderTarget, cursor 
 		}
 		if ce, ok := cache[ffName]; ok {
 			if h.cacheHitPasses(target.UnitLogLevels, ce) && len(ce.payload) > 0 && target.AddItem != nil {
-				target.AddItem(ce.payload, cursor)
+				target.AddItem(ce.payload, cursor, ce.indexDate)
 			}
 			continue
 		}
@@ -144,10 +147,12 @@ func (h *Handler) emitRaw(b *Batch, e *RawEntry, targets []SenderTarget, cursor 
 			continue
 		}
 
+		var indexDate [10]byte
 		payload, err := EmitJSON(nil, b, e, &EmitOptions{
 			Filter:          target.FieldFilter,
 			Extras:          effFragments,
 			MessageOverride: msgOverride,
+			IndexDate:       &indexDate,
 		})
 		if err != nil {
 			return nil, err
@@ -166,11 +171,12 @@ func (h *Handler) emitRaw(b *Batch, e *RawEntry, targets []SenderTarget, cursor 
 			keptUnit:     target.FieldFilter == nil || target.FieldFilter.Keep("SYSTEMD_UNIT"),
 			unit:         unit,
 			priority:     priority,
+			indexDate:    indexDate,
 		}
 		accFragments = effFragments
 		accFields = effFields
 		if target.AddItem != nil {
-			target.AddItem(payload, cursor)
+			target.AddItem(payload, cursor, indexDate)
 		}
 	}
 	return cache, nil

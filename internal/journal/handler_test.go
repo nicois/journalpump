@@ -34,13 +34,15 @@ func (r *recordingStats) Increase(name string, value int64, tags map[string]stri
 
 // collector is one SenderTarget's AddItem sink.
 type collector struct {
-	items   [][]byte
-	cursors []string
+	items      [][]byte
+	cursors    []string
+	indexDates [][10]byte
 }
 
-func (c *collector) add(item []byte, cursor string) {
+func (c *collector) add(item []byte, cursor string, indexDate [10]byte) {
 	c.items = append(c.items, item)
 	c.cursors = append(c.cursors, cursor)
+	c.indexDates = append(c.indexDates, indexDate)
 }
 
 func target(ff *filter.FieldFilter, ull *filter.UnitLogLevel, extras []Field, c *collector) SenderTarget {

@@ -72,6 +72,11 @@ func (discardLogger) Printf(_ string, _ ...any) {}
 type Item struct {
 	Payload []byte
 	Cursor  string
+	// IndexDate is the Elasticsearch index date sidecar (the payload's
+	// timestamp[:10]), or the zero value when the producer could not derive
+	// it without parsing (design §2.4): transports that want it take whole
+	// Items through IndexDateSender and fall back to parsing a zero sidecar.
+	IndexDate [10]byte
 }
 
 // Sender is the transport-specific half of a sender (spec §4.2).
@@ -83,6 +88,15 @@ type Item struct {
 type Sender interface {
 	SendMessages(ctx context.Context, batch [][]byte, cursor string) error
 	MaintenanceOperations(ctx context.Context) error
+}
+
+// IndexDateSender is an OPTIONAL transport capability: the transport wants
+// the per-item sidecars (Item.IndexDate) and therefore takes whole Items
+// instead of bare payloads. The shared loop prefers it over SendMessages
+// when the transport implements it (ElasticsearchSender, which otherwise
+// re-parses every payload just to find its index date).
+type IndexDateSender interface {
+	SendMessagesWithIndexDate(ctx context.Context, batch []Item, cursor string) error
 }
 
 // Finalizer is an OPTIONAL transport capability: flush any buffered
@@ -526,11 +540,17 @@ func (l *Loop) drain(ctx context.Context) {
 		}
 		batch, rest := sliceBatch(items, l.maxBatchSize, l.messageOverhead)
 		cursor := batch[len(batch)-1].Cursor
-		bodies := make([][]byte, len(batch))
-		for i, item := range batch {
-			bodies[i] = item.Payload
+		var err error
+		if ids, ok := l.transport.(IndexDateSender); ok {
+			err = ids.SendMessagesWithIndexDate(ctx, batch, cursor)
+		} else {
+			bodies := make([][]byte, len(batch))
+			for i, item := range batch {
+				bodies[i] = item.Payload
+			}
+			err = l.transport.SendMessages(ctx, bodies, cursor)
 		}
-		if err := l.transport.SendMessages(ctx, bodies, cursor); err != nil {
+		if err != nil {
 			l.failBatch(err)
 			l.hold(items)
 			// A transport that performed the shared backoff itself (Python

@@ -1015,3 +1015,60 @@ func newStatsClient(capture *udpCapture) *statsd.Client {
 	host, port := capture.addr()
 	return statsd.New(&host, port, nil, nil, "", nil)
 }
+
+// indexDateFakeTransport records which send entry point the loop chose and
+// the Items it received (the IndexDateSender preference, design §2.4).
+type indexDateFakeTransport struct {
+	mu          sync.Mutex
+	itemCalls   int
+	itemBatches [][]Item
+}
+
+func (t *indexDateFakeTransport) SendMessages(context.Context, [][]byte, string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	panic("SendMessages must not be called: the loop must prefer IndexDateSender")
+}
+
+func (t *indexDateFakeTransport) SendMessagesWithIndexDate(_ context.Context, batch []Item, _ string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.itemCalls++
+	t.itemBatches = append(t.itemBatches, batch)
+	return nil
+}
+
+func (t *indexDateFakeTransport) MaintenanceOperations(context.Context) error { return nil }
+
+// TestLoopPrefersIndexDateSender pins that a transport implementing
+// IndexDateSender receives whole Items (with their sidecars) instead of the
+// bare-payload SendMessages path.
+func TestLoopPrefersIndexDateSender(t *testing.T) {
+	t.Parallel()
+	tr := &indexDateFakeTransport{}
+	in := make(chan Item, 4)
+	loop := NewLoop(
+		LoopConfig{Name: "out", Tags: map[string]string{}},
+		Instance{Transport: tr, MaxSendInterval: time.Hour, Type: "FakeSender"},
+		in,
+	)
+	var sidecar [10]byte
+	copy(sidecar[:], "2025-06-26")
+	in <- Item{Payload: []byte("x"), Cursor: "c0", IndexDate: sidecar}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loop.drain(ctx)
+
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.itemCalls != 1 {
+		t.Fatalf("SendMessagesWithIndexDate calls = %d, want 1", tr.itemCalls)
+	}
+	if len(tr.itemBatches) != 1 || len(tr.itemBatches[0]) != 1 {
+		t.Fatalf("batches = %v, want one batch of one", tr.itemBatches)
+	}
+	if got := tr.itemBatches[0][0].IndexDate; got != sidecar {
+		t.Fatalf("sidecar = %q, want %q", got[:], sidecar[:])
+	}
+}

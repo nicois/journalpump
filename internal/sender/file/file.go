@@ -119,15 +119,16 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // same messages, duplicates included).
 func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error {
 	for _, msg := range batch {
-		// msg + b"\n" — a fresh buffer, never an in-place append to the
-		// payload slice.
-		line := make([]byte, 0, len(msg)+1)
-		line = append(line, msg...)
-		line = append(line, '\n')
+		// msg + b"\n", written as two bufio writes (design §2.4): the file
+		// bytes are identical to a single line buffer but no per-message
+		// copy is allocated.
 		s.mu.Lock()
-		_, err := s.buf.Write(line)
+		_, err := s.buf.Write(msg)
 		if err == nil {
-			s.rawEnd += int64(len(line))
+			_, err = s.buf.Write(newline)
+		}
+		if err == nil {
+			s.rawEnd += int64(len(msg)) + 1
 			s.payloadEnd += int64(len(msg))
 			s.queue = append(s.queue, flushMark{rawEnd: s.rawEnd, payloadEnd: s.payloadEnd})
 		}
@@ -138,6 +139,9 @@ func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error
 	}
 	return nil
 }
+
+// newline is the line terminator the file sender appends (b"\n").
+var newline = []byte{'\n'}
 
 // MaintenanceOperations implements sender.Sender; the file sender has
 // none (no base.py override in file.py).

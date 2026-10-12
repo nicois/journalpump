@@ -118,9 +118,10 @@ type SenderTarget struct {
 	// for the raw emission path (nil falls back to rendering
 	// ExtraFieldValues per call, which the tests rely on).
 	ExtraFragments []ExtraFragment
-	// AddItem admits one serialized payload with the entry's cursor
-	// (Python msg_buffer.add_item(item=..., cursor=...)).
-	AddItem func(item []byte, cursor string)
+	// AddItem admits one serialized payload with the entry's cursor and
+	// the payload's Elasticsearch index date sidecar (zero when unknown;
+	// Python msg_buffer.add_item(item=..., cursor=...)).
+	AddItem func(item []byte, cursor string, indexDate [10]byte)
 }
 
 // Handler is the per-message pipeline of journalpump.py
@@ -209,7 +210,11 @@ func (h *Handler) Process(entry Entry, targets []SenderTarget) (hasMore bool, by
 		// skipped.
 		if len(jsonEntry) > 0 {
 			if target.AddItem != nil {
-				target.AddItem(jsonEntry, entry.Cursor)
+				// The converted path is the semantic oracle, not the live
+				// pipeline (the pump runs ProcessRaw); it does not carry the
+				// Elasticsearch index-date sidecar, so consumers fall back to
+				// parsing the payload.
+				target.AddItem(jsonEntry, entry.Cursor, [10]byte{})
 			}
 		}
 	}

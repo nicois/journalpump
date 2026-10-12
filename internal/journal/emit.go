@@ -40,6 +40,14 @@ type EmitOptions struct {
 	// Extras still win over it, matching Python's data.update running
 	// after the redaction. When nil the MESSAGE field is emitted as-is.
 	MessageOverride []byte
+	// IndexDate, when non-nil, receives the Elasticsearch index date
+	// (timestamp[:10]) of the emitted payload. It is filled only when the
+	// payload carries the SYNTHESISED ISO timestamp (the timestamp key is
+	// kept by the filter and no extra overrides it); it is left zero when
+	// the timestamp is filtered out, overridden by an extra, or shorter
+	// than 10 bytes — the Elasticsearch consumer then falls back to
+	// parsing the payload (ElasticsearchSender.index_date).
+	IndexDate *[10]byte
 }
 
 // NewExtraFragments renders a sender's extra_field_values (in document
@@ -153,7 +161,18 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 		}
 	}
 	if err := emitSynth("timestamp", func() ([]byte, error) {
-		return renderTimestamp(e.Realtime)
+		timestamp, err := TimestampFromRealtime(float64(e.Realtime) / 1e6)
+		if err != nil {
+			return nil, err
+		}
+		iso := pythonISOFormat(timestamp)
+		// render runs only when the synthesised value is actually emitted,
+		// so filling the sidecar here is exactly the "payload carries the
+		// synthesised timestamp" condition.
+		if opts.IndexDate != nil && len(iso) >= 10 {
+			copy(opts.IndexDate[:], iso[:10])
+		}
+		return appendJSONString(nil, []byte(iso)), nil
 	}); err != nil {
 		return nil, err
 	}
@@ -202,17 +221,6 @@ func markExtras(extras []ExtraFragment, used []bool, key []byte) {
 			used[i] = true
 		}
 	}
-}
-
-// renderTimestamp renders the ISO timestamp for a realtime usec, matching
-// the old timestamp field (TimestampFromRealtime over the converted
-// REALTIME_TIMESTAMP float).
-func renderTimestamp(realtime uint64) ([]byte, error) {
-	timestamp, err := TimestampFromRealtime(float64(realtime) / 1e6)
-	if err != nil {
-		return nil, err
-	}
-	return appendJSONString(nil, []byte(pythonISOFormat(timestamp))), nil
 }
 
 // renderNumber renders a seqnum result (int64 or json.Number) as JSON.

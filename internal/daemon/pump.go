@@ -1292,14 +1292,14 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 			UnitLogLevels:    resolved.unitLogLevels,
 			ExtraFieldValues: resolved.extraFieldValues,
 			ExtraFragments:   resolved.extraFragments,
-			AddItem: func(item []byte, cursor string) {
+			AddItem: func(item []byte, cursor string, indexDate [10]byte) {
 				// Python msg_buffer.add_item never fails; Enqueue blocks
 				// only past the gate and returns on ctx cancellation
 				// (shutdown) — recorded, not dropped.
 				if enqueueErr != nil {
 					return
 				}
-				enqueueErr = sbuf.Enqueue(ctx, sender.Item{Payload: item, Cursor: cursor})
+				enqueueErr = sbuf.Enqueue(ctx, sender.Item{Payload: item, Cursor: cursor, IndexDate: indexDate})
 			},
 		})
 	}
