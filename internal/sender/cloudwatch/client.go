@@ -48,6 +48,12 @@ const (
 	readTimeout    = 60 * time.Second
 )
 
+// defaultRetryMaxAttempts matches botocore's default attempt count (its default
+// retry mode is legacy, with 5 attempts; the SDK's standard default is 3).
+// Applied only when neither the environment nor the selected profile overrides
+// the attempt count or the mode.
+const defaultRetryMaxAttempts = 5
+
 // sdkConfig is the botocore-compatible settings resolved from the sender
 // config and the environment before the SDK client is built.
 type sdkConfig struct {
@@ -75,6 +81,11 @@ type sdkConfig struct {
 
 	// proxy is the botocore-compatible transport proxy selector.
 	proxy func(*http.Request) (*url.URL, error)
+
+	// setMaxAttempts/maxAttempts force botocore's default attempt count when
+	// nothing else overrides retry.
+	setMaxAttempts bool
+	maxAttempts    int
 
 	// baseEndpoint overrides the service endpoint (tests).
 	baseEndpoint string
@@ -179,10 +190,23 @@ func resolveConfig(cfg map[string]any, environ []string) (sdkConfig, error) {
 	// profile; the SDK has no native ca_bundle key, so it is parsed here.
 	sc.caBundle = envLookup(environ, "AWS_CA_BUNDLE")
 	if sc.caBundle == "" {
-		sc.caBundle = profileCABundle(sc.profile, environ)
+		sc.caBundle = sharedConfigValue(sc.profile, environ, "ca_bundle")
 	}
 	if sc.caBundle == "" {
 		sc.caBundle = envLookup(environ, "REQUESTS_CA_BUNDLE")
+	}
+
+	// Retry: botocore's default is legacy mode with 5 attempts (the SDK's
+	// standard default is 3). When neither the environment nor the selected
+	// profile overrides the attempt count or the mode, apply botocore's 5;
+	// otherwise leave resolution to the SDK (AWS_MAX_ATTEMPTS / profile
+	// max_attempts / standard|adaptive). An explicit legacy/unknown mode fails
+	// construction with the SDK's own error (documented deviation, charter §2).
+	if envLookup(environ, "AWS_MAX_ATTEMPTS") == "" &&
+		envLookup(environ, "AWS_RETRY_MODE") == "" &&
+		sharedConfigValue(sc.profile, environ, "max_attempts") == "" &&
+		sharedConfigValue(sc.profile, environ, "retry_mode") == "" {
+		sc.setMaxAttempts, sc.maxAttempts = true, defaultRetryMaxAttempts
 	}
 
 	// Retry is left to the SDK's own env/profile resolution. botocore and the
@@ -234,6 +258,9 @@ func (sc sdkConfig) loadOptions() ([]func(*config.LoadOptions) error, error) {
 		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(sc.envAccessKey, sc.envSecretKey, sc.envSession),
 		))
+	}
+	if sc.setMaxAttempts {
+		opts = append(opts, config.WithRetryMaxAttempts(sc.maxAttempts))
 	}
 	if sc.caBundle != "" {
 		pem, err := os.ReadFile(sc.caBundle)
@@ -290,12 +317,12 @@ func envLookup(environ []string, key string) string {
 	return ""
 }
 
-// profileCABundle reads the ca_bundle setting for the selected profile from the
-// shared config file (AWS_CONFIG_FILE, else ~/.aws/config), mirroring
-// botocore's config-file lookup: the default profile uses [default], others use
-// [profile NAME]. An unreadable or absent file yields "". This exists because
-// the SDK has no native ca_bundle config key.
-func profileCABundle(profile string, environ []string) string {
+// sharedConfigValue reads key for the selected profile from the shared config
+// file (AWS_CONFIG_FILE, else ~/.aws/config), mirroring botocore's config-file
+// lookup: the default profile uses [default], others use [profile NAME]. An
+// unreadable or absent file yields "". This exists because the SDK exposes no
+// reader for arbitrary config-file keys (ca_bundle, max_attempts, retry_mode).
+func sharedConfigValue(profile string, environ []string, key string) string {
 	if profile == "" {
 		profile = "default"
 	}
@@ -331,11 +358,11 @@ func profileCABundle(profile string, environ []string) string {
 		if !inSection {
 			continue
 		}
-		key, value, ok := strings.Cut(line, "=")
+		k, value, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(key), "ca_bundle") {
+		if strings.EqualFold(strings.TrimSpace(k), key) {
 			return strings.TrimSpace(value)
 		}
 	}

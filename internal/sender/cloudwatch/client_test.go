@@ -233,51 +233,77 @@ func TestResolveConfigEnvCredentials(t *testing.T) {
 }
 
 // TestSDKRetryResolution uses the real SDK loader to pin the retry behavior:
-// the standard-mode default is 3 attempts, AWS_MAX_ATTEMPTS overrides it, and
-// AWS_RETRY_MODE=legacy is rejected by the SDK (a documented deviation —
-// botocore accepts it).
+// botocore's 5-attempt default when nothing overrides it, AWS_MAX_ATTEMPTS and
+// profile max_attempts overrides, standard/adaptive mode defaults (3), and the
+// documented rejection of an explicit legacy mode.
 func TestSDKRetryResolution(t *testing.T) {
-	base := sdkConfig{region: "us-east-1", accessKey: "k", secretKey: "s", hasCreds: true}
+	cfgPath := writeConfig(t, "[profile probe]\nmax_attempts = 7\n")
 
-	// attempts reads the retryer the REAL CloudWatch client resolves (the
-	// SDK applies the mode's default attempt count when none is set).
-	attempts := func(t *testing.T) int {
+	// retryer resolves the config exactly as the production path does
+	// (resolveConfig decides the botocore default, then the SDK loads it).
+	retryer := func(t *testing.T) aws.Retryer {
 		t.Helper()
-		loaded, err := loadAWSConfig(context.Background(), base)
+		sc, err := resolveConfig(nil, os.Environ())
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		sc.region, sc.accessKey, sc.secretKey, sc.hasCreds = "us-east-1", "k", "s", true
+		loaded, err := loadAWSConfig(context.Background(), sc)
 		if err != nil {
 			t.Fatalf("loadAWSConfig: %v", err)
 		}
-		return cloudwatchlogs.NewFromConfig(loaded).Options().Retryer.MaxAttempts()
+		return cloudwatchlogs.NewFromConfig(loaded).Options().Retryer
 	}
 
-	t.Setenv("AWS_MAX_ATTEMPTS", "")
-	t.Setenv("AWS_RETRY_MODE", "")
-	if got := attempts(t); got != 3 {
-		t.Errorf("default max attempts = %d, want 3 (standard/adaptive default)", got)
+	resetRetryEnv := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("AWS_MAX_ATTEMPTS", "")
+		t.Setenv("AWS_RETRY_MODE", "")
+		t.Setenv("AWS_DEFAULT_PROFILE", "")
+		t.Setenv("AWS_PROFILE", "")
+		t.Setenv("AWS_CONFIG_FILE", writeConfig(t, "[default]\n"))
 	}
 
+	// Nothing overrides → botocore's 5.
+	resetRetryEnv(t)
+	if got := retryer(t).MaxAttempts(); got != 5 {
+		t.Errorf("default max attempts = %d, want 5 (botocore default)", got)
+	}
+
+	// AWS_MAX_ATTEMPTS wins.
 	t.Setenv("AWS_MAX_ATTEMPTS", "9")
-	if got := attempts(t); got != 9 {
+	if got := retryer(t).MaxAttempts(); got != 9 {
 		t.Errorf("AWS_MAX_ATTEMPTS max attempts = %d, want 9", got)
 	}
 	t.Setenv("AWS_MAX_ATTEMPTS", "")
 
-	t.Setenv("AWS_RETRY_MODE", "adaptive")
-	loaded, err := loadAWSConfig(context.Background(), base)
-	if err != nil {
-		t.Fatalf("loadAWSConfig adaptive: %v", err)
+	// Profile max_attempts wins.
+	t.Setenv("AWS_CONFIG_FILE", cfgPath)
+	t.Setenv("AWS_DEFAULT_PROFILE", "probe")
+	if got := retryer(t).MaxAttempts(); got != 7 {
+		t.Errorf("profile max attempts = %d, want 7", got)
 	}
-	if loaded.RetryMode != aws.RetryModeAdaptive {
-		t.Errorf("adaptive mode = %q, want adaptive", loaded.RetryMode)
-	}
-	if got := attempts(t); got != 3 {
-		t.Errorf("adaptive default max attempts = %d, want 3", got)
-	}
+	t.Setenv("AWS_DEFAULT_PROFILE", "")
+	t.Setenv("AWS_CONFIG_FILE", writeConfig(t, "[default]\n"))
 
-	// The SDK rejects botocore's default mode value; this is the deviation the
-	// parity doc records (botocore treats legacy as its default).
+	// Explicit standard/adaptive modes keep botocore's 3-attempt default.
+	for _, mode := range []string{"standard", "adaptive"} {
+		t.Setenv("AWS_RETRY_MODE", mode)
+		r := retryer(t)
+		if got := r.MaxAttempts(); got != 3 {
+			t.Errorf("%s max attempts = %d, want 3", mode, got)
+		}
+	}
+	t.Setenv("AWS_RETRY_MODE", "")
+
+	// The ONE deviation: an explicit legacy mode fails construction.
 	t.Setenv("AWS_RETRY_MODE", "legacy")
-	if _, err := loadAWSConfig(context.Background(), base); err == nil {
+	sc, err := resolveConfig(nil, os.Environ())
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	sc.region, sc.accessKey, sc.secretKey, sc.hasCreds = "us-east-1", "k", "s", true
+	if _, err := loadAWSConfig(context.Background(), sc); err == nil {
 		t.Error("AWS_RETRY_MODE=legacy accepted, want SDK rejection")
 	}
 }
