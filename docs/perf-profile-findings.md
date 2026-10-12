@@ -86,7 +86,7 @@ field slice).
 
 `PythonJSONString` (18.8 % of CPU) appends the 80-400 byte `MESSAGE` **one
 rune at a time** through `bytes.Buffer.WriteRune` (1.01 s cumulative; that
-is ~84 % of the escaping cost), and returns `out.String()` for a copy:
+is ~45 % of the function's 2.26 s), and returns `out.String()` for a copy:
 
 ```
      520ms      2.26s ...  journal.PythonJSONString
@@ -125,27 +125,37 @@ Same workload, same config, Go binary only, 5 measured runs + 1 warmup:
 | Go, `GOMAXPROCS=1` | **8.62 s** (8.26..9.19) | 72.54 s | 256.4 MiB | 4,136/s |
 | Python (for reference) | 8.94 s | 71.20 s | 217.6 MiB | 4,214/s |
 
-**The parallelism hypothesis is NOT the whole story, but it is real.** At
-`GOMAXPROCS=1` Go's CPU drops by **4.73 s (35 %)** with no wall penalty
-(72.54 vs 74.51 s, within the 10 s sampling bound): that ~4.7 s is GC and
-other goroutines (reader, sender loop) running concurrently on otherwise
-idle cores. The program is only ~16 % CPU-busy per wall second, so the GC
-has 15 spare cores to spread mark work over — that inflates *CPU-seconds*
-without inflating wall time.
+**Observation:** at `GOMAXPROCS=1` Go's CPU falls by **4.73 s (35 %)** with
+no wall penalty (72.54 vs 74.51 s, within the 10 s sampling bound). That
+reduction is the measured fact.
+
+**Hypothesis (not established by these measurements):** the 4.73 s is work
+that runs on otherwise-idle cores when more than one P is available. The
+program is only ~16 % CPU-busy per wall second, so there are ~15 spare
+cores to spread such work over, which would inflate *CPU-seconds* without
+inflating wall time. **The composition of the 4.73 s is NOT fully
+attributed.** The whole-run profile attributes only ~1.9 s to GC
+mark+sweep, so "it is all GC" would be over-claiming by ~2.8 s: the
+remainder is GC-*adjacent* runtime work that also only exists because of
+concurrent execution (allocation and freeing on multiple Ps, heap growth
+and `memclr`, background sweep, the reader/sender goroutines themselves),
+but this harness did not measure that split. One concrete piece of
+counter-evidence to a pure-GC story: peak RSS *rises* slightly at
+GOMAXPROCS=1 (256.4 vs 253.5 MiB) while CPU falls.
 
 But a single core is not a free pass: Go at `GOMAXPROCS=1` (8.62 s) is
 **not meaningfully below Python's 8.94 s**. For a fixed volume of data a
 compiled daemon would be expected to use *much* less CPU than an
-interpreter; here it does not. The parallelism explains *where* the
-CPU-seconds are spent (concurrent GC), but the reason there is so much GC to
-spread is the **~12.5 KB / ~158 allocations per entry** above.
+interpreter; here it does not.
 
 **This is a genuine design observation to flag, not to explain away**: on
 this workload the Go port's single-core CPU is on par with Python's, not
-better. The excess CPU-seconds at default `GOMAXPROCS` are real work (GC
-mark/sweep burning otherwise-idle cores). Removing the allocation churn
-should lower both the `GOMAXPROCS=1` number and the default-GOMAXPROCS
-number.
+better, and that is independent of any GC hypothesis — it is a `GOMAXPROCS=1`
+measurement. The ~12.5 KB / ~158 allocations per entry above are the
+mechanism that keeps the *serial* work at Python levels, and they are also
+why so much auxiliary runtime work exists to spread across cores. Removing
+the allocation churn should lower both the `GOMAXPROCS=1` number and the
+default-GOMAXPROCS number; the size of the latter is not predicted here.
 
 ## Python-fidelity (parity) tax
 
@@ -180,19 +190,34 @@ refresh with `make bench-pgo`). `go build` applies it automatically — the
 build metadata records `-pgo=/…/cmd/journalpump/default.pgo`, so the
 packaging builds (`make build-go`) pick it up without change.
 
-Go-only, same workload/config, 5 runs + 1 warmup:
+**The like-for-like comparison is two whole runs** — the same fixture,
+config and host, 5 measured runs each, differing only in whether
+`default.pgo` existed at build time. Both are the committed baseline at
+different commits, so the numbers are reproducible from git:
 
-| build | cpu_s | wall_s | peak RSS | entries/s |
+| build | cpu_s (median, range) | wall_s (median) | peak RSS | entries/s |
 |---|---:|---:|---:|---:|
-| before PGO (committed baseline) | 13.35 s | 74.51 s | 253.5 MiB | 4,026/s |
-| after PGO (`default.pgo`) | 13.02 s | 73.52 s | 253.8 MiB | 4,081/s |
-| delta | −2.5 % | −1.3 % | +0.1 % | +1.4 % |
+| **without** PGO (`bench/results/baseline-…json` at `e1b0d7c`) | 13.33 s (12.23-13.83) | 73.56 s | 252.7 MiB | 4,078/s |
+| **with** PGO (`…` at `fa773fb`; the committed baseline) | 13.35 s (12.75-13.61) | 74.51 s | 253.5 MiB | 4,026/s |
+| delta | **+0.2 %** | +1.3 % | +0.3 % | −1.3 % |
 
-PGO is a small, mostly-in-noise win here (CPU spread is ±0.7 s run to run;
-wall and throughput move less than the 10 s sampling bound). That is
-expected: the process is only ~16 % CPU-busy, so better code layout cannot
-recover much wall, and the CPU time is dominated by allocation/GC, which PGO
-does not change.
+**PGO shows no measurable effect on this workload.** Every delta is inside
+the per-run spread (CPU ±0.8 s run to run; wall and throughput move less
+than the 10 s sampling bound), and the signs are not even consistent with a
+win. That is expected: the process is only ~16 % CPU-busy, so better code
+layout cannot recover wall, and the CPU time is dominated by
+allocation/GC, which PGO does not change.
+
+Correcting an earlier draft of this document: it compared the non-PGO
+baseline's 13.35 s against a single Go-only profiled run of the PGO build
+(13.02 s) and reported a −2.5 % CPU "win". Those two numbers came from
+different run shapes (a two-implementation baseline vs a one-implementation
+profile run), so the delta was not like-for-like. The Go-only profiled run
+(cpu 13.02 s, wall 73.52 s, 253.8 MiB, 4,081/s) is retained here only as a
+supporting observation that a single PGO run landed ~2 % low — well within
+the spread shown above, not evidence of an improvement. The PGO build path
+is still worth keeping (it costs nothing and may help other workloads), but
+it is not a performance result on this one.
 
 ## Ranked optimisation candidates (not yet done)
 
@@ -219,16 +244,23 @@ unless noted.
 
 ## Conclusion
 
-- The "Go uses ~43-60 % more CPU-seconds" is, at default `GOMAXPROCS`,
-  largely **parallel GC burning idle cores** (~4.7 s of the ~13 s): the
-  workload is poll-paced and only ~16 % CPU-busy, so background marking
-  spreads over free cores without adding wall time.
+- **Observation**: Go uses ~43-60 % more CPU-seconds at default
+  `GOMAXPROCS`, and the fall to `GOMAXPROCS=1` removes 4.73 s of them
+  (35 %). **Hypothesis, not established here**: that 4.73 s is work that
+  only exists because more than one P is available — the workload is
+  poll-paced and only ~16 % CPU-busy, so it can spread over ~15 idle cores
+  without adding wall time. The whole-run profile pins only ~1.9 s of it to
+  GC mark+sweep; the rest is unattributed GC-adjacent runtime work, and
+  attributing the 4.73 s to "parallel GC" alone over-claims by ~2.8 s.
 - It is **not** an interpreter-defying efficiency win: at `GOMAXPROCS=1`
   Go's CPU (8.62 s) is on par with Python's (8.94 s). The Go port does
   roughly the same *serial* work as Python, because of ~12.5 KB and ~158
   allocations per entry — the JSON escaping path and the entry
   materialization dominate.
-- The excess is therefore **our per-entry allocation pattern driving GC**,
-  not the libsystemd read and not framework busy-waiting. Serialization *is*
-  already shared once per filter key per entry.
-- PGO is a small, mostly-in-noise improvement on this mostly-idle workload.
+- The excess is therefore **our per-entry allocation pattern**, not the
+  libsystemd read and not framework busy-waiting: ~12.5 KB and ~158
+  allocations per entry is what keeps the serial work at Python levels and
+  what creates the auxiliary runtime work the extra cores absorb.
+  Serialization *is* already shared once per filter key per entry.
+- **PGO shows no measurable effect on this mostly-idle workload** (like-for-like
+  baselines: 13.33 s without vs 13.35 s with, inside the run-to-run spread).

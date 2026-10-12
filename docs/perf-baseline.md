@@ -67,9 +67,9 @@ Caveat, printed with the secondaries: the output file grows only on buffer flush
 ## Interpretation limits
 
 - This is a whole-run REPLAY of a production-shaped read path. The shared reader pacing constrains both implementations, so the numbers are valid for comparing the two on that path; they are NOT evidence of either implementation's maximum throughput capacity, which a saturated, pacing-free setup would measure.
-- Go whole-process peak RSS was 253.5 MiB. That does NOT establish a violation of the bounded-queue expectation: peak RSS includes the journal file mappings the reader holds, the language runtime and allocator slack, not just sender buffers. Do not read a memory bound (or a memory regression) out of this metric; that needs a memory-attribution or scaling measurement.
+- Go whole-process peak RSS was 253.5 MiB. A difference here IS a real whole-process memory difference, and the primary table treats it as one; what peak RSS does NOT establish is a bounded-QUEUE violation, because it includes the journal file mappings the reader holds, the language runtime and allocator slack, not just sender buffers. Attributing a change to the queue (or to any one component) needs a memory-attribution or scaling measurement.
 - Reconciliation with the earlier analytical note in `docs/superpowers/specs/memory-under-multi-sender-backpressure.md`: that note bounds COUNTED queue bytes at roughly 25-35 MB of Go heap for two slow senders at the default budget. The measured peak RSS here is about 7-10x that, because it is whole-process RSS over a 300,000-entry fixture whose journal the reader mmap-s, and this harness uses a single file sender with no backpressure at all. The two numbers measure different things; the gap is flagged as needing a dedicated memory-attribution measurement, not explained by this harness.
-- The host ran the CPU governor in its default `powersave` state and the CPU figures show run-to-run spread (see the min/max columns): treat the CPU comparison as indicative, not precise.
+- The host ran the CPU governor as `powersave`, not `performance`, so the absolute CPU figures are governor-limited and would move with the governor; the CPU comparison still shows run-to-run spread (see the min/max columns) and is indicative, not precise.
 
 ## Acceptance
 
