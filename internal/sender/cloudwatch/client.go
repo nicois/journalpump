@@ -6,7 +6,6 @@
 package cloudwatch
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -16,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,17 +66,31 @@ type sdkConfig struct {
 	secretKey string
 	hasCreds  bool
 
-	// Env pair (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or the legacy
-	// AWS_ACCESS_KEY/AWS_SECRET_KEY) with AWS_SESSION_TOKEN. Passed as an
-	// explicit provider when config credentials are absent so the env pair
-	// keeps botocore's precedence over the selected profile.
+	// Env pair (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) with the session
+	// token. Passed as an explicit provider when config credentials are absent
+	// so the env pair keeps botocore's precedence over the selected profile.
 	envAccessKey string
 	envSecretKey string
 	envSession   string
 	hasEnvCreds  bool
 
-	// caBundle is the CA bundle path (AWS_CA_BUNDLE then REQUESTS_CA_BUNDLE);
-	// empty means the SDK/system default trust set.
+	// Static pair from the selected shared-config profile (credentials file).
+	// Resolved here — rather than left to the SDK chain — so the SDK never
+	// applies its own credential source selection, which would honour the
+	// legacy AWS_ACCESS_KEY/AWS_SECRET_KEY aliases botocore's EnvProvider
+	// ignores.
+	profileAccessKey string
+	profileSecretKey string
+	profileSession   string
+	hasProfileCreds  bool
+
+	// profileFound records that the shared config profile resolved (so the SDK
+	// can be told to use it even without an explicit AWS_PROFILE).
+	profileFound bool
+
+	// caBundle is the CA bundle path (AWS_CA_BUNDLE, then the profile's
+	// ca_bundle, then REQUESTS_CA_BUNDLE); empty means the SDK/system default
+	// trust set.
 	caBundle string
 
 	// proxy is the botocore-compatible transport proxy selector.
@@ -162,14 +176,15 @@ func resolveConfig(cfg map[string]any, environ []string) (sdkConfig, error) {
 	}
 
 	// Environment credentials, mirroring botocore's EnvProvider exactly: the
-	// access key is AWS_ACCESS_KEY_ID only (no legacy alias); when it is
-	// absent the provider yields nothing and falls through to the profile,
-	// even if a secret key is present; when it is present the secret key is
-	// required (else PartialCredentialsError). The token is the first present
-	// of AWS_SECURITY_TOKEN then AWS_SESSION_TOKEN. Env credentials take
-	// precedence over the selected profile, so they are resolved here (only
-	// when the config pair did not supply credentials) and passed as an
-	// explicit provider.
+	// access key is AWS_ACCESS_KEY_ID only (the SDK also reads the legacy
+	// AWS_ACCESS_KEY/AWS_SECRET_KEY aliases, but botocore does not, so we must
+	// never let the SDK's own chain select them — see the provider switch
+	// below); when the access key is absent the provider yields nothing and
+	// falls through to the profile, even if a secret key is present; when it is
+	// present the secret key is required (else PartialCredentialsError). The
+	// token is the first present of AWS_SECURITY_TOKEN then AWS_SESSION_TOKEN.
+	// Env credentials take precedence over the selected profile, so they are
+	// resolved here (only when the config pair did not supply credentials).
 	if !sc.hasCreds {
 		if envAccess := envLookup(environ, "AWS_ACCESS_KEY_ID"); envAccess != "" {
 			envSecret := envLookup(environ, "AWS_SECRET_ACCESS_KEY")
@@ -184,13 +199,30 @@ func resolveConfig(cfg map[string]any, environ []string) (sdkConfig, error) {
 		}
 	}
 
+	// Shared config profile: read through the SDK's own loader (the only
+	// supported reader; a hand-rolled parser missed valid [profile default]
+	// sections and drifted from the SDK's normalization). It exposes the
+	// profile CA bundle, retry attempts, and retry mode, plus any static
+	// credentials. A missing or invalid profile is left to surface from
+	// LoadDefaultConfig exactly as before; here it just means no profile
+	// settings were found.
+	shared, sharedErr := loadSharedConfig(sc.profile, environ)
+	if sharedErr == nil {
+		sc.profileFound = true
+		if !sc.hasCreds && !sc.hasEnvCreds && shared.Credentials.HasKeys() {
+			sc.profileAccessKey = shared.Credentials.AccessKeyID
+			sc.profileSecretKey = shared.Credentials.SecretAccessKey
+			sc.profileSession = shared.Credentials.SessionToken
+			sc.hasProfileCreds = true
+		}
+	}
+
 	// CA bundle: botocore resolves AWS_CA_BUNDLE, then the profile's
 	// ca_bundle, then REQUESTS_CA_BUNDLE (endpoint._get_verify_value). The
-	// profile bundle is read from the shared config file for the selected
-	// profile; the SDK has no native ca_bundle key, so it is parsed here.
+	// profile bundle comes from the SDK-resolved shared config above.
 	sc.caBundle = envLookup(environ, "AWS_CA_BUNDLE")
-	if sc.caBundle == "" {
-		sc.caBundle = sharedConfigValue(sc.profile, environ, "ca_bundle")
+	if sc.caBundle == "" && sharedErr == nil {
+		sc.caBundle = shared.CustomCABundle
 	}
 	if sc.caBundle == "" {
 		sc.caBundle = envLookup(environ, "REQUESTS_CA_BUNDLE")
@@ -202,19 +234,61 @@ func resolveConfig(cfg map[string]any, environ []string) (sdkConfig, error) {
 	// otherwise leave resolution to the SDK (AWS_MAX_ATTEMPTS / profile
 	// max_attempts / standard|adaptive). An explicit legacy/unknown mode fails
 	// construction with the SDK's own error (documented deviation, charter §2).
+	profileMaxAttempts := ""
+	profileRetryMode := ""
+	if sharedErr == nil {
+		if shared.RetryMaxAttempts != 0 {
+			profileMaxAttempts = strconv.Itoa(shared.RetryMaxAttempts)
+		}
+		profileRetryMode = string(shared.RetryMode)
+	}
 	if envLookup(environ, "AWS_MAX_ATTEMPTS") == "" &&
 		envLookup(environ, "AWS_RETRY_MODE") == "" &&
-		sharedConfigValue(sc.profile, environ, "max_attempts") == "" &&
-		sharedConfigValue(sc.profile, environ, "retry_mode") == "" {
+		profileMaxAttempts == "" &&
+		profileRetryMode == "" {
 		sc.setMaxAttempts, sc.maxAttempts = true, defaultRetryMaxAttempts
 	}
 
-	// Retry is left to the SDK's own env/profile resolution. botocore and the
-	// SDK agree on standard/adaptive defaults (3 attempts) and on
-	// AWS_MAX_ATTEMPTS / profile max_attempts. The SDK has no "legacy" mode,
-	// so AWS_RETRY_MODE=legacy cannot be honored and surfaces the SDK's own
-	// rejection (documented deviation; see the parity doc).
 	return sc, nil
+}
+
+// loadSharedConfig resolves profile through the SDK's shared-config loader,
+// pinning the config/credentials files explicitly (the SDK fixes its default
+// file list at package init, before tests can redirect it via the
+// environment). A missing file/profile yields the loader's own error, which
+// the caller treats as "no profile settings".
+func loadSharedConfig(profile string, environ []string) (config.SharedConfig, error) {
+	if profile == "" {
+		profile = "default"
+	}
+	configFile, credentialsFile := defaultSharedFiles(environ)
+	return config.LoadSharedConfigProfile(context.Background(), profile, func(o *config.LoadSharedConfigOptions) {
+		if configFile != "" {
+			o.ConfigFiles = []string{configFile}
+		}
+		if credentialsFile != "" {
+			o.CredentialsFiles = []string{credentialsFile}
+		}
+	})
+}
+
+// defaultSharedFiles returns the botocore-style config and credentials file
+// paths (AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE, else the ~/.aws
+// defaults).
+func defaultSharedFiles(environ []string) (configFile, credentialsFile string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	configFile = envLookup(environ, "AWS_CONFIG_FILE")
+	if configFile == "" && home != "" {
+		configFile = filepath.Join(home, ".aws", "config")
+	}
+	credentialsFile = envLookup(environ, "AWS_SHARED_CREDENTIALS_FILE")
+	if credentialsFile == "" && home != "" {
+		credentialsFile = filepath.Join(home, ".aws", "credentials")
+	}
+	return configFile, credentialsFile
 }
 
 // buildSDKClient loads the SDK config and constructs the client, applying any
@@ -248,6 +322,12 @@ func (sc sdkConfig) loadOptions() ([]func(*config.LoadOptions) error, error) {
 	}
 	if sc.profile != "" {
 		opts = append(opts, config.WithSharedConfigProfile(sc.profile))
+	} else if !sc.hasCreds && !sc.hasEnvCreds && !sc.hasProfileCreds && sc.profileFound {
+		// No explicit profile and no resolved credentials: select the default
+		// profile the SDK-resolved shared config found, so its region/retry/CA
+		// and container/IMDS resolution apply. Only when it actually exists —
+		// forcing it unconditionally errors when there is no config file.
+		opts = append(opts, config.WithSharedConfigProfile("default"))
 	}
 	switch {
 	case sc.hasCreds:
@@ -257,6 +337,13 @@ func (sc sdkConfig) loadOptions() ([]func(*config.LoadOptions) error, error) {
 	case sc.hasEnvCreds:
 		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(sc.envAccessKey, sc.envSecretKey, sc.envSession),
+		))
+	case sc.hasProfileCreds:
+		// Supply the profile's static pair ourselves so the SDK's own chain
+		// (which would prefer the legacy AWS_ACCESS_KEY/AWS_SECRET_KEY aliases
+		// over the profile, unlike botocore) is never consulted.
+		opts = append(opts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(sc.profileAccessKey, sc.profileSecretKey, sc.profileSession),
 		))
 	}
 	if sc.setMaxAttempts {
@@ -312,58 +399,6 @@ func envLookup(environ []string, key string) string {
 	for _, kv := range environ {
 		if strings.HasPrefix(kv, key+"=") {
 			return kv[len(key)+1:]
-		}
-	}
-	return ""
-}
-
-// sharedConfigValue reads key for the selected profile from the shared config
-// file (AWS_CONFIG_FILE, else ~/.aws/config), mirroring botocore's config-file
-// lookup: the default profile uses [default], others use [profile NAME]. An
-// unreadable or absent file yields "". This exists because the SDK exposes no
-// reader for arbitrary config-file keys (ca_bundle, max_attempts, retry_mode).
-func sharedConfigValue(profile string, environ []string, key string) string {
-	if profile == "" {
-		profile = "default"
-	}
-	section := "profile " + profile
-	if profile == "default" {
-		section = "default"
-	}
-	path := envLookup(environ, "AWS_CONFIG_FILE")
-	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return ""
-		}
-		path = filepath.Join(home, ".aws", "config")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer func() { _ = f.Close() }()
-
-	inSection := false
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			inSection = strings.EqualFold(strings.TrimSpace(line[1:len(line)-1]), section)
-			continue
-		}
-		if !inSection {
-			continue
-		}
-		k, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(k), key) {
-			return strings.TrimSpace(value)
 		}
 	}
 	return ""

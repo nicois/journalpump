@@ -165,6 +165,19 @@ func TestResolveConfigCABundlePrecedence(t *testing.T) {
 	if sc.caBundle != "/probe.pem" {
 		t.Errorf("caBundle = %q, want /probe.pem", sc.caBundle)
 	}
+
+	// The default profile may also be written as [profile default]; the
+	// loader (not a hand-rolled section scanner) must honour it.
+	if err := os.WriteFile(cfgPath, []byte("[profile default]\nca_bundle = /profiledefault.pem\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	sc, err = resolveConfig(nil, []string{cfgEnv, "REQUESTS_CA_BUNDLE=/requests.pem"})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if sc.caBundle != "/profiledefault.pem" {
+		t.Errorf("caBundle = %q, want /profiledefault.pem ([profile default] ca_bundle)", sc.caBundle)
+	}
 }
 
 // TestResolveConfigEnvCredentials pins botocore's EnvProvider semantics: the
@@ -284,6 +297,15 @@ func TestSDKRetryResolution(t *testing.T) {
 		t.Errorf("profile max attempts = %d, want 7", got)
 	}
 	t.Setenv("AWS_DEFAULT_PROFILE", "")
+	t.Setenv("AWS_CONFIG_FILE", writeConfig(t, "[default]\n"))
+
+	// The default profile may also be written as [profile default]; a
+	// hand-rolled section scanner missed it and wrongly applied the 5-attempt
+	// override on top of the profile's 7.
+	t.Setenv("AWS_CONFIG_FILE", writeConfig(t, "[profile default]\nmax_attempts = 7\n"))
+	if got := retryer(t).MaxAttempts(); got != 7 {
+		t.Errorf("[profile default] max attempts = %d, want 7", got)
+	}
 	t.Setenv("AWS_CONFIG_FILE", writeConfig(t, "[default]\n"))
 
 	// Explicit standard/adaptive modes keep botocore's 3-attempt default.
@@ -820,6 +842,75 @@ func TestSDKCredentialPrecedence(t *testing.T) {
 	}
 	if creds.AccessKeyID != "PROFKEY" {
 		t.Errorf("access key = %q, want PROFKEY (profile fallback)", creds.AccessKeyID)
+	}
+}
+
+// TestSDKCredentialLegacyAliasesIgnored pins that the SDK's legacy
+// AWS_ACCESS_KEY/AWS_SECRET_KEY aliases never win over the default profile's
+// identity. botocore's EnvProvider ignores those aliases, but the SDK reads
+// them; if the SDK's own credential chain were left to run they would be
+// selected instead of the [default] profile. This drives the production
+// resolver with ACTUAL environment variables and an implicit default profile.
+func TestSDKCredentialLegacyAliasesIgnored(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+	credPath := filepath.Join(dir, "credentials")
+	if err := os.WriteFile(cfgPath, []byte("[default]\nregion = us-east-1\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(credPath, []byte("[default]\naws_access_key_id = PROFKEY\naws_secret_access_key = PROFSECRET\n"), 0o600); err != nil {
+		t.Fatalf("write credentials: %v", err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", cfgPath)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credPath)
+	t.Setenv("AWS_DEFAULT_PROFILE", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_ACCESS_KEY", "ALIASKEY")
+	t.Setenv("AWS_SECRET_KEY", "ALIASSECRET")
+
+	retrieve := func(t *testing.T) aws.Credentials {
+		t.Helper()
+		sc, err := resolveConfig(nil, os.Environ())
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		loaded, err := loadAWSConfig(context.Background(), sc)
+		if err != nil {
+			t.Fatalf("loadAWSConfig: %v", err)
+		}
+		creds, err := loaded.Credentials.Retrieve(context.Background())
+		if err != nil {
+			t.Fatalf("retrieve: %v", err)
+		}
+		return creds
+	}
+
+	// Non-vacuity: with no resolved provider the SDK's own chain selects the
+	// legacy aliases, so asserting the profile wins below is meaningful.
+	bare, err := loadAWSConfig(context.Background(), sdkConfig{})
+	if err != nil {
+		t.Fatalf("loadAWSConfig(bare): %v", err)
+	}
+	bareCreds, err := bare.Credentials.Retrieve(context.Background())
+	if err != nil {
+		t.Fatalf("retrieve(bare): %v", err)
+	}
+	if bareCreds.AccessKeyID != "ALIASKEY" {
+		t.Fatalf("bare SDK selected %q, want ALIASKEY (premise of this test)", bareCreds.AccessKeyID)
+	}
+
+	// Legacy aliases present, no canonical env pair: the default profile wins.
+	if creds := retrieve(t); creds.AccessKeyID != "PROFKEY" {
+		t.Errorf("access key = %q, want PROFKEY (legacy aliases must be ignored, profile wins)", creds.AccessKeyID)
+	}
+
+	// The canonical env pair still wins over the profile (and the aliases).
+	t.Setenv("AWS_ACCESS_KEY_ID", "ENVKEY")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "ENVSECRET")
+	if creds := retrieve(t); creds.AccessKeyID != "ENVKEY" {
+		t.Errorf("access key = %q, want ENVKEY (canonical env pair wins over profile)", creds.AccessKeyID)
 	}
 }
 
