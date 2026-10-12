@@ -3431,9 +3431,16 @@ SAFE: it configures NO readers or senders, so the daemon starts
 (`Type=notify` `READY=1`) and idles cleanly, producing no output and no
 network traffic; operators opt in by editing it. The RPM marks it
 `%config(noreplace)` and keeps the Python spec's sample `journalpump.json`
-as `%doc`. Recorded as a sanctioned §2 deviation: this is NEW behavior vs
-the Python packages, which shipped no config and left a zero-config
-`systemctl start` broken (the earlier CONFLICT this replaces).
+as `%doc`; the DEB marks it a dpkg CONFFILE
+(`debian/journalpump.conffiles`), so an operator's edits survive install-over
+and upgrade in both formats — a plain dpkg payload would be silently
+overwritten with empty readers, disabling forwarding. The conffile cannot
+live in `/etc` (the unchanged unit's `ExecStart` names this path), so lintian
+reports `non-etc-file-marked-as-conffile` (an E:), which the packaging gate
+allowlists with that documented reason. Recorded as a sanctioned §2
+deviation: this is NEW behavior vs the Python packages, which shipped no
+config and left a zero-config `systemctl start` broken (the earlier CONFLICT
+this replaces).
 
 Tests added (there is no Python counterpart to port — Python had no
 packaging test):
@@ -3445,18 +3452,26 @@ packaging test):
   go.mod-pinned toolchain) — no separate Go is injected. Asserts: the golang
   release/version marker; an arch-specific package (rpm `ARCH != noarch`, deb
   `Architecture != all`); the expected payload manifests INCLUDING the shipped
-  default config `/var/lib/journalpump/journalpump.json`; the rpm `Requires`
+  default config `/var/lib/journalpump/journalpump.json`; the config is marked
+  `%config(noreplace)` in the rpm (`FILEFLAGS` `cn`) and a dpkg conffile in the
+  deb (`DEBIAN/conffiles`); the rpm `Requires`
   carry `libsystemd.so.0()(64bit)`; an ELF `/usr/bin/journalpump`; the shipped
   unit BYTE-IDENTICAL to the in-tree `journalpump.unit` (`cmp`); the shipped
   config byte-identical to `journalpump.default.json` (`cmp`); and the
   Debian `postinst` byte-identical to `debian/postinst`. Linter gates are
-  fail-closed: an `E:` line not on a narrow allowlist fails, a linter that
-  did not run (rpmlint without its session banner; lintian reporting a
-  processing failure) fails, and a gate self-test (negative controls) proves
-  both — including that `summary-too-long` is now REJECTED (it is no longer
-  allowlisted). The rpmlint allowlist names only the `systemd`/`journald`/
-  `logplex` technology-name `spelling-error`s, which persist in the Summary
-  and description. The deb leg sets `DEBEMAIL`/`DEBFULLNAME`
+  fail-closed on BOTH the diagnostics and the EXIT STATUS: an `E:` line not on
+  a narrow allowlist fails, and a run that did not complete fails — an
+  unexpected exit status, a missing rpmlint session banner, a lintian
+  processing failure, or an exit status that disagrees with the diagnostics
+  seen (`rpmlint` 0 <-> no errors / 64 <-> errors; `lintian` 0 <-> no E: /
+  2 <-> E:). A gate self-test (negative controls) proves each rejection path,
+  including abnormal termination (a nonzero status without a diagnostic) and
+  status/output disagreement, and that `summary-too-long` is now REJECTED (it
+  is no longer allowlisted). The rpmlint allowlist names only the
+  `systemd`/`journald`/`logplex` technology-name `spelling-error`s; the
+  lintian allowlist names only
+  `non-etc-file-marked-as-conffile` for the shipped config (documented above).
+  The deb leg sets `DEBEMAIL`/`DEBFULLNAME`
   to the package Maintainer so `dch` does not write a `user@hostname`
   changelog entry (which lintian flags as
   `bogus-mail-host-in-debian-changelog`).
@@ -3475,7 +3490,9 @@ packaging test):
   leg additionally proves the runtime `ca-certificates` dependency is real:
   `ca-certificates` must be ABSENT before the deb is installed and present
   (as a resolved dependency) after, so the TLS senders have system roots on a
-  minimal install.
+  minimal install. It then edits the shipped config and reinstalls (install
+  over) and upgrades the deb (rebuilt with a higher version) to prove the
+  conffile is PRESERVED and the service still starts from the preserved file.
 
 Sanctioned/operator-visible packaging decisions (recorded in charter §6 row
 27): the marker differs by format (rpm `.golang`, deb `~golang`); the
@@ -3483,7 +3500,9 @@ Sanctioned/operator-visible packaging decisions (recorded in charter §6 row
 aarch64` (the cgo reader is 64-bit only); `GOTOOLCHAIN=auto` network
 toolchain fetch at build time; the added Debian service (a §2 deviation from
 the Python deb's unit omission); and the shipped default config (a §2
-deviation — new behavior vs Python, safe/no-output). The RPM `Section` is
+deviation — new behavior vs Python, safe/no-output, and a dpkg conffile /
+`%config(noreplace)` file so operator edits survive install-over and upgrade).
+The RPM `Section` is
 the original value; the `Summary` is a deliberate, user-approved metadata
 divergence (see below).
 
@@ -3497,19 +3516,23 @@ USER DECISIONS APPLIED (2026-10-12):
    narrowed to the remaining `systemd`/`journald`/`logplex` spelling
    false-positives only, and the gate self-test now proves
    `summary-too-long` is rejected.
-2. The packaged default config (above) is shipped in BOTH formats; the
-   packaging tests assert it is present and byte-identical to
-   `journalpump.default.json`, and the install-and-start legs no longer
-   write `{}` by hand, so they genuinely validate the shipped config.
+2. The packaged default config (above) is shipped in BOTH formats as a
+   conffile-equivalent (`%config(noreplace)` rpm; dpkg conffile deb) so
+   operator edits are not silently overwritten; the packaging tests assert it
+   is present and byte-identical to `journalpump.default.json`, and the
+   install-and-start legs no longer write `{}` by hand, so they genuinely
+   validate the shipped config.
    Runtime `ca-certificates` remains a declared dependency (the Python deb
    inherited it via `python3-requests`); the Go package declares it
    explicitly.
 
 Execution (UNCACHED): `make check-packaging` PASS (rpm
-`journalpump-2.4.6-384.gbec15c8.golang.fc44.x86_64`, rpmlint clean apart from
-the allowlisted spelling false-positives; deb
-`journalpump_2.4.6-384-gbec15c8~golang_amd64`, lintian no `E:`); `make
-systest-package-on-podman` PASS (rpm + deb legs, zero-config start); `make
+`journalpump-2.4.6-386.gbb4d654.golang.fc44.x86_64`, rpmlint exit 64 clean
+apart from the allowlisted spelling false-positives; deb
+`journalpump_2.4.6-386-gbb4d654~golang_amd64`, lintian exit 2 with only the
+allowlisted non-etc-conffile `E:`); `make
+systest-package-on-podman` PASS (rpm + deb legs, zero-config start; deb leg
+also proves the conffile survives install-over and upgrade); `make
 build-go` / `make lint-go` (0 issues) / `go test -race -count=1 ./...` / `go
 test -race -count=1 -tags systest ./systest-go/...` green;
 `JOURNALPUMP_BIN=go pytest -q systest/` 38 passed; `pytest -q test/` 160
