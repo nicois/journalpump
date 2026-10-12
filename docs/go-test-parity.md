@@ -3146,3 +3146,116 @@ Execution after the round-6 test commit (UNCACHED): `go test -race -count=1
 -count=1 -tags systest ./systest-go/...` PASS (144.0 s); `JOURNALPUMP_BIN=go
 python -m pytest -q systest/` 38 passed; `python -m pytest -q test/` 160
 passed. Ledger row 25 stays `review`.
+
+## Task 26 — Google Cloud Logging sender (spec §5)
+
+`internal/sender/gcl` ports
+`journalpump/senders/google_cloud_logging.py` and is registered as
+`output_type google_cloud_logging`. It writes batches through the Cloud
+Logging v2 API (`google.golang.org/api/logging/v2`) with an INJECTABLE HTTP
+transport: the generated client is handed an `*http.Client` built on the
+shared `internal/httpx` helper (Task 23's closing block), so tests drive the
+real generated client at an `httptest` server (`option.WithEndpoint` +
+`option.WithHTTPClient`) and production talks to
+`logging.googleapis.com`.
+
+Proxy selection (quirk-lock, `httpx.Httplib2Proxy`):
+
+- Python's GCL transport is `googleapiclient.build` →
+  `google-auth-httplib2.AuthorizedHttp` wrapping `httplib2.Http` — NOT
+  `requests`. The GCL sender therefore passes the httplib2-compatible
+  selector, pinning scheme-specific variables (`http_proxy`/`https_proxy`),
+  a present-but-empty lowercase value DISABLING that scheme with no uppercase
+  fallback, `no_proxy` lowercase-then-uppercase with `*` bypassing everything,
+  case-sensitive bare-hostname matching and no `ALL_PROXY` fallback
+  (`internal/httpx/httpx_test.go:TestHttplib2Proxy`). The oauth2 token source
+  is wrapped over the same httpx base transport, so token fetches share the
+  policy.
+
+Credentials and config:
+
+- `New` reads `google_cloud_logging_project_id` and
+  `google_cloud_logging_log_id` (required), optional
+  `google_cloud_logging_resource_labels`, optional
+  `google_service_account_credentials` and `max_send_interval` (default 0.3 s;
+  non-positive rejected at load).
+- A service-account JSON is loaded with the TYPE-SPECIFIC loader
+  (`google.CredentialsFromJSONWithType(..., google.ServiceAccount, scope)` —
+  Python `Credentials.from_service_account_info`), and its `project_id`
+  OVERRIDES the configured one (`TestNewServiceAccountOverridesProjectID`
+  uses the `test/data.py` GCP key fixture copied to
+  `internal/sender/gcl/testdata/gcp_private_key.pem`). Otherwise application
+  default credentials are found. The log-write scope is requested explicitly
+  (Python passes no scopes to google-auth).
+- Cancellation: the generated `Entries.Write` call takes the request context
+  everywhere (`...Write(req).Context(ctx).Do()`), so a batch in flight is
+  cancellable at shutdown — no sarama/gorilla-class cancellation gap. Flagged
+  early per the task and confirmed clean.
+
+Send (`google_cloud_logging.py:68-131`):
+
+- Request: `logName = projects/<project>/logs/<log_id>`,
+  `resource = {type: generic_node}` plus configured labels, one entry per
+  message.
+- Quota (`_LOG_ENTRY_QUOTA = 250*1024`, `_MAX_MESSAGE_SIZE = 200*1024`): when
+  the raw message length exceeds the quota, a STRING `MESSAGE` is truncated to
+  200 Ki codepoints (Python slices `str`) and the `[MESSAGE TRUNCATED]` marker
+  appended; if the recomputed entry still exceeds the quota — or the entry has
+  no `MESSAGE` — the entry becomes the MESSAGE-only DEFAULT replacement. A
+  non-string `MESSAGE` on the oversized path is an error (Python's slice would
+  raise). `TestBigLogEntryIsTruncated` (the Python fixture's `257_00` is below
+  the quota, so the MESSAGE passes through), `TestBigLogEntrySendsDefault`,
+  `TestTruncatedMessageAppendsMarker`, `TestMissingMessageOnOversizedEntry`.
+- Entry build: `timestamp` and `PRIORITY` are popped; a present string
+  timestamp is cut to 26 characters with `Z` appended
+  (`TestCorrectTimestamp`, `TestTimestampTruncatedTo26Chars`); `PRIORITY`
+  maps through the severity table (Python `bool` is an `int`, so `True`→ALERT,
+  `False`→EMERGENCY; a float/string/out-of-range value →DEFAULT) —
+  `TestSeverityMapping`; a string `MESSAGE` that parses as JSON is replaced by
+  the parsed value (`TestMessageJSON`, `TestMessageString`,
+  `TestMissingMessage`).
+- Failure path (`google_cloud_logging.py:115-131`): mark disconnected, log at
+  ERROR, emit `unexpected_exception` (where=`sender`, tag
+  `app=journalpump`), wait the shared backoff, then optimistically re-mark
+  connected (Python's `mark_connected()`, which also resets the backoff
+  exponent), and return the error wrapped in `sender.BackoffError` so the loop
+  does not wait twice (`TestFailurePathOrderAndBackoff`,
+  `TestBadRequestNotMarkedSent`, `TestWriteHTTPErrorFailsBatch`). Never marked
+  sent on failure — the loop retries the batch.
+
+Tests (Go's `logging/v2` ships no generated mock, so — as with CloudWatch —
+the sanctioned custom-fake/httptest route applies):
+
+- The generated client at an httptest server through the injected transport:
+  `TestWriteWireShape` (POST `<endpoint>/v2/entries:write`, logName, resource,
+  `jsonPayload.MESSAGE`) and `TestWriteHTTPErrorFailsBatch` (400 fails the
+  batch).
+- A fake writer porting `test/test_google_cloud_logging.py`:
+  `TestMessageString`, `TestMissingMessage`, `TestMessageJSON`,
+  `TestBadRequestNotMarkedSent`, `TestCorrectTimestamp`,
+  `TestBigLogEntryIsTruncated`, `TestBigLogEntrySendsDefault` (all seven
+  Python cases), plus `TestParseConfig`, `TestNewMissingProjectID`,
+  `TestInvalidJSONMessageFailsBatch`, `TestMaintenanceOperationsIsNoOp`.
+
+Stated deviations (also in charter §2):
+
+- Compact-JSON size approximation: the recomputed entry size that decides the
+  DEFAULT fallback is measured against compact JSON rather than Python's
+  `", "/": "` separators, so the threshold can differ by a couple of bytes per
+  field. The raw-message quota gate is byte-identical. (The Python source
+  concedes the same "not exactly 256KB" approximation.)
+- Optimistic-reconnect final health state — FLAGGED for the coordinator →
+  user. Python marks disconnected, backs off and then unconditionally calls
+  `mark_connected()`, so a persistently failing GCL sender reports health
+  `connected`, clears its error ring and never escalates its backoff. The Go
+  sender reproduces the non-escalating backoff (it re-marks connected through
+  the loop's connection seam before returning a `BackoffError`, resetting the
+  shared exponent), but the shared loop owns the connected flag and the
+  disconnected/error-ring bookkeeping, so after a failed batch the state file
+  reports `disconnected` with the error recorded until the next successful
+  batch. Documented rather than reproduced; operator-visible.
+
+Execution (UNCACHED): `go test -race -count=1 ./...` PASS;
+`golangci-lint run ./...` 0 issues; `go vet ./...` clean; `go test -race
+-count=1 -tags systest ./systest-go/...` PASS (144.8 s). Ledger row 26 stays
+`review`.
