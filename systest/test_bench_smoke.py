@@ -134,6 +134,31 @@ def test_bench_driver_smoke_runs_both_implementations():
         shutil.rmtree(work, ignore_errors=True)
 
 
+@pytest.mark.skipif(not GO_BINARY.exists(), reason="build/journalpump is missing; run make build-go")
+def test_bench_driver_profile_writes_go_profiles():
+    work = runtime_dir("profile")
+    shutil.rmtree(work, ignore_errors=True)
+    profile_dir = work / "profiles"
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(BENCH_DRIVER), "--profile", "--profile-dir", str(profile_dir), "--out", str(work / "r.json")],
+            env=bench_env(BENCH_JOURNAL_DIR=str(work)),
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        # The env-gated hook captured a real CPU and heap profile of the Go
+        # binary, and only the Go implementation was run.
+        assert (profile_dir / "go-cpu-measured.prof").stat().st_size > 0
+        assert (profile_dir / "go-mem-measured.prof").stat().st_size > 0
+        result = json.loads((work / "r.json").read_text(encoding="utf-8"))
+        assert set(result["implementations"]) == {"go"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_bench_driver_refuses_a_baseline_below_the_minimum():
     completed = subprocess.run(
         [sys.executable, str(BENCH_DRIVER), "--baseline"],

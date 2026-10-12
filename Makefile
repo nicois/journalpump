@@ -84,19 +84,23 @@ lint-go:
 # fixture; see bench/journalpump_bench.py and bench/report.py.  A baseline
 # needs >= 200000 entries and >= 60 s of median Go wall time; the tripwire
 # (bench-check) compares Go against the committed Go baseline only.
+# BENCH_TMPFS holds the fixture and the measured OUTPUT file; the driver
+# verifies the output directory is on tmpfs, so a disk fixture fallback
+# cannot put the sink on disk.  BENCH_JOURNAL_DIR (fixture storage) and
+# BENCH_WORK_DIR (output directory) override the locations.
 BENCH_TMPFS = /run/user/$(shell id -u)/journalpump-bench
 
 .PHONY: bench
 bench: build-go
-	$(PYTHON) bench/journalpump_bench.py
+	BENCH_TMPFS=$(BENCH_TMPFS) $(PYTHON) bench/journalpump_bench.py
 
 .PHONY: bench-go
 bench-go: build-go
-	BENCH_IMPL=go $(PYTHON) bench/journalpump_bench.py
+	BENCH_TMPFS=$(BENCH_TMPFS) BENCH_IMPL=go $(PYTHON) bench/journalpump_bench.py
 
 .PHONY: bench-python
 bench-python:
-	BENCH_IMPL=python $(PYTHON) bench/journalpump_bench.py
+	BENCH_TMPFS=$(BENCH_TMPFS) BENCH_IMPL=python $(PYTHON) bench/journalpump_bench.py
 
 .PHONY: bench-fixture
 bench-fixture:
@@ -104,11 +108,32 @@ bench-fixture:
 
 .PHONY: bench-baseline
 bench-baseline: build-go
-	$(PYTHON) bench/journalpump_bench.py --baseline
+	BENCH_TMPFS=$(BENCH_TMPFS) $(PYTHON) bench/journalpump_bench.py --baseline
 
 .PHONY: bench-check
 bench-check: build-go
-	$(PYTHON) bench/journalpump_bench.py --check
+	BENCH_TMPFS=$(BENCH_TMPFS) $(PYTHON) bench/journalpump_bench.py --check
+
+# Profile the Go binary under the bench workload (one warmup-free run) with
+# the env-gated runtime/pprof hook, and print go tool pprof -top.  GOMAXPROCS
+# may be set on the command line (GOMAXPROCS=1 make bench-profile) to compare
+# single-core against the default multi-core Go run.
+.PHONY: bench-profile
+bench-profile: build-go
+	BENCH_TMPFS=$(BENCH_TMPFS) BENCH_ENTRIES=$${BENCH_ENTRIES:-300000} BENCH_RUNS=1 BENCH_WARMUP=0 \
+		$(PYTHON) bench/journalpump_bench.py --profile $(BENCH_PROFILE_ARGS)
+
+# Refresh the committed PGO profile (cmd/journalpump/default.pgo) from a
+# representative bench run.  PGO is not a one-off: go build applies
+# default.pgo automatically when it sits in the main package directory, so
+# the packaging builds (which run make build-go) pick it up.  See
+# docs/perf-profile-findings.md for provenance and how to refresh.
+.PHONY: bench-pgo
+bench-pgo: build-go
+	BENCH_TMPFS=$(BENCH_TMPFS) BENCH_ENTRIES=$${BENCH_ENTRIES:-300000} BENCH_RUNS=1 BENCH_WARMUP=0 \
+		$(PYTHON) bench/journalpump_bench.py --profile --profile-dir $(BENCH_TMPFS)/work/profiles
+	cp $(BENCH_TMPFS)/work/profiles/go-cpu-measured.prof cmd/journalpump/default.pgo
+	@echo "refreshed cmd/journalpump/default.pgo; run make build-go to apply"
 
 # Deliberately not part of the required correctness checks: it drives real
 # processes and needs the fixture toolchain.

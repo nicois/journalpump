@@ -9,14 +9,19 @@ would leave a run waiting forever for a count it already reached."""
 from pathlib import Path
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import journalpump_bench as driver  # noqa: E402
+
+TEMPLATE = driver.CONFIG_TEMPLATE.read_text(encoding="utf-8")
 
 
 def wait_for(listener: driver.StatsdListener, target: int, timeout: float = 3.0) -> None:
@@ -70,3 +75,106 @@ def test_process_exited_sees_a_live_and_a_finished_child():
 def test_read_governor_and_cgroup_limits_never_raise():
     assert isinstance(driver.read_governor(), str)
     assert isinstance(driver.read_cgroup_limit("memory.max"), str)
+
+
+# --- exceptional-path cleanup ----------------------------------------------
+
+
+def _stub(tmp_path: Path, body: str) -> list[str]:
+    script = tmp_path / "stub.py"
+    script.write_text(body, encoding="utf-8")
+    return [sys.executable, str(script)]
+
+
+def _run_stub(tmp_path: Path, command: list[str], **overrides):
+    kwargs = {
+        "implementation": "python",
+        "template": TEMPLATE,
+        "journal_path": tmp_path,
+        "output_path": tmp_path / "out.jsonl",
+        "config_path": tmp_path / "cfg.json",
+        "entries": 2000,
+        "mode": "measured",
+        "timeout_s": 5.0,
+        "stop_timeout_s": 5.0,
+        "work_dir": tmp_path,
+        "command": command,
+    }
+    kwargs.update(overrides)
+    return driver.run_once(**kwargs)
+
+
+def test_run_once_terminates_and_reaps_a_child_that_never_readies(tmp_path, monkeypatch):
+    monkeypatch.setattr(driver, "READY_TIMEOUT_S", 1.0)
+    pidfile = tmp_path / "pid"
+    body = f"import os, time\nopen({str(pidfile)!r}, 'w').write(str(os.getpid()))\ntime.sleep(600)\n"
+    with pytest.raises(driver.BenchmarkError):
+        _run_stub(tmp_path, _stub(tmp_path, body))
+    assert driver._process_exited(int(pidfile.read_text()))
+
+
+def test_run_once_terminates_and_reaps_a_child_that_never_reaches_the_gauge(tmp_path):
+    pidfile = tmp_path / "pid"
+    body = (
+        "import os, socket, time\n"
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "addr = os.environ['NOTIFY_SOCKET']\n"
+        "if addr.startswith('@'):\n"
+        "    addr = '\\x00' + addr[1:]\n"
+        "sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n"
+        "sock.sendto(b'READY=1', addr)\n"
+        "time.sleep(600)\n"
+    )
+    with pytest.raises(driver.BenchmarkError):
+        _run_stub(tmp_path, _stub(tmp_path, body), timeout_s=1.0)
+    assert driver._process_exited(int(pidfile.read_text()))
+
+
+def test_run_once_passes_extra_env_to_the_child(tmp_path):
+    seen = tmp_path / "seen.txt"
+    body = f"import os\nopen({str(seen)!r}, 'w').write(os.environ.get('JOURNALPUMP_CPU_PROFILE', ''))\n"
+    with pytest.raises(driver.BenchmarkError):
+        _run_stub(tmp_path, _stub(tmp_path, body), extra_env={"JOURNALPUMP_CPU_PROFILE": "/tmp/x.prof"}, timeout_s=1.0)
+    assert seen.read_text() == "/tmp/x.prof"
+
+
+def test_terminate_and_reap_kills_a_live_child_and_is_idempotent():
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    driver._terminate_and_reap(child, child.pid, 5.0)
+    assert child.returncode is not None
+    assert driver._process_exited(child.pid)
+    driver._terminate_and_reap(child, child.pid, 5.0)  # must not double-reap
+
+
+# --- output/work directory --------------------------------------------------
+
+
+def test_resolve_work_dir_defaults_under_bench_tmpfs(monkeypatch):
+    root = Path(f"/run/user/{os.getuid()}/jp-bench-tmpfs-test")
+    monkeypatch.delenv("BENCH_WORK_DIR", raising=False)
+    monkeypatch.setenv("BENCH_TMPFS", str(root))
+    try:
+        assert driver.resolve_work_dir() == root / "work"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_resolve_work_dir_accepts_an_explicit_tmpfs_override(monkeypatch):
+    explicit = Path(f"/run/user/{os.getuid()}/jp-bench-workdir-test")
+    monkeypatch.setenv("BENCH_WORK_DIR", str(explicit))
+    try:
+        assert driver.resolve_work_dir() == explicit
+    finally:
+        shutil.rmtree(explicit, ignore_errors=True)
+
+
+def test_resolve_work_dir_refuses_a_disk_backed_directory(monkeypatch):
+    disk = Path("/var/tmp") / f"jp-bench-disk-{os.getpid()}"
+    if driver.filesystem_type(disk.parent) == "tmpfs":  # pragma: no cover - host-dependent
+        pytest.skip("no disk-backed path available on this host")
+    monkeypatch.setenv("BENCH_WORK_DIR", str(disk))
+    try:
+        with pytest.raises(SystemExit):
+            driver.resolve_work_dir()
+    finally:
+        shutil.rmtree(disk, ignore_errors=True)

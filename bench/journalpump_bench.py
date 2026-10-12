@@ -34,8 +34,18 @@ config hash so a baseline stays comparable across hosts.
 Environment knobs (all optional): ``BENCH_ENTRIES`` (>= the baseline
 minimum for ``--baseline``), ``BENCH_SEED``, ``BENCH_RUNS``,
 ``BENCH_WARMUP``, ``BENCH_TIMEOUT``, ``BENCH_STOP_TIMEOUT``,
-``BENCH_IMPL`` (``go`` / ``python`` / ``both``), ``BENCH_JOURNAL_DIR``,
+``BENCH_IMPL`` (``go`` / ``python`` / ``both``), ``BENCH_JOURNAL_DIR``
+(where the fixture journal is stored; may be disk), ``BENCH_TMPFS`` /
+``BENCH_WORK_DIR`` (where the OUTPUT file is written; verified tmpfs, so a
+disk fixture fallback cannot move the measured sink onto disk), and
 ``BENCH_ALLOW_ANY_GOVERNOR=1``.
+
+``--profile`` additionally runs the Go binary with the env-gated
+``runtime/pprof`` hook (``JOURNALPUMP_CPU_PROFILE`` / ``JOURNALPUMP_MEM_PROFILE``,
+see ``cmd/journalpump/profile.go``) and GODEBUG=gctrace=1, then prints
+``go tool pprof -top`` for the captured CPU and heap profiles. GOMAXPROCS is
+inherited from the environment, so ``GOMAXPROCS=1`` measures a single-core
+Go build.
 """
 
 from __future__ import annotations
@@ -208,6 +218,64 @@ def check_governor() -> None:
         "Set the governor to performance, or set BENCH_ALLOW_ANY_GOVERNOR=1 to "
         "measure anyway (and record that the numbers are governor-limited)."
     )
+
+
+# --------------------------------------------------------------------------
+# Output/work directory
+
+
+def _unescape_mount(field: str) -> str:
+    for escape, char in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        field = field.replace(escape, char)
+    return field
+
+
+def filesystem_type(path: Path) -> str:
+    """The filesystem type of the mount containing ``path`` (the longest
+    matching mount point in ``/proc/self/mounts``)."""
+    try:
+        resolved = path.resolve()
+        mounts = Path("/proc/self/mounts").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "unknown"
+    best_mount = ""
+    best_type = "unknown"
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount, fstype = _unescape_mount(parts[1]), parts[2]
+        mount_path = Path(mount)
+        if resolved == mount_path or mount_path in resolved.parents:
+            if len(mount) >= len(best_mount):
+                best_mount, best_type = mount, fstype
+    return best_type
+
+
+def resolve_work_dir() -> Path:
+    """The run's output/work directory, on a VERIFIED tmpfs.
+
+    The fixture may live on disk (``BENCH_JOURNAL_DIR`` or the ``/var/tmp``
+    fallback), but the measured SINK must not: the output file is written
+    and re-read for every run, and disk stalls would pollute the timing.
+    ``BENCH_WORK_DIR`` overrides the location; otherwise it defaults to
+    ``BENCH_TMPFS``/work. The filesystem is checked and the run is refused
+    if it is not tmpfs, so a fallback cannot silently move the sink to disk.
+    """
+    explicit = os.environ.get("BENCH_WORK_DIR")
+    if explicit:
+        work_dir = Path(explicit)
+    else:
+        work_dir = Path(os.environ.get("BENCH_TMPFS", f"/run/user/{os.getuid()}/journalpump-bench")) / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    fs_type = filesystem_type(work_dir)
+    if fs_type != "tmpfs":
+        raise SystemExit(
+            f"the benchmark output directory {work_dir} is on {fs_type!r}, not tmpfs: "
+            "writing the measured sink to disk would pollute the timing.\n"
+            "Set BENCH_TMPFS to a tmpfs root or BENCH_WORK_DIR to a directory on tmpfs."
+        )
+    return work_dir
 
 
 # --------------------------------------------------------------------------
@@ -405,8 +473,14 @@ def run_once(
     timeout_s: float,
     stop_timeout_s: float,
     work_dir: Path,
+    command: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """One spawn/measure cycle. ``mode`` is ``"measured"`` or ``"preflight"``."""
+    """One spawn/measure cycle. ``mode`` is ``"measured"`` or ``"preflight"``.
+
+    ``command`` overrides the binary selected by ``implementation``; tests
+    use it to substitute a stub that exercises the failure paths.
+    """
     output_path.unlink(missing_ok=True)
     stderr_path = work_dir / f"stderr-{implementation}-{mode}.log"
 
@@ -417,11 +491,11 @@ def run_once(
         encoding="utf-8",
     )
 
-    argv = command_for("go" if implementation == "go" else "python")
+    argv = command if command is not None else command_for("go" if implementation == "go" else "python")
     env = build_environment(
         runtime_directory=work_dir,
         notify_socket_name=listener.name,
-        env={"JOURNALPUMP_BIN": "go" if implementation == "go" else ""},
+        env={"JOURNALPUMP_BIN": "go" if implementation == "go" else "", **(extra_env or {})},
         export_runtime_directory=False,
     )
     # UNSHIMMED: strip any PYTHONPATH a caller may have set, so no
@@ -454,6 +528,12 @@ def run_once(
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGTERM)
                 exit_at, status, rusage = _wait4(process, pid, stop_timeout_s)
+            except BaseException:
+                # A rejected fixture, a readiness timeout or a terminal
+                # gauge timeout must not leak a live daemon or an unreaped
+                # child: terminate AND reap before propagating.
+                _terminate_and_reap(process, pid, stop_timeout_s)
+                raise
             finally:
                 sampler.stop()
     finally:
@@ -542,6 +622,28 @@ def _wait_for_sent_lines(
     raise BenchmarkError(f"journal.sent_lines never reached {entries} within {timeout_s:.0f}s (saw {statsd.max_sent_lines})")
 
 
+def _terminate_and_reap(process: subprocess.Popen, pid: int, stop_timeout_s: float) -> None:
+    """SIGTERM then reap a child on an EXCEPTIONAL path.
+
+    The normal path (READY=1 -> gauge reached -> SIGTERM -> one ``os.wait4``)
+    only covers the happy flow. If readiness fails (a rejected fixture), an
+    output-growth preflight stalls, or the terminal gauge never arrives, the
+    child would otherwise be left running or unreaped. This delivers the same
+    SIGTERM + single ``os.wait4`` (which escalates to SIGKILL on timeout) so
+    no live daemon and no zombie survives. Idempotent: once ``_wait4`` has
+    reaped the child, ``process.returncode`` is set and a repeat call is a
+    no-op.
+    """
+    if process.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    try:
+        _wait4(process, pid, stop_timeout_s)
+    except ChildProcessError:
+        pass  # already reaped elsewhere; nothing left to clean up
+
+
 def _wait4(process: subprocess.Popen, pid: int, stop_timeout_s: float) -> tuple[float, int, Any]:
     """Exactly ONE ``os.wait4``: the exit status and the whole-run rusage."""
     deadline = time.monotonic() + stop_timeout_s
@@ -574,8 +676,22 @@ def run_implementation(
     warmup: int,
     timeout_s: float,
     stop_timeout_s: float,
+    profile_dir: Path | None = None,
 ) -> dict[str, Any]:
     config_path = work_dir / f"config-{implementation}.json"
+
+    def profiled_env(mode: str) -> dict[str, str]:
+        # Profiles are only meaningful for the Go binary (the Python
+        # interpreter is not the subject of this harness). GODEBUG=gctrace=1
+        # writes a GC summary to stderr, which the run already captures.
+        if profile_dir is None or implementation != "go":
+            return {}
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "JOURNALPUMP_CPU_PROFILE": str(profile_dir / f"go-cpu-{mode}.prof"),
+            "JOURNALPUMP_MEM_PROFILE": str(profile_dir / f"go-mem-{mode}.prof"),
+            "GODEBUG": "gctrace=1",
+        }
 
     preflight = run_once(
         implementation=implementation,
@@ -588,6 +704,7 @@ def run_implementation(
         timeout_s=timeout_s,
         stop_timeout_s=stop_timeout_s,
         work_dir=work_dir,
+        extra_env=profiled_env("preflight"),
     )
 
     measured: list[dict[str, Any]] = []
@@ -604,15 +721,28 @@ def run_implementation(
                 timeout_s=timeout_s,
                 stop_timeout_s=stop_timeout_s,
                 work_dir=work_dir,
+                extra_env=profiled_env("measured"),
             )
         )
     return {"preflight": preflight, "runs": measured[warmup:]}
 
 
+def print_profiles(profile_dir: Path) -> None:
+    """``go tool pprof -top`` over the profiles a profiled run captured, so
+    ``make bench-profile`` is repeatable end to end."""
+    for label, name in (("CPU (measured run)", "go-cpu-measured.prof"), ("HEAP (measured run)", "go-mem-measured.prof")):
+        path = profile_dir / name
+        if not path.exists():
+            continue
+        print(f"\n=== go tool pprof -top ({label}): {path} ===", flush=True)
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(["go", "tool", "pprof", "-top", "-nodecount=30", str(path)], cwd=REPO_ROOT)
+
+
 def build_result(
     *, implementations: dict[str, Any], entries: int, fixture: dict[str, Any], config_hash: str, warmup: int, runs: int
 ) -> dict[str, Any]:
-    return {
+    result = {
         "schema": 1,
         "date": date.today().isoformat(),
         "host": host_facts(),
@@ -625,6 +755,10 @@ def build_result(
         "measured_runs": runs,
         "implementations": implementations,
     }
+    # Persist the per-metric instrumented labels and uncertainty bounds, so
+    # a consumer of the JSON does not have to re-derive them.
+    result["metrics"] = report.metric_metadata(result)
+    return result
 
 
 def _newest_baseline() -> Path:
@@ -638,6 +772,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--baseline", action="store_true", help="write the committed baseline artifacts")
     parser.add_argument("--check", action="store_true", help="compare this run against the committed Go baseline")
+    parser.add_argument("--profile", action="store_true", help="profile the Go binary and print go tool pprof -top")
+    parser.add_argument("--profile-dir", type=Path, default=None, help="where to write the captured profiles")
     parser.add_argument("--out", type=Path, default=None, help="write the result JSON here")
     parser.add_argument("--fixture-dir", type=Path, default=None)
     parser.add_argument("--entries", type=int, default=int(os.environ.get("BENCH_ENTRIES", str(DEFAULT_ENTRIES))))
@@ -656,6 +792,8 @@ def main(argv: list[str] | None = None) -> int:
     selection = os.environ.get("BENCH_IMPL", "both")
     if args.baseline or args.check:
         selection = "both"
+    if args.profile:
+        selection = "go"  # only the Go binary is profiled
     if selection == "both":
         impls = ["go", "python"]
     elif selection in ("go", "python"):
@@ -677,8 +815,8 @@ def main(argv: list[str] | None = None) -> int:
     template = CONFIG_TEMPLATE.read_text(encoding="utf-8")
     config_hash = canonical_config(template)
 
-    work_dir = runtime_root / "work"
-    work_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = resolve_work_dir()
+    profile_dir = (args.profile_dir or (work_dir / "profiles")) if args.profile else None
     implementations: dict[str, Any] = {}
 
     for implementation in impls:
@@ -693,6 +831,7 @@ def main(argv: list[str] | None = None) -> int:
             warmup=args.warmup,
             timeout_s=args.timeout,
             stop_timeout_s=args.stop_timeout,
+            profile_dir=profile_dir,
         )
 
     result = build_result(
@@ -724,6 +863,10 @@ def main(argv: list[str] | None = None) -> int:
         docs = REPO_ROOT / "docs" / "perf-baseline.md"
         docs.write_text(report.render_markdown(result) + "\n", encoding="utf-8")
         print(f"wrote {docs}")
+
+    if profile_dir is not None:
+        print(f"\nprofiles: {profile_dir}")
+        print_profiles(profile_dir)
 
     if args.check:
         baseline = json.loads(_newest_baseline().read_text(encoding="utf-8"))

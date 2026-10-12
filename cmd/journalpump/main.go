@@ -73,6 +73,14 @@ var newLogger = func(stdout io.Writer, level int64) *journaldlog.Log {
 //     (Python notifies twice at startup), and the run loop drives until
 //     SIGTERM/SIGINT.
 func run(args []string, stdout, stderr io.Writer) int {
+	// Profiling is env-gated and inert unless JOURNALPUMP_CPU_PROFILE /
+	// JOURNALPUMP_MEM_PROFILE are set (bench/profile.go); the defer fires
+	// on every return path, so a clean SIGTERM shutdown flushes the
+	// profile. os.Exit in main would skip a defer here, hence the hook
+	// lives in run().
+	stopProfiling := startProfiling()
+	defer stopProfiling()
+
 	if len(args) != 1 {
 		_, _ = fmt.Fprintln(stdout, "config file argument required")
 		return exitErr
