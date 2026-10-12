@@ -96,8 +96,13 @@ in review regardless of passing tests elsewhere.
 7. **repr()-style UTF-8 fallback** (D8): Python's `process()`
    (`journalpump.py:711-714`) converts undecodable byte field values to
    their `repr()` string before JSON serialization — raw invalid bytes
-   never reach the wire. The Go serializer must do the same; this is what
-   makes byte-identical golden-file parity achievable.
+   never reach the wire. The Go serializer must do the same. The parity
+   contract for serialization is **semantically equivalent output
+   (byte-identical where free)**, not byte-identity (user directive,
+   2026-10-13, Task 32): the JSON must stay valid and carry the same keys,
+   values and per-sender event stream, while key order, whitespace,
+   escaping form and float spelling may differ. The D8 repr()-fallback
+   behaviour is unaffected and remains exact.
 8. **Kafka compression** (D5 + thread A8): `kgo.SnappyCompression` —
    not a manual github.com/golang/snappy dependency (that module is for
    websocket app-level compression only). kafka-python used **xerial-
@@ -795,9 +800,11 @@ diff and test output.
       unjustified in the diff.
 
 **Serialization / entries (Tasks 4, 6):**
-- [ ] Golden serialization output byte-identical to Python `json.dumps`
-      for the fixture entries, including an invalid-UTF-8 fixture whose
-      field values appear as repr()-style strings, not raw bytes.
+- [ ] Golden serialization output semantically equivalent to Python
+      `json.dumps` for the fixture entries (same keys/values; byte-identical
+      where free — user directive 2026-10-13, Task 32), including an
+      invalid-UTF-8 fixture whose field values appear as repr()-style
+      strings, not raw bytes.
 - [ ] Cursor `i=<hex>` seqnum parse and `__SEQNUM` enrichment match Python.
 - [ ] `ip_to_geohash` tag values match Python for a test .mmdb (no silent
       empty tags).
