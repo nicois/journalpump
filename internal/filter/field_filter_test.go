@@ -12,6 +12,25 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/filter"
 )
 
+// TestFieldFilterKeepBytes pins KeepBytes to Keep over the raw-path key
+// shapes (leading underscores, mixed case, non-ASCII).
+func TestFieldFilterKeepBytes(t *testing.T) {
+	t.Parallel()
+	filts := []*filter.FieldFilter{
+		filter.NewFieldFilter("wl", config.FieldFilterConfig{Whitelist: true, Fields: []string{"_foo", "BAR"}}),
+		filter.NewFieldFilter("bl", config.FieldFilterConfig{Whitelist: false, Fields: []string{"_foo"}}),
+	}
+	keys := []string{"Foo", "_foo", "BAR", "_bar", "_zob", "__REALTIME_TIMESTAMP", "message", "", "_", "Å", "PRIORITY"}
+	for _, ff := range filts {
+		for _, key := range keys {
+			want := ff.Keep(key)
+			if got := ff.KeepBytes([]byte(key)); got != want {
+				t.Errorf("%s KeepBytes(%q) = %v want %v", ff.Name(), key, got, want)
+			}
+		}
+	}
+}
+
 // TestFieldFilter ports test/test_journalpump.py:TestFieldFilter.
 func TestFieldFilter(t *testing.T) {
 	t.Parallel()

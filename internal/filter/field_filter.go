@@ -72,3 +72,34 @@ func (f *FieldFilter) Keep(name string) bool {
 	_, member := f.fields[strings.ToLower(strings.TrimLeft(name, "_"))]
 	return member == f.whitelist
 }
+
+// KeepBytes is Keep over a byte view (the raw emission path): the leading
+// underscores are stripped, ASCII letters lowercased, and the map probed
+// without allocating when the key is already lowercase.
+func (f *FieldFilter) KeepBytes(name []byte) bool {
+	i := 0
+	for i < len(name) && name[i] == '_' {
+		i++
+	}
+	key := name[i:]
+	needsLower := false
+	for _, c := range key {
+		if c >= 'A' && c <= 'Z' {
+			needsLower = true
+			break
+		}
+	}
+	if !needsLower {
+		_, member := f.fields[string(key)]
+		return member == f.whitelist
+	}
+	lowered := make([]byte, len(key))
+	for j, c := range key {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		lowered[j] = c
+	}
+	_, member := f.fields[string(lowered)]
+	return member == f.whitelist
+}
