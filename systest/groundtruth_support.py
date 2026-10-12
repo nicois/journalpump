@@ -126,6 +126,21 @@ def save_fixture(name: str, data: dict[str, Any]) -> None:
     fixture_path(name).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def semantic_equal(a: bytes | str, b: bytes | str) -> bool:
+    """Compare two JSON payloads by their parsed data, not their bytes.
+
+    Task 32 charter amendment: serialization is "semantically-equivalent,
+    byte-identical where free". Key order and free numeric/whitespace
+    formatting may differ between the Python ground truth and the Go
+    emitter; the parsed values must not. Non-JSON input falls back to a
+    byte comparison (framing/header bytes are compared raw elsewhere).
+    """
+    try:
+        return json.loads(a) == json.loads(b)
+    except (ValueError, TypeError):
+        return a == b
+
+
 def build_shim(directory: Path, extra_shim: str = "") -> Path:
     """Write the storage-origin shim (plus any capture-specific extra
     snippet) and return the PYTHONPATH entry."""

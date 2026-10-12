@@ -69,8 +69,8 @@ def test_file_sender_wire_bytes(tmp_path: Path) -> None:
                 "sent_cursor": sent["cursor"],
             },
             "notes": [
-                "full 40-message output pinned; byte-exact payload JSON per line",
-                "Go parity: identical payload bytes per line, same sent.cursor/count state values",
+                "full 40-message output pinned; payload JSON compared semantically per line (Task 32)",
+                "Go parity: semantically-equal payload JSON per line, same sent.cursor/count state values",
                 "D9 deviation: Python's BufferedWriter tail is lost on SIGTERM; Go flushes it within the "
                 "shutdown grace window, so Go reaches all 40 lines without the capture shim",
             ],
@@ -79,6 +79,12 @@ def test_file_sender_wire_bytes(tmp_path: Path) -> None:
         if not gt.update_mode():
             pytest.fail("file_sender fixture was missing and has been generated; commit it and rerun")
 
-    assert lines[:_EXPECTED_LINES] == fixture["expected"]["lines"]
+    got = lines[:_EXPECTED_LINES]
+    want = fixture["expected"]["lines"]
+    assert len(got) == len(want)
+    for index, (line, expected_line) in enumerate(zip(got, want)):
+        assert gt.semantic_equal(line, expected_line), (
+            f"line {index} payload differs semantically:\n got  {line}\n want {expected_line}"
+        )
     assert sent["count"] == fixture["expected"]["sent_count"]
     assert sent["cursor"] == fixture["expected"]["sent_cursor"]

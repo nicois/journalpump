@@ -247,6 +247,17 @@ def _run_and_capture(
     }
 
 
+def _assert_payloads_semantically_equal(got: list[str], want: list[str], mode: str) -> None:
+    """Compare consumed payloads by parsed JSON (Task 32 charter
+    amendment): key order and free formatting may differ; record framing,
+    headers, key, partition, count and cursor are compared raw elsewhere."""
+    assert len(got) == len(want), f"{mode}: {len(got)} payloads, want {len(want)}"
+    for index, (payload, expected) in enumerate(zip(got, want)):
+        assert gt.semantic_equal(payload, expected), (
+            f"{mode}: record {index} payload differs semantically:\n got  {payload}\n want {expected}"
+        )
+
+
 def test_kafka_wire_records(tmp_path: Path, kafka_broker: str) -> None:
     fixture = gt.load_fixture(_FIXTURE_NAME)
     broker = kafka_broker
@@ -355,11 +366,11 @@ def test_kafka_wire_records(tmp_path: Path, kafka_broker: str) -> None:
     assert manual_partitions == manual_expected["num_partitions"]
     assert auto["partition"] == auto_expected["partition"]
     assert auto["key"] == auto_expected["key"] is None
-    assert auto["payloads"] == auto_expected["payloads"]
+    _assert_payloads_semantically_equal(auto["payloads"], auto_expected["payloads"], "auto_create")
     assert auto["sent_count"] == auto_expected["sent_count"]
     assert auto["sent_cursor"] == auto_expected["sent_cursor"]
     assert manual["partition"] == manual_expected["partition"]
     assert manual["key"] == manual_expected["key"] == "journalpump"
-    assert manual["payloads"] == manual_expected["payloads"]
+    _assert_payloads_semantically_equal(manual["payloads"], manual_expected["payloads"], "manual_create_keyed")
     assert manual["sent_count"] == manual_expected["sent_count"]
     assert manual["sent_cursor"] == manual_expected["sent_cursor"]
