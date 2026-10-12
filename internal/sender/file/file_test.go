@@ -295,6 +295,35 @@ func TestFlushedPayloadBytesAdvancesWhenBufferFills(t *testing.T) {
 	}
 }
 
+// TestDirectWriteBodyIsVisibleWithItsNewline locks the large-line path: a
+// body larger than the empty bufio buffer is written straight to the file,
+// so the trailing newline must reach the file with it. If the newline were
+// instead left buffered, the complete line would not be on disk (only nine
+// of ten lines counted by a reader) and the delivery checkpoint could not
+// advance over it.
+func TestDirectWriteBodyIsVisibleWithItsNewline(t *testing.T) {
+	tr, outPath := newTestSender(t)
+
+	body := bytes.Repeat([]byte("x"), pythonBufferSize+16)
+	if err := tr.SendMessages(context.Background(), [][]byte{body}, ""); err != nil {
+		t.Fatalf("SendMessages: %v", err)
+	}
+
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if want := len(body) + 1; len(raw) != want {
+		t.Fatalf("file size = %d, want %d (body plus newline, both direct-written)", len(raw), want)
+	}
+	if raw[len(raw)-1] != '\n' {
+		t.Fatalf("last byte = %q, want newline", raw[len(raw)-1])
+	}
+	if got := tr.FlushedPayloadBytes(); got != int64(len(body)) {
+		t.Errorf("flushed = %d, want %d (the complete line reached disk)", got, len(body))
+	}
+}
+
 // TestCloseDiscardingDropsUnflushedTail locks the reload-retire contract:
 // the unflushed tail is DROPPED (not flushed to disk), matching the fact
 // that the persisted cursor never claimed those lines — so a replay after

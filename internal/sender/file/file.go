@@ -119,13 +119,22 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // same messages, duplicates included).
 func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error {
 	for _, msg := range batch {
-		// msg + b"\n", written as two bufio writes (design §2.4): the file
-		// bytes are identical to a single line buffer but no per-message
-		// copy is allocated.
+		// msg + b"\n" written as two writes (design §2.4): the file bytes
+		// are identical to a single line buffer but no per-message copy is
+		// allocated. When the body is larger than the (empty) bufio buffer
+		// bufio writes it straight to the file, leaving the buffer empty;
+		// the newline must go straight to the file too, or it would sit
+		// buffered past a fully-written body and the line would not be
+		// visible on disk (and the delivery checkpoint could not advance
+		// over it). Otherwise the newline is buffered with the body tail.
 		s.mu.Lock()
 		_, err := s.buf.Write(msg)
 		if err == nil {
-			_, err = s.buf.Write(newline)
+			if s.buf.Buffered() == 0 {
+				_, err = s.count.Write(newline)
+			} else {
+				_, err = s.buf.Write(newline)
+			}
 		}
 		if err == nil {
 			s.rawEnd += int64(len(msg)) + 1
