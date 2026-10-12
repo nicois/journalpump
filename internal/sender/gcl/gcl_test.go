@@ -8,7 +8,10 @@ package gcl
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/api/logging/v2"
@@ -39,6 +43,21 @@ func (f *fakeWriter) WriteLogEntries(_ context.Context, req *logging.WriteLogEnt
 	defer f.mu.Unlock()
 	f.reqs = append(f.reqs, req)
 	return f.err
+}
+
+// callCount is the number of write attempts (successes and failures).
+func (f *fakeWriter) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.reqs)
+}
+
+// setErr swaps the write result so a loop test can fail repeatedly, then
+// recover.
+func (f *fakeWriter) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
 }
 
 // fakeStats records unexpected_exception emissions.
@@ -283,6 +302,63 @@ func TestTruncatedMessageAppendsMarker(t *testing.T) {
 	}
 }
 
+// TestUnicodeLineSeparatorSizeMatchesPython is the review item 5 regression.
+// Go's json.Marshal escapes U+2028 into six ASCII bytes, so a 50,000-rune
+// U+2028 MESSAGE becomes a line over the 250 KiB quota and takes the
+// truncation branch. Python's recompute measures
+// json.dumps(msg, ensure_ascii=False), where those runes are 3-byte UTF-8
+// (150,000 bytes, well under quota), so Python keeps the truncated MESSAGE.
+// Measuring with encoding/json would over-count to ~300,000 and wrongly swap
+// in the DEFAULT replacement, DISCARDING the message content.
+func TestUnicodeLineSeparatorSizeMatchesPython(t *testing.T) {
+	w := &fakeWriter{}
+	s := newTestSender(w)
+	messageContent := strings.Repeat("\u2028", 50000)
+	message, err := json.Marshal(map[string]any{"MESSAGE": messageContent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(message) <= logEntryQuota {
+		t.Fatalf("fixture line = %d bytes, want > quota %d so truncation runs", len(message), logEntryQuota)
+	}
+	if err := s.SendMessages(context.Background(), [][]byte{message}, ""); err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{{
+		"jsonPayload": map[string]any{"MESSAGE": messageContent + truncationSuffix},
+	}}
+	if got := entryMaps(t, w.reqs[0]); !reflect.DeepEqual(got, want) {
+		t.Errorf("entries = %#v, want the truncated MESSAGE kept (not the DEFAULT replacement)", got)
+	}
+}
+
+// TestPythonJSONSize pins the size probe's Python semantics directly:
+// U+2028/U+2029 count as raw 3-byte UTF-8 and separators match
+// json.dumps defaults.
+func TestPythonJSONSize(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want int
+	}{
+		{"line_separator_is_raw_utf8", strings.Repeat("\u2028", 3), 3*3 + 2},
+		{"paragraph_separator_is_raw_utf8", "\u2029", 3 + 2},
+		{"python_separators", map[string]any{"a": json.Number("1"), "b": json.Number("2")}, len(`{"a": 1, "b": 2}`)},
+		{"control_escaped", "\n", 2 + 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := pythonJSONSize(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("pythonJSONSize = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestFailurePathOrderAndBackoff pins the optimistic-reconnect failure path:
 // mark_disconnected, then the shared backoff, then mark_connected, and a
 // sender.BackoffError so the loop does not wait twice.
@@ -308,6 +384,78 @@ func TestFailurePathOrderAndBackoff(t *testing.T) {
 	if stats.count() != 1 {
 		t.Errorf("unexpected_exception emissions = %d, want 1", stats.count())
 	}
+}
+
+// TestLoopRepeatedFailuresThenRecovery drives the GCL sender through the REAL
+// sender.Loop under synctest (review item 8). It pins: a NON-escalating
+// backoff (the failure path re-marks connected, resetting the loop exponent,
+// so ~10 attempts fit in 10 virtual seconds where an escalating schedule
+// would manage ~4), the unchanged failed-batch cursor and a zero sent count
+// while every write fails, and Go's TRUTHFUL disconnected health during the
+// outage — a deliberate deviation from Python, whose failure path ends with a
+// false-success mark_connected. On recovery the sent count, cursor and
+// connected health all converge.
+func TestLoopRepeatedFailuresThenRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := &fakeWriter{err: errors.New("logging api unavailable")}
+		stats := &fakeStats{}
+		s := newSender(nil, stats, testOptions(), w)
+		inst := sender.Instance{
+			Transport:       s,
+			MaxSendInterval: defaultMaxSendInterval,
+			Type:            "GoogleCloudLoggingSender",
+			ConnectOnInit:   true,
+		}
+		in := make(chan sender.Item, 4)
+		loop := sender.NewLoop(sender.LoopConfig{Name: "gcl-loop"}, inst, in)
+		// The supervisor marks ConnectOnInit senders connected at startup
+		// (python __init__ calls mark_connected).
+		loop.MarkConnected()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { _ = loop.Run(ctx); close(done) }()
+
+		in <- sender.Item{Payload: []byte(`{"MESSAGE": "retry-me"}`), Cursor: "c0"}
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+
+		if got := w.callCount(); got < 7 {
+			t.Errorf("write attempts in 10s = %d, want >= 7 (non-escalating backoff); an escalating schedule would give ~4", got)
+		}
+		mid := loop.State()
+		if mid.Sent.Count != 0 {
+			t.Errorf("sent count while failing = %d, want 0", mid.Sent.Count)
+		}
+		if mid.Sent.Cursor != nil {
+			t.Errorf("cursor advanced to %v while failing; want nil (the failed batch cursor is unchanged)", *mid.Sent.Cursor)
+		}
+		if mid.Health.Status != "disconnected" {
+			t.Errorf("health while failing = %q, want disconnected (Go's truthful state, retained over Python's false-success reset)", mid.Health.Status)
+		}
+		if len(mid.Health.Errors) == 0 {
+			t.Error("health errors empty; the failing sends were not recorded")
+		}
+
+		w.setErr(nil)
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		st := loop.State()
+		cancel()
+		<-done
+
+		if st.Sent.Count != 1 {
+			t.Errorf("sent count after recovery = %d, want 1", st.Sent.Count)
+		}
+		if st.Sent.Cursor == nil || *st.Sent.Cursor != "c0" {
+			t.Errorf("sent cursor after recovery = %v, want c0", st.Sent.Cursor)
+		}
+		if st.Health.Status != "connected" {
+			t.Errorf("health after recovery = %q, want connected", st.Health.Status)
+		}
+		if len(st.Health.Errors) != 0 {
+			t.Errorf("health errors after recovery = %v, want cleared", st.Health.Errors)
+		}
+	})
 }
 
 // TestSeverityMapping pins the journald PRIORITY → severity map and its
@@ -587,5 +735,344 @@ func TestTimestampTruncatedTo26Chars(t *testing.T) {
 	got := entryMaps(t, w.reqs[0])
 	if got[0]["timestamp"] != "2020-06-25T06:24:13.787255Z" {
 		t.Errorf("timestamp = %v", got[0]["timestamp"])
+	}
+}
+
+// clearProxyEnv unsets every proxy variable the shared transport consults, so
+// a construction test starts from a known no-proxy state.
+func clearProxyEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(k, "")
+	}
+}
+
+// writeADCFile writes an authorized_user application-default-credentials file
+// whose token endpoint is tokenURI and points GOOGLE_APPLICATION_CREDENTIALS at
+// it, so FindDefaultCredentials picks it up exactly as in production.
+func writeADCFile(t *testing.T, tokenURI string) {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{
+		"type":          "authorized_user",
+		"client_id":     "abc.apps.googleusercontent.com",
+		"client_secret": "secret",
+		"refresh_token": "refresh-token",
+		"token_uri":     tokenURI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "adc.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path)
+}
+
+// tokenHandler answers a refresh-token exchange with a fixed access token.
+func tokenHandler(token string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"` + token + `","token_type":"Bearer","expires_in":3600}`))
+	}
+}
+
+// TestTokenFetchAfterConstructionAndAuthSend is the review item 1 regression:
+// credentials resolved during construction must still mint a token AFTER the
+// construction function returns (a bounded discovery context would have been
+// canceled and every later fetch would fail "context canceled"), and a send
+// through the oauth2-wrapped client must carry that token.
+func TestTokenFetchAfterConstructionAndAuthSend(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	tokenSrv := httptest.NewServer(tokenHandler("test-token"))
+	defer tokenSrv.Close()
+	writeADCFile(t, tokenSrv.URL)
+
+	var mu sync.Mutex
+	var authHeader string
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authHeader = r.Header.Get("Authorization")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer apiSrv.Close()
+
+	cfg, err := tlsConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiClient, creds, err := buildAuthorizedClient(cfg, testOptions())
+	if err != nil {
+		t.Fatalf("buildAuthorizedClient: %v", err)
+	}
+	if creds.TokenSource == nil {
+		t.Fatal("no token source resolved")
+	}
+
+	// The token fetch and the authenticated request both happen after
+	// construction returned.
+	req, err := http.NewRequest(http.MethodGet, apiSrv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		t.Fatalf("authenticated request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	mu.Lock()
+	got := authHeader
+	mu.Unlock()
+	if got != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want Bearer test-token (token fetched after construction)", got)
+	}
+}
+
+// TestTokenFetchUsesProxyTransport is the review item 2 proxy regression:
+// oauth2.Transport.Base does not govern token acquisition, so the shared
+// oauth2.HTTPClient transport must. With http_proxy set, the refresh-token
+// exchange must be sent to the proxy (absolute-form request URI).
+func TestTokenFetchUsesProxyTransport(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	var mu sync.Mutex
+	var seen []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Method+" "+r.URL.String())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"proxy-token","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer proxy.Close()
+	t.Setenv("http_proxy", proxy.URL)
+	writeADCFile(t, "http://token.example/token")
+
+	cfg, err := tlsConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, creds, err := buildAuthorizedClient(cfg, testOptions())
+	if err != nil {
+		t.Fatalf("buildAuthorizedClient: %v", err)
+	}
+	tok, err := creds.TokenSource.Token()
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if tok.AccessToken != "proxy-token" {
+		t.Errorf("access token = %q, want proxy-token (the proxy answered)", tok.AccessToken)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) == 0 {
+		t.Fatal("the proxy saw no token request; token acquisition bypassed Httplib2Proxy")
+	}
+	if seen[0] != "POST http://token.example/token" {
+		t.Errorf("proxy request = %q, want POST http://token.example/token", seen[0])
+	}
+}
+
+// TestStalledTokenFetchIsBounded is the review item 2 stalled-token
+// regression: a token endpoint that accepts the connection but never answers
+// must not hang the fetch forever — the shared transport's inactivity timeout
+// bounds it.
+func TestStalledTokenFetchIsBounded(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	old := socketTimeout
+	socketTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { socketTimeout = old })
+
+	release := make(chan struct{})
+	stall := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer stall.Close()
+	// LIFO: release the handler before waiting for the server to close.
+	defer close(release)
+	writeADCFile(t, stall.URL)
+
+	cfg, err := tlsConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, creds, err := buildAuthorizedClient(cfg, testOptions())
+	if err != nil {
+		t.Fatalf("buildAuthorizedClient: %v", err)
+	}
+	start := time.Now()
+	if _, err := creds.TokenSource.Token(); err == nil {
+		t.Fatal("a stalled token fetch returned no error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("stalled token fetch took %v, want it bounded by the socket timeout", elapsed)
+	}
+}
+
+// TestAPIInactivityTimeoutBounds is the review item 3 regression: the API
+// transport must bound connect/read/write INACTIVITY (Python's 60 s httplib2
+// socket timeout), across a stalled response, a stalled TLS handshake, and a
+// slow-but-progressing transfer that legitimately outlasts the timeout.
+func TestAPIInactivityTimeoutBounds(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	old := socketTimeout
+	socketTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { socketTimeout = old })
+	cfg, err := tlsConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("stalled_response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		}))
+		defer srv.Close()
+		client := newBaseClient(cfg)
+		start := time.Now()
+		if _, err := client.Get(srv.URL); err == nil {
+			t.Fatal("a stalled response returned no error")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("stalled response took %v, want it bounded by the socket timeout", elapsed)
+		}
+	})
+
+	t.Run("stalled_tls_handshake", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release); _ = ln.Close() })
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			<-release // accept TCP but never speak TLS
+			_ = conn.Close()
+		}()
+		client := newBaseClient(cfg)
+		start := time.Now()
+		if _, err := client.Get("https://" + ln.Addr().String() + "/"); err == nil {
+			t.Fatal("a stalled TLS handshake returned no error")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("stalled TLS handshake took %v, want it bounded by the socket timeout", elapsed)
+		}
+	})
+
+	t.Run("slow_but_progressing", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			flusher := w.(http.Flusher)
+			for range 5 {
+				_, _ = w.Write([]byte("x"))
+				flusher.Flush()
+				time.Sleep(120 * time.Millisecond) // each gap < 200ms, total > 200ms
+			}
+		}))
+		defer srv.Close()
+		client := newBaseClient(cfg)
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("a slow-but-progressing transfer failed: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != "xxxxx" {
+			t.Errorf("body = %q, want xxxxx", body)
+		}
+	})
+}
+
+// TestHTTPLIB2CACertsTrust is the review item 6 regression for a custom trust
+// bundle: with HTTPLIB2_CA_CERTS pointing at the server's CA, the shared
+// transport trusts it (and, separately, the token fetch does too).
+func TestHTTPLIB2CACertsTrust(t *testing.T) {
+	clearProxyEnv(t)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("trusted"))
+	}))
+	defer srv.Close()
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caPath, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HTTPLIB2_CA_CERTS", caPath)
+
+	cfg, err := tlsConfigFromEnv()
+	if err != nil {
+		t.Fatalf("tlsConfigFromEnv: %v", err)
+	}
+	client := newBaseClient(cfg)
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET with a custom CA failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "trusted" {
+		t.Errorf("body = %q, want trusted", body)
+	}
+}
+
+// TestTokenFetchHonorsCACerts proves the trust bundle applies to token traffic
+// too (the shared oauth2.HTTPClient transport), not only API requests.
+func TestTokenFetchHonorsCACerts(t *testing.T) {
+	clearProxyEnv(t)
+	srv := httptest.NewTLSServer(tokenHandler("ca-token"))
+	defer srv.Close()
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caPath, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HTTPLIB2_CA_CERTS", caPath)
+	writeADCFile(t, srv.URL)
+
+	cfg, err := tlsConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, creds, err := buildAuthorizedClient(cfg, testOptions())
+	if err != nil {
+		t.Fatalf("buildAuthorizedClient: %v", err)
+	}
+	tok, err := creds.TokenSource.Token()
+	if err != nil {
+		t.Fatalf("token fetch ignored HTTPLIB2_CA_CERTS: %v", err)
+	}
+	if tok.AccessToken != "ca-token" {
+		t.Errorf("access token = %q, want ca-token", tok.AccessToken)
+	}
+}
+
+// TestHTTPLIB2CACertsInvalid pins the validation: a missing file and a
+// directory are both rejected (httplib2 raises at import when the path is not
+// a file).
+func TestHTTPLIB2CACertsInvalid(t *testing.T) {
+	t.Setenv("HTTPLIB2_CA_CERTS", filepath.Join(t.TempDir(), "missing.pem"))
+	if _, err := tlsConfigFromEnv(); err == nil {
+		t.Error("a missing HTTPLIB2_CA_CERTS path was accepted")
+	}
+	t.Setenv("HTTPLIB2_CA_CERTS", t.TempDir())
+	if _, err := tlsConfigFromEnv(); err == nil {
+		t.Error("a directory HTTPLIB2_CA_CERTS path was accepted")
 	}
 }

@@ -18,8 +18,12 @@
 // Credentials follow Python: a config-provided service-account JSON is
 // parsed with google.CredentialsFromJSON and its project_id OVERRIDES the
 // configured project id; otherwise application default credentials are
-// found. The resulting oauth2 token source is wrapped over the httpx base
-// transport so token fetches use the same proxy policy.
+// found. Resolution runs on a long-lived context carrying oauth2.HTTPClient,
+// so token fetches reuse the same httpx transport (proxy, HTTPLIB2_CA_CERTS,
+// socket timeout) as the API calls; note that oauth2.Transport.Base governs
+// only the API request, and TokenSource.Token() takes no context, so a send's
+// cancellation does not reach an in-flight token fetch (bounded instead by
+// the transport's inactivity timeout).
 //
 // Ported behavior: the 250 KiB / 200 KiB log-entry quota with the
 // MESSAGE-truncation / DEFAULT-replacement logic, the journald-priority →
@@ -32,11 +36,15 @@ package gcl
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,11 +72,17 @@ const (
 	genericNode = "generic_node"
 	// The default idle-flush interval (config.get("max_send_interval", 0.3)).
 	defaultMaxSendInterval = 300 * time.Millisecond
-	// initTimeout bounds credential resolution at construction.
-	initTimeout = 30 * time.Second
 	// truncationSuffix is appended to a truncated MESSAGE.
 	truncationSuffix = "[MESSAGE TRUNCATED]"
 )
+
+// socketTimeout is googleapiclient.http.build_http's httplib2 socket timeout:
+// socket.getdefaulttimeout() if the process set one, else
+// DEFAULT_HTTP_TIMEOUT_SEC = 60. httplib2 applies it as a single scalar to
+// connect, read AND write (Python's socket.settimeout is a per-operation
+// timeout), which httpx.IdleTimeoutDialer reproduces (dial timeout plus a
+// per-read/write inactivity deadline). A var so tests can shorten it.
+var socketTimeout = 60 * time.Second
 
 // severityMapping ports _SEVERITY_MAPPING (journald PRIORITY → Cloud
 // Logging severity). An absent/undefined priority maps to "DEFAULT".
@@ -236,11 +250,16 @@ func parseConfig(raw map[string]any) (options, error) {
 		if !ok {
 			return options{}, fmt.Errorf("google_service_account_credentials: %v is not an object", v)
 		}
-		data, err := json.Marshal(obj)
-		if err != nil {
-			return options{}, fmt.Errorf("google_service_account_credentials: %w", err)
+		// google_cloud_logging.py:50 — `if google_service_account:` is FALSE for
+		// an empty object, so {} selects application default credentials rather
+		// than a (malformed) service account.
+		if len(obj) > 0 {
+			data, err := json.Marshal(obj)
+			if err != nil {
+				return options{}, fmt.Errorf("google_service_account_credentials: %w", err)
+			}
+			opts.serviceAccount = data
 		}
-		opts.serviceAccount = data
 	}
 
 	if v, present := raw["max_send_interval"]; present {
@@ -302,10 +321,12 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 	if err != nil {
 		return sender.Instance{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), initTimeout)
-	defer cancel()
+	tlsCfg, err := tlsConfigFromEnv()
+	if err != nil {
+		return sender.Instance{}, &sender.InitializationError{Err: err}
+	}
 
-	creds, err := resolveCredentials(ctx, opts)
+	apiClient, creds, err := buildAuthorizedClient(tlsCfg, opts)
 	if err != nil {
 		return sender.Instance{}, &sender.InitializationError{Err: err}
 	}
@@ -315,12 +336,7 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 		opts.projectID = creds.ProjectID
 	}
 
-	// The base transport carries the httplib2-compatible proxy policy; the
-	// oauth2 token source wraps it so token fetches share the policy.
-	base := httpx.NewClient(httpx.ClientOptions{Proxy: httpx.Httplib2Proxy})
-	client := &http.Client{Transport: &oauth2.Transport{Source: creds.TokenSource, Base: base.Transport}}
-
-	svc, err := logging.NewService(ctx, option.WithHTTPClient(client))
+	svc, err := logging.NewService(context.Background(), option.WithHTTPClient(apiClient))
 	if err != nil {
 		return sender.Instance{}, &sender.InitializationError{Err: err}
 	}
@@ -332,6 +348,80 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 		// google_cloud_logging.py:66 — the constructor calls mark_connected.
 		ConnectOnInit: true,
 	}, nil
+}
+
+// newBaseClient is the single httpx transport shared by the API requests and
+// the credential token fetches: httplib2's proxy policy, the HTTPLIB2_CA_CERTS
+// trust bundle and the 60 s socket timeout (connect plus per-read/write
+// inactivity), matching googleapiclient's one build_http() httplib2.Http
+// (googleapiclient/http.py:2013-2042 wires Http(timeout=socket.getdefaulttimeout()
+// or 60)).
+func newBaseClient(tlsCfg *tls.Config) *http.Client {
+	return httpx.NewClient(httpx.ClientOptions{
+		Proxy:           httpx.Httplib2Proxy,
+		TLSClientConfig: tlsCfg,
+		DialContext:     httpx.IdleTimeoutDialer(socketTimeout),
+	})
+}
+
+// buildAuthorizedClient resolves credentials and wraps the shared transport in
+// the oauth2 Authorization layer — the exact *http.Client handed to the
+// generated logging service.
+//
+// Two lifetime facts drive this shape (review items 1 and 2):
+//
+//   - The credential context is LONG-LIVED (Background-based). oauth2's token
+//     sources capture the context they are created with and reuse it on every
+//     refresh, so a bounded construction context would be canceled the moment
+//     New returned and every later token fetch would fail with "context
+//     canceled".
+//   - oauth2.Transport.Base governs only the API request; it does NOT govern
+//     token acquisition. The token fetch instead follows the oauth2.HTTPClient
+//     value carried on the credential context, so that value is what points the
+//     token fetch at the SAME transport (proxy + HTTPLIB2_CA_CERTS + socket
+//     timeout) as the API calls. The fetch is bounded by that transport's
+//     inactivity timeout, not by a per-send request context: oauth2's
+//     TokenSource.Token() takes no context, so a send's cancellation does not
+//     reach an in-flight token fetch (a documented residual difference).
+func buildAuthorizedClient(tlsCfg *tls.Config, opts options) (*http.Client, *google.Credentials, error) {
+	base := newBaseClient(tlsCfg)
+	credCtx := context.WithValue(context.Background(), oauth2.HTTPClient, base)
+	creds, err := resolveCredentials(credCtx, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	apiClient := &http.Client{Transport: &oauth2.Transport{Source: creds.TokenSource, Base: base.Transport}}
+	return apiClient, creds, nil
+}
+
+// tlsConfigFromEnv builds the TLS configuration for the shared transport,
+// honoring httplib2's HTTPLIB2_CA_CERTS trust bundle (certs.where(): an
+// existing FILE path, else a RuntimeError at import). With it unset, Go uses
+// the system roots where Python would use certifi/the bundled CA list — a
+// documented default-trust deviation, the same class as the ES/OS sender.
+func tlsConfigFromEnv() (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	path := os.Getenv("HTTPLIB2_CA_CERTS")
+	if path == "" {
+		return cfg, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("HTTPLIB2_CA_CERTS: %w", err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("HTTPLIB2_CA_CERTS: %q is a directory, not a CA bundle file", path)
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("HTTPLIB2_CA_CERTS: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if added := pool.AppendCertsFromPEM(pem); !added {
+		return nil, fmt.Errorf("HTTPLIB2_CA_CERTS: %q contains no PEM certificates", path)
+	}
+	cfg.RootCAs = pool
+	return cfg, nil
 }
 
 func statsFromArgs(args sender.ConstructorArgs) exceptionStats {
@@ -491,15 +581,13 @@ func truncateMessage(msg map[string]any) (map[string]any, error) {
 			runes = runes[:maxMessageSize]
 		}
 		msg["MESSAGE"] = string(runes) + truncationSuffix
-		// Python measures json.dumps(msg, ensure_ascii=False).encode("utf-8").
-		// This compact marshal omits Python's ", "/": " separators, so the
-		// measured size can differ by a couple of bytes per field — the same
-		// approximation the Python comment concedes.
-		size, err := marshalJSON(msg)
+		// Python measures json.dumps(msg, ensure_ascii=False).encode("utf-8"):
+		// canonical separators, raw UTF-8 for U+2028/U+2029 (review item 5).
+		size, err := pythonJSONSize(msg)
 		if err != nil {
 			return nil, err
 		}
-		if len(size) > logEntryQuota {
+		if size > logEntryQuota {
 			return map[string]any{"MESSAGE": defaultTruncatedMessage}, nil
 		}
 		return msg, nil
@@ -571,6 +659,119 @@ func marshalJSON(v any) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// pythonJSONSize returns the length in bytes of Python's
+// json.dumps(msg, ensure_ascii=False).encode("utf-8"), the measure the
+// upstream GCL sender uses for the log-entry quota (review item 5). It
+// exists because encoding/json cannot express Python's Unicode treatment:
+// with ensure_ascii=False Python emits non-ASCII — including U+2028 and
+// U+2029 — as raw UTF-8, while encoding/json (even with SetEscapeHTML(false))
+// escapes those two into six ASCII bytes each, over-counting and wrongly
+// rejecting entries Python keeps. Separators match Python's defaults
+// (", " and ": "), so the compact-marshal deviation no longer applies here;
+// the only residual difference is number spelling (Python re-serializes
+// floats via repr; Go re-emits json.Number literals), a corner this size
+// probe does not need to reproduce.
+func pythonJSONSize(v any) (int, error) {
+	var b strings.Builder
+	if err := writePythonJSON(&b, v); err != nil {
+		return 0, err
+	}
+	return b.Len(), nil
+}
+
+// writePythonJSON writes v in Python's json.dumps(ensure_ascii=False) shape.
+// Map key order is irrelevant to a byte LENGTH, so the unordered range is
+// fine.
+func writePythonJSON(b *strings.Builder, v any) error {
+	switch x := v.(type) {
+	case nil:
+		b.WriteString("null")
+	case bool:
+		if x {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case string:
+		writePythonJSONString(b, x)
+	case json.Number:
+		b.WriteString(x.String())
+	case float64:
+		b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
+	case int:
+		b.WriteString(strconv.Itoa(x))
+	case int64:
+		b.WriteString(strconv.FormatInt(x, 10))
+	case map[string]any:
+		b.WriteByte('{')
+		first := true
+		for k, val := range x {
+			if !first {
+				b.WriteString(", ")
+			}
+			first = false
+			writePythonJSONString(b, k)
+			b.WriteString(": ")
+			if err := writePythonJSON(b, val); err != nil {
+				return err
+			}
+		}
+		b.WriteByte('}')
+	case []any:
+		b.WriteByte('[')
+		for i, val := range x {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if err := writePythonJSON(b, val); err != nil {
+				return err
+			}
+		}
+		b.WriteByte(']')
+	default:
+		// Unexpected shape: fall back to encoding/json so the count stays
+		// finite rather than silently undercounting.
+		data, err := marshalJSON(x)
+		if err != nil {
+			return err
+		}
+		b.Write(data)
+	}
+	return nil
+}
+
+// writePythonJSONString quotes s the way Python's json encoder does with
+// ensure_ascii=False: only `"`, `\` and the control characters are escaped;
+// every other rune (U+2028/U+2029 included) is emitted as raw UTF-8.
+func writePythonJSONString(b *strings.Builder, s string) {
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(b, `\u%04x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
 }
 
 // isIntegerLiteral distinguishes Python ints from floats by the literal

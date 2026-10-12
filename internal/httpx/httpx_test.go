@@ -6,12 +6,15 @@
 package httpx
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -300,6 +303,179 @@ func TestHttplib2Proxy(t *testing.T) {
 	t.Setenv("no_proxy", "TARGET.EXAMPLE")
 	if u, err := Httplib2Proxy(httpsReq); err != nil || u == nil {
 		t.Fatalf("no_proxy matching is case-sensitive (uppercase entry should NOT bypass): %v, %v", u, err)
+	}
+}
+
+// TestNormalizeHttplib2Proxy pins httplib2's proxy_info_from_url translation
+// (review item 4): the PORT is defaulted from the DESTINATION scheme (not the
+// proxy URL's own scheme), and the proxy URL SCHEME selects the transport —
+// socks4/socks5/socks map to SOCKS, while http, https and any unknown scheme
+// become a plain HTTP proxy.
+func TestNormalizeHttplib2Proxy(t *testing.T) {
+	cases := []struct {
+		name       string
+		proxy      string
+		destScheme string
+		want       string
+	}{
+		{"omitted_port_https_dest_defaults_443", "http://proxy.example", "https", "http://proxy.example:443"},
+		{"omitted_port_http_dest_defaults_80", "http://proxy.example", "http", "http://proxy.example:80"},
+		{"explicit_port_preserved", "http://proxy.example:3128", "https", "http://proxy.example:3128"},
+		{"https_proxy_is_plain_http", "https://proxy.example:8443", "https", "http://proxy.example:8443"},
+		{"unknown_scheme_is_plain_http", "foo://proxy.example", "https", "http://proxy.example:443"},
+		{"socks5_scheme", "socks5://proxy.example:1080", "https", "socks5://proxy.example:1080"},
+		{"socks_alias_is_socks5", "socks://proxy.example:1080", "https", "socks5://proxy.example:1080"},
+		{"socks4_scheme", "socks4://proxy.example:1080", "https", "socks4://proxy.example:1080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed, err := url.Parse(tc.proxy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := normalizeHttplib2Proxy(parsed, tc.destScheme)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.String() != tc.want {
+				t.Errorf("normalize(%q, %q) = %q, want %q", tc.proxy, tc.destScheme, got.String(), tc.want)
+			}
+		})
+	}
+}
+
+// proxyRequestLine is a minimal HTTP CONNECT proxy that records the request
+// line it received and then blind-tunnels bytes to the requested host. It
+// proves the CLIENT performs a real CONNECT handshake, not merely that a URL
+// was selected.
+type proxyRequestLine struct {
+	ln     net.Listener
+	mu     sync.Mutex
+	lines  []string
+	closed bool
+}
+
+func newProxyRequestLine(t *testing.T) *proxyRequestLine {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &proxyRequestLine{ln: ln}
+	go p.serve()
+	t.Cleanup(func() { p.close() })
+	return p
+}
+
+func (p *proxyRequestLine) addr() string { return p.ln.Addr().String() }
+
+func (p *proxyRequestLine) close() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	p.mu.Unlock()
+	_ = p.ln.Close()
+}
+
+func (p *proxyRequestLine) requests() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.lines...)
+}
+
+func (p *proxyRequestLine) serve() {
+	for {
+		conn, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+		go p.handle(conn)
+	}
+}
+
+func (p *proxyRequestLine) handle(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	// Drain the request headers up to the blank line.
+	for {
+		h, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if h == "\r\n" || h == "\n" {
+			break
+		}
+	}
+	p.mu.Lock()
+	p.lines = append(p.lines, strings.TrimSpace(line))
+	p.mu.Unlock()
+
+	fields := strings.Fields(line)
+	if len(fields) < 2 || fields[0] != http.MethodConnect {
+		_, _ = conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
+		return
+	}
+	remote, err := net.Dial("tcp", fields[1])
+	if err != nil {
+		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	defer func() { _ = remote.Close() }()
+	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(remote, br); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(conn, remote); done <- struct{}{} }()
+	<-done
+}
+
+// TestHttplib2ProxyHandshake drives a real HTTPS request through
+// httpx.Httplib2Proxy with https_proxy set to an https:// URL. httplib2 treats
+// an https:// proxy URL as an ordinary HTTP CONNECT proxy (not TLS-to-proxy),
+// so the proxy must receive a plain "CONNECT host:port" line and the body must
+// round-trip through the tunnel.
+func TestHttplib2ProxyHandshake(t *testing.T) {
+	for _, k := range []string{"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(k, "")
+	}
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("tunneled"))
+	}))
+	defer target.Close()
+
+	proxy := newProxyRequestLine(t)
+	t.Setenv("https_proxy", "https://"+proxy.addr())
+
+	client := NewClient(ClientOptions{
+		Proxy:           Httplib2Proxy,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	})
+	defer client.CloseIdleConnections()
+
+	resp, err := client.Get(target.URL)
+	if err != nil {
+		t.Fatalf("GET through CONNECT proxy: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "tunneled" {
+		t.Errorf("body = %q, want tunneled", body)
+	}
+	reqs := proxy.requests()
+	if len(reqs) == 0 {
+		t.Fatal("the proxy saw no request; the transport did not CONNECT")
+	}
+	if !strings.HasPrefix(reqs[0], http.MethodConnect+" ") {
+		t.Errorf("proxy request line = %q, want a CONNECT", reqs[0])
 	}
 }
 

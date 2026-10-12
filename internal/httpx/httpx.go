@@ -545,20 +545,41 @@ func ShouldBypassProxies(u *url.URL) bool {
 //   - bypass matching is CASE-SENSITIVE and operates on the bare hostname
 //     (no port). A skip entry ending in "."-prefix form matches the host as a
 //     dotted suffix; otherwise it must equal the host exactly. Loopback is not
-//     special-cased.
+//     special-cased;
+//   - the proxy is only consulted for an http/https DESTINATION: httplib2's
+//     proxy_info_from_environment returns None for any other method;
+//   - the proxy PORT is defaulted from the DESTINATION scheme, not the proxy
+//     URL's own scheme (httplib2: url.port or dict(https=443, http=80)[method]),
+//     so an http:// proxy with no port used for an https target defaults to 443;
+//   - the proxy URL's scheme selects the transport: socks4 → SOCKS4,
+//     socks5/socks → SOCKS5, and EVERYTHING ELSE (http, https, and any unknown
+//     scheme) → a plain HTTP proxy (CONNECT for an https target). An https://
+//     proxy URL is therefore NOT a TLS-to-proxy connection; it is an ordinary
+//     HTTP CONNECT proxy.
+//
+// The returned URL is NORMALIZED for Go's http.Transport (see
+// normalizeHttplib2Proxy): scheme mapped to http/socks5 and the port resolved.
+// One residual deviation: Go's transport has no SOCKS4, so a socks4:// proxy
+// is returned as-is and fails at dial time where httplib2 (via PySocks) would
+// use it — documented in charter §2.
+//
+// Note the reference environment: httplib2 only uses a proxy when PySocks is
+// importable (ProxyInfo.isgood() is `socks and ...`), so a deployment without
+// PySocks silently bypasses every configured proxy. That is an environment
+// property, not a selection rule, and is not reproduced here.
 func Httplib2Proxy(req *http.Request) (*url.URL, error) {
 	u := req.URL
 	if u == nil || u.Hostname() == "" {
 		return nil, nil
 	}
+	// proxy_info_from_environment only handles http/https methods.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, nil
+	}
 	if httplib2Bypass(u.Hostname()) {
 		return nil, nil
 	}
-	scheme := "http"
-	if u.Scheme == "https" {
-		scheme = "https"
-	}
-	proxy := envLowerThenUpper(scheme + "_proxy")
+	proxy := envLowerThenUpper(u.Scheme + "_proxy")
 	if proxy == "" {
 		return nil, nil
 	}
@@ -566,16 +587,36 @@ func Httplib2Proxy(req *http.Request) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("proxy %q: %w", proxy, err)
 	}
+	return normalizeHttplib2Proxy(parsed, u.Scheme)
+}
+
+// normalizeHttplib2Proxy maps a parsed proxy URL to httplib2's effective
+// proxy (proxy_info_from_url): the destination scheme supplies the default
+// port and the proxy URL scheme selects the proxy type.
+func normalizeHttplib2Proxy(parsed *url.URL, destScheme string) (*url.URL, error) {
+	if parsed.Hostname() == "" {
+		return nil, fmt.Errorf("proxy %q has no host", parsed.String())
+	}
+	port := parsed.Port()
+	if port == "" {
+		if destScheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	out := *parsed
 	switch parsed.Scheme {
-	case "http", "https", "socks4", "socks5", "socks":
+	case "socks4":
+		out.Scheme = "socks4" // Go has no SOCKS4; fails at dial (documented).
+	case "socks5", "socks":
+		out.Scheme = "socks5"
 	default:
-		// httplib2's proxy_info_from_url returns None for an unsupported scheme.
-		return nil, nil
+		// http, https, and any unknown scheme are all a plain HTTP proxy.
+		out.Scheme = "http"
 	}
-	if parsed.Host == "" {
-		return nil, fmt.Errorf("proxy %q has no host", proxy)
-	}
-	return parsed, nil
+	out.Host = net.JoinHostPort(parsed.Hostname(), port)
+	return &out, nil
 }
 
 // envLowerThenUpper mirrors httplib2's os.environ.get(lower, os.environ.get(UPPER)):
