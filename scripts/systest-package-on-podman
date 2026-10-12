@@ -149,10 +149,13 @@ wait_systemd "$rpm_container"
 
 podman exec "$rpm_container" dnf -y install /tmp/journalpump.rpm
 # The rpm ships the working directory (the spec has no adduser %post, and the
-# unit runs as root); add the config the unit reads (neither package ships a
-# production config -- see the parity doc).
+# unit runs as root) AND a minimal, safe default config, so the service must
+# start zero-config with the shipped file only -- this leg writes nothing.
 podman exec "$rpm_container" test -d /var/lib/journalpump
-podman exec "$rpm_container" sh -c "printf '{}' >/var/lib/journalpump/journalpump.json"
+podman exec "$rpm_container" test -f /var/lib/journalpump/journalpump.json
+# The packaged config must be the shipped default (safe: no readers/senders).
+podman exec "$rpm_container" cat /var/lib/journalpump/journalpump.json \
+    | cmp - "$repo/journalpump.default.json"
 assert_service_active "$rpm_container"
 echo "rpm install-and-start: PASS"
 
@@ -203,7 +206,11 @@ podman exec "$deb_container" apt-get install -y /tmp/journalpump.deb
 podman exec "$deb_container" getent passwd journalpump >/dev/null
 podman exec "$deb_container" test -d /var/lib/journalpump
 podman exec "$deb_container" test -e /etc/ssl/certs/ca-certificates.crt
-podman exec "$deb_container" sh -c "printf '{}' >/var/lib/journalpump/journalpump.json"
+# The deb also ships a minimal, safe default config: the service must start
+# zero-config with the shipped file only -- this leg writes nothing.
+podman exec "$deb_container" test -f /var/lib/journalpump/journalpump.json
+podman exec "$deb_container" cat /var/lib/journalpump/journalpump.json \
+    | cmp - "$repo/journalpump.default.json"
 assert_service_active "$deb_container"
 echo "deb install-and-start: PASS"
 

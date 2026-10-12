@@ -2,7 +2,7 @@ Name:           journalpump
 Version:        %{major_version}
 Release:        %{minor_version}.golang%{?dist}
 Url:            http://github.com/aiven/journalpump
-Summary:        Pump messages from systemd journal to Elasticsearch, Kafka, Logplex or AWS CloudWatch
+Summary:        Pump systemd journal messages to Elasticsearch, Kafka, Logplex or CloudWatch
 License:        ASL 2.0
 Source0:        journalpump-rpm-src.tar.gz
 # The sd-journal reader dlopens libsystemd.so.0 at runtime, which the RPM
@@ -47,7 +47,10 @@ make build-go VERSION=%{version}-%{release}
 %install
 %{__install} -Dm0755 build/journalpump %{buildroot}%{_bindir}/journalpump
 %{__install} -Dm0644 journalpump.unit %{buildroot}%{_unitdir}/journalpump.service
-%{__mkdir_p} %{buildroot}%{_localstatedir}/lib/journalpump
+# Ship a minimal, safe default config so `systemctl start journalpump` works
+# zero-config.  It configures no readers or senders, so the daemon starts and
+# idles without emitting anything; operators opt in by editing this file.
+%{__install} -Dm0644 journalpump.default.json %{buildroot}%{_localstatedir}/lib/journalpump/journalpump.json
 
 
 %files
@@ -55,7 +58,8 @@ make build-go VERSION=%{version}-%{release}
 %doc LICENSE README.rst journalpump.json
 %{_bindir}/journalpump
 %{_unitdir}/journalpump.service
-%{_localstatedir}/lib/journalpump
+%dir %{_localstatedir}/lib/journalpump
+%config(noreplace) %{_localstatedir}/lib/journalpump/journalpump.json
 
 
 %changelog

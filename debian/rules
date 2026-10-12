@@ -35,8 +35,12 @@ override_dh_auto_test:
 # The built binary is installed via debian/install.  The unchanged unit must
 # ship as journalpump.service, but the in-tree source is journalpump.unit and
 # dh_install cannot rename files, so install it here with the service name.
+# Also ship a minimal, safe default config (no readers or senders) so
+# `systemctl start journalpump` works zero-config; operators opt in by editing
+# this file.
 override_dh_auto_install:
 	install -Dm0644 journalpump.unit debian/journalpump/usr/lib/systemd/system/journalpump.service
+	install -Dm0644 journalpump.default.json debian/journalpump/var/lib/journalpump/journalpump.json
 
 # Go's DWARF uses compressed sections that dwz cannot process ("Found
 # compressed .debug_aranges section"); skip the optional DWARF compression

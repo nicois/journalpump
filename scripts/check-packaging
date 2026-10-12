@@ -51,12 +51,12 @@ deb_image=${DEB_IMAGE:-docker.io/library/debian:trixie}
 # ---------------------------------------------------------------------------
 
 # rpmlint diagnostics that are inherent to the package and documented:
-#   - summary-too-long: the Summary is the ORIGINAL wording inherited from
-#     the Python spec (the metadata-adjudication ruling requires restoring
-#     it); at 85 chars it exceeds rpmlint's 80-char limit.
 #   - spelling-error on the technology names systemd (Summary), journald and
 #     logplex (description) -- rpmlint's dictionary false positives.
-RPM_E_ALLOW=": E: (summary-too-long|spelling-error \('(systemd|journald|logplex)')"
+# There is no summary-too-long entry: the Summary is deliberately kept under
+# rpmlint's 80-char limit (a user-approved divergence from the Python spec's
+# 85-char wording), so that diagnostic no longer occurs.
+RPM_E_ALLOW=": E: (spelling-error \('(systemd|journald|logplex)')"
 # The deb carries no allowlisted diagnostics.
 DEB_E_ALLOW='$^'
 
@@ -99,7 +99,6 @@ selftest_gates() {
     # allowlisted rpmlint output passes
     cat >"$t" <<'EOF'
 rpmlint session starts
-journalpump.x86_64: E: summary-too-long Pump messages from systemd journal
 journalpump.x86_64: E: spelling-error ('journald', '%description -l en_US journald -> journals')
 journalpump.x86_64: E: spelling-error ('logplex', 'complex') and ('systemd', 'systems')
 EOF
@@ -107,6 +106,9 @@ EOF
     # an unexpected E: must fail
     printf 'rpmlint session starts\nfoo.x86_64: E: unexpected-tag bar\n' >"$t"
     if rpmlint_gate "$t"; then echo "gate self-test: unexpected error accepted" >&2; rm -f "$t"; return 1; fi
+    # summary-too-long is deliberately NOT allowlisted: it must fail
+    printf "rpmlint session starts\nfoo.x86_64: E: summary-too-long a very long summary\n" >"$t"
+    if rpmlint_gate "$t"; then echo "gate self-test: summary-too-long accepted" >&2; rm -f "$t"; return 1; fi
     # a linter that did not run (no banner) must fail
     printf 'rpmlint: internal error\n' >"$t"
     if rpmlint_gate "$t"; then echo "gate self-test: failed rpmlint run accepted" >&2; rm -f "$t"; return 1; fi
@@ -148,7 +150,8 @@ echo "rpm: $rpmfile  (release=$release arch=$arch)"
 rpmfiles=$(rpm -qlp "$rpmfile")
 for want in /usr/bin/journalpump \
             /usr/lib/systemd/system/journalpump.service \
-            /var/lib/journalpump; do
+            /var/lib/journalpump \
+            /var/lib/journalpump/journalpump.json; do
     grep -qx "$want" <<<"$rpmfiles" || { echo "rpm missing $want"; exit 1; }
 done
 
@@ -167,11 +170,16 @@ grep -q 'ELF' <<<"$kind" || { echo "packaged binary is not an ELF"; exit 1; }
 cmp usr/lib/systemd/system/journalpump.service /src/journalpump.unit || {
     echo "shipped unit differs from journalpump.unit"; exit 1;
 }
+# The shipped default config must match the in-tree journalpump.default.json
+# byte-for-byte, so the zero-config start is validated against the real file.
+cmp var/lib/journalpump/journalpump.json /src/journalpump.default.json || {
+    echo "shipped default config differs from journalpump.default.json"; exit 1;
+}
 
 rpmlint "/src/$rpmfile" >/tmp/rpmlint.out 2>&1 || true
 echo "=== rpmlint output ==="; cat /tmp/rpmlint.out
 rpmlint_gate /tmp/rpmlint.out
-echo "rpmlint: clean (only the allowlisted summary-too-long / technology-name spelling diagnostics)"
+echo "rpmlint: clean (only the allowlisted technology-name spelling diagnostics)"
 RPM_SCRIPT
 
 # The gate functions are used inside the containers; pass their definitions
@@ -218,7 +226,8 @@ echo "deb: $debfile  (version=$version arch=$arch)"
 
 # Expected payload manifest.
 debfiles=$(dpkg-deb -c "$debfile")
-for want in usr/bin/journalpump usr/lib/systemd/system/journalpump.service; do
+for want in usr/bin/journalpump usr/lib/systemd/system/journalpump.service \
+            var/lib/journalpump/journalpump.json; do
     grep -qE "[[:space:]]\./$want\$" <<<"$debfiles" || { echo "deb missing $want"; exit 1; }
 done
 
@@ -229,6 +238,11 @@ grep -q 'ELF' <<<"$kind" || { echo "packaged binary is not an ELF"; exit 1; }
 # The plan requires the unit UNCHANGED: compare byte-for-byte.
 cmp "$work/usr/lib/systemd/system/journalpump.service" /src/journalpump.unit || {
     echo "shipped unit differs from journalpump.unit"; exit 1;
+}
+# The shipped default config must match the in-tree journalpump.default.json
+# byte-for-byte, so the zero-config start is validated against the real file.
+cmp "$work/var/lib/journalpump/journalpump.json" /src/journalpump.default.json || {
+    echo "shipped default config differs from journalpump.default.json"; exit 1;
 }
 
 # The adduser postinst must be shipped verbatim.
