@@ -6,6 +6,7 @@
 package cloudwatch
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -148,32 +150,37 @@ func resolveConfig(cfg map[string]any, environ []string) (sdkConfig, error) {
 		return sdkConfig{}, errors.New("cloudwatch: partial credentials: aws_secret_access_key supplied without aws_access_key_id")
 	}
 
-	// Environment credentials: botocore's env provider reads
-	// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (plus AWS_SESSION_TOKEN), then
-	// the legacy AWS_ACCESS_KEY/AWS_SECRET_KEY. They take precedence over the
-	// selected profile, so they are resolved here (only when the config pair
-	// did not supply credentials) and passed as an explicit provider.
+	// Environment credentials, mirroring botocore's EnvProvider exactly: the
+	// access key is AWS_ACCESS_KEY_ID only (no legacy alias); when it is
+	// absent the provider yields nothing and falls through to the profile,
+	// even if a secret key is present; when it is present the secret key is
+	// required (else PartialCredentialsError). The token is the first present
+	// of AWS_SECURITY_TOKEN then AWS_SESSION_TOKEN. Env credentials take
+	// precedence over the selected profile, so they are resolved here (only
+	// when the config pair did not supply credentials) and passed as an
+	// explicit provider.
 	if !sc.hasCreds {
-		envAccess := envLookup(environ, "AWS_ACCESS_KEY_ID")
-		envSecret := envLookup(environ, "AWS_SECRET_ACCESS_KEY")
-		if envAccess == "" && envSecret == "" {
-			envAccess = envLookup(environ, "AWS_ACCESS_KEY")
-			envSecret = envLookup(environ, "AWS_SECRET_KEY")
-		}
-		switch {
-		case envAccess != "" && envSecret != "":
-			sc.envAccessKey, sc.envSecretKey = envAccess, envSecret
-			sc.envSession = envLookup(environ, "AWS_SESSION_TOKEN")
-			sc.hasEnvCreds = true
-		case envAccess != "":
-			return sdkConfig{}, errors.New("cloudwatch: partial credentials: AWS_ACCESS_KEY_ID supplied without AWS_SECRET_ACCESS_KEY")
-		case envSecret != "":
-			return sdkConfig{}, errors.New("cloudwatch: partial credentials: AWS_SECRET_ACCESS_KEY supplied without AWS_ACCESS_KEY_ID")
+		if envAccess := envLookup(environ, "AWS_ACCESS_KEY_ID"); envAccess != "" {
+			envSecret := envLookup(environ, "AWS_SECRET_ACCESS_KEY")
+			if envSecret == "" {
+				return sdkConfig{}, errors.New("cloudwatch: partial credentials: AWS_ACCESS_KEY_ID supplied without AWS_SECRET_ACCESS_KEY")
+			}
+			sc.envAccessKey, sc.envSecretKey, sc.hasEnvCreds = envAccess, envSecret, true
+			sc.envSession = envLookup(environ, "AWS_SECURITY_TOKEN")
+			if sc.envSession == "" {
+				sc.envSession = envLookup(environ, "AWS_SESSION_TOKEN")
+			}
 		}
 	}
 
-	// CA bundle: botocore honors AWS_CA_BUNDLE, then REQUESTS_CA_BUNDLE.
+	// CA bundle: botocore resolves AWS_CA_BUNDLE, then the profile's
+	// ca_bundle, then REQUESTS_CA_BUNDLE (endpoint._get_verify_value). The
+	// profile bundle is read from the shared config file for the selected
+	// profile; the SDK has no native ca_bundle key, so it is parsed here.
 	sc.caBundle = envLookup(environ, "AWS_CA_BUNDLE")
+	if sc.caBundle == "" {
+		sc.caBundle = profileCABundle(sc.profile, environ)
+	}
 	if sc.caBundle == "" {
 		sc.caBundle = envLookup(environ, "REQUESTS_CA_BUNDLE")
 	}
@@ -262,7 +269,12 @@ func (sc sdkConfig) newHTTPClient() (aws.HTTPClient, error) {
 		read = readTimeout
 	}
 	b := awshttp.NewBuildableClient().
-		WithTransportOptions(func(tr *http.Transport) { tr.Proxy = sc.proxy }).
+		WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = sc.proxy
+			// botocore applies its connect timeout to the TLS handshake too;
+			// the BuildableClient default is 10s.
+			tr.TLSHandshakeTimeout = connect
+		}).
 		WithDialerOptions(func(d *net.Dialer) { d.Timeout = connect })
 	return b.WithReadTimeout(read), nil
 }
@@ -273,6 +285,58 @@ func envLookup(environ []string, key string) string {
 	for _, kv := range environ {
 		if strings.HasPrefix(kv, key+"=") {
 			return kv[len(key)+1:]
+		}
+	}
+	return ""
+}
+
+// profileCABundle reads the ca_bundle setting for the selected profile from the
+// shared config file (AWS_CONFIG_FILE, else ~/.aws/config), mirroring
+// botocore's config-file lookup: the default profile uses [default], others use
+// [profile NAME]. An unreadable or absent file yields "". This exists because
+// the SDK has no native ca_bundle config key.
+func profileCABundle(profile string, environ []string) string {
+	if profile == "" {
+		profile = "default"
+	}
+	section := "profile " + profile
+	if profile == "default" {
+		section = "default"
+	}
+	path := envLookup(environ, "AWS_CONFIG_FILE")
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		path = filepath.Join(home, ".aws", "config")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+
+	inSection := false
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			inSection = strings.EqualFold(strings.TrimSpace(line[1:len(line)-1]), section)
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(key), "ca_bundle") {
+			return strings.TrimSpace(value)
 		}
 	}
 	return ""

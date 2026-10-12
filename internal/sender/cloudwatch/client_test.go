@@ -7,11 +7,17 @@ package cloudwatch
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,10 +25,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/smithy-go"
 )
@@ -104,28 +112,66 @@ func TestResolveConfigPartialCredentials(t *testing.T) {
 	}
 }
 
-// TestResolveConfigCABundlePrecedence pins AWS_CA_BUNDLE over
-// REQUESTS_CA_BUNDLE, and the REQUESTS_CA_BUNDLE fallback.
+// TestResolveConfigCABundlePrecedence pins botocore's order: AWS_CA_BUNDLE,
+// then the selected profile's ca_bundle, then REQUESTS_CA_BUNDLE.
 func TestResolveConfigCABundlePrecedence(t *testing.T) {
-	sc, err := resolveConfig(nil, []string{"REQUESTS_CA_BUNDLE=/requests.pem"})
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(cfgPath, []byte("[default]\nca_bundle = /profile.pem\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfgEnv := "AWS_CONFIG_FILE=" + cfgPath
+
+	// REQUESTS_CA_BUNDLE is the last fallback.
+	sc, err := resolveConfig(nil, []string{cfgEnv, "REQUESTS_CA_BUNDLE=/requests.pem"})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if sc.caBundle != "/profile.pem" {
+		t.Errorf("caBundle = %q, want /profile.pem (profile beats REQUESTS_CA_BUNDLE)", sc.caBundle)
+	}
+
+	// Without a profile bundle, REQUESTS_CA_BUNDLE applies.
+	if err := os.WriteFile(cfgPath, []byte("[default]\nregion = us-east-1\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	sc, err = resolveConfig(nil, []string{cfgEnv, "REQUESTS_CA_BUNDLE=/requests.pem"})
 	if err != nil {
 		t.Fatalf("resolveConfig: %v", err)
 	}
 	if sc.caBundle != "/requests.pem" {
 		t.Errorf("caBundle = %q, want /requests.pem", sc.caBundle)
 	}
-	sc, err = resolveConfig(nil, []string{"AWS_CA_BUNDLE=/aws.pem", "REQUESTS_CA_BUNDLE=/requests.pem"})
+
+	// AWS_CA_BUNDLE wins over the profile bundle.
+	if err := os.WriteFile(cfgPath, []byte("[default]\nca_bundle = /profile.pem\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	sc, err = resolveConfig(nil, []string{cfgEnv, "AWS_CA_BUNDLE=/aws.pem", "REQUESTS_CA_BUNDLE=/requests.pem"})
 	if err != nil {
 		t.Fatalf("resolveConfig: %v", err)
 	}
 	if sc.caBundle != "/aws.pem" {
 		t.Errorf("caBundle = %q, want /aws.pem (AWS_CA_BUNDLE wins)", sc.caBundle)
 	}
+
+	// A non-default profile reads [profile NAME].
+	if err := os.WriteFile(cfgPath, []byte("[profile probe]\nca_bundle = /probe.pem\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	sc, err = resolveConfig(nil, []string{cfgEnv, "AWS_DEFAULT_PROFILE=probe", "REQUESTS_CA_BUNDLE=/requests.pem"})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if sc.caBundle != "/probe.pem" {
+		t.Errorf("caBundle = %q, want /probe.pem", sc.caBundle)
+	}
 }
 
-// TestResolveConfigEnvCredentials pins botocore's env-credential precedence:
-// the env pair is captured when the config supplies none, the legacy pair is
-// the fallback, and a partial env pair is rejected.
+// TestResolveConfigEnvCredentials pins botocore's EnvProvider semantics: the
+// access key is AWS_ACCESS_KEY_ID only, the token prefers AWS_SECURITY_TOKEN
+// over AWS_SESSION_TOKEN, a missing access key falls through (even with a
+// secret present), a legacy pair is ignored, and a present access key without
+// a secret is rejected.
 func TestResolveConfigEnvCredentials(t *testing.T) {
 	sc, err := resolveConfig(nil, []string{
 		"AWS_ACCESS_KEY_ID=envkey",
@@ -139,12 +185,36 @@ func TestResolveConfigEnvCredentials(t *testing.T) {
 		t.Errorf("env creds = %+v", sc)
 	}
 
-	sc, err = resolveConfig(nil, []string{"AWS_ACCESS_KEY=legacy", "AWS_SECRET_KEY=legacysecret"})
+	// AWS_SECURITY_TOKEN wins over AWS_SESSION_TOKEN.
+	sc, err = resolveConfig(nil, []string{
+		"AWS_ACCESS_KEY_ID=k", "AWS_SECRET_ACCESS_KEY=s",
+		"AWS_SECURITY_TOKEN=security", "AWS_SESSION_TOKEN=session",
+	})
 	if err != nil {
 		t.Fatalf("resolveConfig: %v", err)
 	}
-	if !sc.hasEnvCreds || sc.envAccessKey != "legacy" {
-		t.Errorf("legacy env creds = %+v", sc)
+	if sc.envSession != "security" {
+		t.Errorf("token = %q, want security (AWS_SECURITY_TOKEN precedence)", sc.envSession)
+	}
+
+	// A secret key WITHOUT an access key falls through to the profile (no
+	// error), matching EnvProvider's truthiness check on the access key.
+	sc, err = resolveConfig(nil, []string{"AWS_SECRET_ACCESS_KEY=secret-only"})
+	if err != nil {
+		t.Fatalf("secret-only env: %v", err)
+	}
+	if sc.hasEnvCreds {
+		t.Errorf("secret-only env produced credentials: %+v", sc)
+	}
+
+	// The legacy aliases are NOT read (botocore 1.42 removed them); they must
+	// not override the profile with a different identity.
+	sc, err = resolveConfig(nil, []string{"AWS_ACCESS_KEY=legacy", "AWS_SECRET_KEY=legacysecret"})
+	if err != nil {
+		t.Fatalf("legacy env: %v", err)
+	}
+	if sc.hasEnvCreds {
+		t.Errorf("legacy aliases produced credentials: %+v", sc)
 	}
 
 	// A config pair suppresses env credentials entirely.
@@ -158,7 +228,7 @@ func TestResolveConfigEnvCredentials(t *testing.T) {
 	}
 
 	if _, err := resolveConfig(nil, []string{"AWS_ACCESS_KEY_ID=envkey"}); err == nil {
-		t.Error("partial env credentials accepted, want error")
+		t.Error("access-key-only env accepted, want partial-credentials error")
 	}
 }
 
@@ -309,60 +379,126 @@ func TestProxySelectorRouting(t *testing.T) {
 	}
 }
 
-// TestClientCustomCATrustSet drives the FULL production construction path: the
-// AWS_CA_BUNDLE (and REQUESTS_CA_BUNDLE) bundle must reach the real SDK client
-// through the BuildableClient, completing a verified TLS handshake. Without the
-// bundle the handshake must fail.
+// TestClientCustomCATrustSet drives the FULL production construction path:
+// the resolved bundle must reach the real SDK client through the
+// BuildableClient, completing a verified TLS handshake. Two servers with
+// DIFFERENT CAs prove which bundle wins, and without a bundle the handshake
+// must fail.
 func TestClientCustomCATrustSet(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "{}")
-	}))
-	defer server.Close()
+	serverA, caA := selfSignedServer(t)
+	defer serverA.Close()
+	serverB, caB := selfSignedServer(t)
+	defer serverB.Close()
 
-	caPath := writeCertPEM(t, server.Certificate())
-
-	base := func() sdkConfig {
-		return sdkConfig{region: "us-east-1", accessKey: "k", secretKey: "s", hasCreds: true, baseEndpoint: server.URL}
-	}
-
-	for _, env := range []string{"AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"} {
-		t.Run(env, func(t *testing.T) {
-			sc, err := resolveConfig(nil, []string{env + "=" + caPath})
-			if err != nil {
-				t.Fatalf("resolveConfig: %v", err)
-			}
-			merged := base()
-			merged.caBundle = sc.caBundle
-			c, err := buildSDKClient(context.Background(), merged)
-			if err != nil {
-				t.Fatalf("buildSDKClient: %v", err)
-			}
-			if err := c.CreateLogGroup(context.Background(), "group"); err != nil {
-				t.Fatalf("CreateLogGroup with %s trusts: %v", env, err)
-			}
+	client := func(t *testing.T, server *httptest.Server, caBundle string) logsClient {
+		t.Helper()
+		c, err := buildSDKClient(context.Background(), sdkConfig{
+			region: "us-east-1", accessKey: "k", secretKey: "s", hasCreds: true,
+			baseEndpoint: server.URL, caBundle: caBundle,
 		})
+		if err != nil {
+			t.Fatalf("buildSDKClient: %v", err)
+		}
+		return c
 	}
+	mustTrust := func(t *testing.T, c logsClient, server string) {
+		t.Helper()
+		if err := c.CreateLogGroup(context.Background(), "group"); err != nil {
+			t.Fatalf("handshake with the resolved bundle failed against %s: %v", server, err)
+		}
+	}
+	mustReject := func(t *testing.T, c logsClient, server string) {
+		t.Helper()
+		if err := c.CreateLogGroup(context.Background(), "group"); err == nil {
+			t.Fatalf("handshake succeeded against %s without its CA", server)
+		}
+	}
+
+	// AWS_CA_BUNDLE wins over the profile and REQUESTS_CA_BUNDLE.
+	t.Run("AWS_CA_BUNDLE", func(t *testing.T) {
+		cfg := writeConfig(t, "[default]\nca_bundle = "+caB+"\n")
+		sc, err := resolveConfig(nil, []string{"AWS_CA_BUNDLE=" + caA, "AWS_CONFIG_FILE=" + cfg, "REQUESTS_CA_BUNDLE=" + caB})
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		mustTrust(t, client(t, serverA, sc.caBundle), "A")
+		mustReject(t, client(t, serverB, sc.caBundle), "B")
+	})
+
+	// The profile ca_bundle beats REQUESTS_CA_BUNDLE.
+	t.Run("profile ca_bundle", func(t *testing.T) {
+		cfg := writeConfig(t, "[default]\nca_bundle = "+caB+"\n")
+		sc, err := resolveConfig(nil, []string{"AWS_CONFIG_FILE=" + cfg, "REQUESTS_CA_BUNDLE=" + caA})
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		mustTrust(t, client(t, serverB, sc.caBundle), "B")
+		mustReject(t, client(t, serverA, sc.caBundle), "A")
+	})
+
+	// REQUESTS_CA_BUNDLE applies when neither AWS nor profile supplies one.
+	t.Run("REQUESTS_CA_BUNDLE", func(t *testing.T) {
+		cfg := writeConfig(t, "[default]\nregion = us-east-1\n")
+		sc, err := resolveConfig(nil, []string{"AWS_CONFIG_FILE=" + cfg, "REQUESTS_CA_BUNDLE=" + caA})
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		mustTrust(t, client(t, serverA, sc.caBundle), "A")
+		mustReject(t, client(t, serverB, sc.caBundle), "B")
+	})
 
 	// Without the CA the handshake must fail (proves the CA is actually used).
-	c, err := buildSDKClient(context.Background(), base())
-	if err != nil {
-		t.Fatalf("buildSDKClient: %v", err)
-	}
-	if err := c.CreateLogGroup(context.Background(), "group"); err == nil {
-		t.Error("handshake succeeded without the custom CA")
-	}
+	mustReject(t, client(t, serverA, ""), "A")
 }
 
-// writeCertPEM writes an httptest certificate to a temp PEM file and returns
-// its path.
-func writeCertPEM(t *testing.T, cert *x509.Certificate) string {
+// writeConfig writes a shared config file and returns its path.
+func writeConfig(t *testing.T, contents string) string {
 	t.Helper()
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+// selfSignedServer starts a TLS server with its OWN freshly generated
+// self-signed CA/leaf cert (httptest.NewTLSServer reuses one shared cert, so it
+// cannot distinguish two trust bundles) and returns it plus the PEM path of its
+// cert.
+func selfSignedServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "{}")
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	srv.StartTLS()
+
 	path := filepath.Join(t.TempDir(), "ca.pem")
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
 		t.Fatalf("write cert: %v", err)
 	}
-	return path
+	return srv, path
 }
 
 // captureServer records the requests the real SDK client sends.
@@ -624,12 +760,14 @@ func TestSDKCredentialPrecedence(t *testing.T) {
 	t.Setenv("AWS_CONFIG_FILE", cfgPath)
 	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credPath)
 
-	// Env pair present: it must win over the selected profile.
+	// Env pair present: it must win over the selected profile, with the
+	// AWS_SECURITY_TOKEN value as the session token.
 	sc := sdkConfig{
 		region:       "us-east-1",
 		profile:      "probe",
 		envAccessKey: "ENVKEY",
 		envSecretKey: "ENVSECRET",
+		envSession:   "ENVTOKEN",
 		hasEnvCreds:  true,
 	}
 	loaded, err := loadAWSConfig(context.Background(), sc)
@@ -640,8 +778,8 @@ func TestSDKCredentialPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retrieve: %v", err)
 	}
-	if creds.AccessKeyID != "ENVKEY" {
-		t.Errorf("access key = %q, want ENVKEY (env wins over profile)", creds.AccessKeyID)
+	if creds.AccessKeyID != "ENVKEY" || creds.SessionToken != "ENVTOKEN" {
+		t.Errorf("creds = (%q,%q), want (ENVKEY,ENVTOKEN) (env wins over profile)", creds.AccessKeyID, creds.SessionToken)
 	}
 
 	// Without env credentials the selected profile supplies the identity.
@@ -659,14 +797,93 @@ func TestSDKCredentialPrecedence(t *testing.T) {
 	}
 }
 
-// TestBuildSDKClientBoundedConstruction is a construction-path regression:
-// an already-cancelled context must not leave construction blocked (the
-// documented residual is the container-credential hostname lookup, which does
-// not observe ctx).
-func TestBuildSDKClientBoundedConstruction(t *testing.T) {
-	sc := sdkConfig{region: "us-east-1", accessKey: "k", secretKey: "s", hasCreds: true}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+// TestHTTPClientTLSHandshakeTimeout pins that the transport's TLS handshake
+// timeout is botocore's connect timeout (not the BuildableClient's 10s default)
+// and that a stalled handshake is bounded by it.
+func TestHTTPClientTLSHandshakeTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Accept but never speak TLS, stalling the handshake.
+			_ = conn
+		}
+	}()
+
+	const handshakeBound = 300 * time.Millisecond
+	sc := sdkConfig{proxy: botocoreProxyFunc(nil), connectTimeout: handshakeBound}
+	hc, err := sc.newHTTPClient()
+	if err != nil {
+		t.Fatalf("newHTTPClient: %v", err)
+	}
+	b, ok := hc.(*awshttp.BuildableClient)
+	if !ok {
+		t.Fatalf("client = %T, want *awshttp.BuildableClient", hc)
+	}
+	if got := b.GetTransport().TLSHandshakeTimeout; got != handshakeBound {
+		t.Errorf("TLSHandshakeTimeout = %v, want %v (botocore connect timeout)", got, handshakeBound)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "https://"+ln.Addr().String()+"/", nil)
+	start := time.Now()
+	resp, err := hc.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("stalled TLS handshake did not time out")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("stalled handshake returned after %v, want a bounded timeout", d)
+	}
+}
+
+// TestBuildSDKClientDiscoveryBounded exercises construction with an ACTIVE
+// discovery path: no static credentials/region and a stalled local IMDS
+// endpoint with auto defaults discovery. It asserts discovery was actually
+// reached (so the test is not vacuous) and that the ctx bounds completion.
+func TestBuildSDKClientDiscoveryBounded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	var hits atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			hits.Add(1)
+			// Accept but never respond, stalling the IMDS request.
+			_ = conn
+		}
+	}()
+
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://"+ln.Addr().String())
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "")
+	t.Setenv("AWS_DEFAULTS_MODE", "auto")
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_DEFAULT_PROFILE", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_CONFIG_FILE", writeConfig(t, "[default]\n"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", writeConfig(t, ""))
+
+	// No static credentials or region → the discovery path is active.
+	sc := sdkConfig{proxy: botocoreProxyFunc(nil)}
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -674,8 +891,14 @@ func TestBuildSDKClientBoundedConstruction(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("construction did not return for a cancelled context")
+		if d := time.Since(start); d > 4*time.Second {
+			t.Errorf("construction took %v, want a ctx-bounded completion", d)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("construction was not bounded by the ctx deadline")
+	}
+	if hits.Load() == 0 {
+		t.Error("discovery never reached the stalled IMDS endpoint (test is vacuous)")
 	}
 }
 
