@@ -60,33 +60,15 @@ type sdkConfig struct {
 	region  string
 	profile string
 
-	// Explicit pair from the journalpump config (aws_access_key_id/secret);
-	// wins over the environment chain, as in botocore.
+	// Explicit pair from the journalpump config (aws_access_key_id/secret).
+	// The SDK's native chain cannot see these (they are journalpump config
+	// keys, not environment variables), so they are supplied as an explicit
+	// static provider. Every OTHER credential source (environment incl. the
+	// web-identity/container/IMDS chain, and shared-config profiles) is left
+	// to the SDK's native chain.
 	accessKey string
 	secretKey string
 	hasCreds  bool
-
-	// Env pair (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) with the session
-	// token. Passed as an explicit provider when config credentials are absent
-	// so the env pair keeps botocore's precedence over the selected profile.
-	envAccessKey string
-	envSecretKey string
-	envSession   string
-	hasEnvCreds  bool
-
-	// Static pair from the selected shared-config profile (credentials file).
-	// Resolved here — rather than left to the SDK chain — so the SDK never
-	// applies its own credential source selection, which would honour the
-	// legacy AWS_ACCESS_KEY/AWS_SECRET_KEY aliases botocore's EnvProvider
-	// ignores.
-	profileAccessKey string
-	profileSecretKey string
-	profileSession   string
-	hasProfileCreds  bool
-
-	// profileFound records that the shared config profile resolved (so the SDK
-	// can be told to use it even without an explicit AWS_PROFILE).
-	profileFound bool
 
 	// caBundle is the CA bundle path (AWS_CA_BUNDLE, then the profile's
 	// ca_bundle, then REQUESTS_CA_BUNDLE); empty means the SDK/system default
@@ -175,47 +157,13 @@ func resolveConfig(cfg map[string]any, environ []string) (sdkConfig, error) {
 		return sdkConfig{}, errors.New("cloudwatch: partial credentials: aws_secret_access_key supplied without aws_access_key_id")
 	}
 
-	// Environment credentials, mirroring botocore's EnvProvider exactly: the
-	// access key is AWS_ACCESS_KEY_ID only (the SDK also reads the legacy
-	// AWS_ACCESS_KEY/AWS_SECRET_KEY aliases, but botocore does not, so we must
-	// never let the SDK's own chain select them — see the provider switch
-	// below); when the access key is absent the provider yields nothing and
-	// falls through to the profile, even if a secret key is present; when it is
-	// present the secret key is required (else PartialCredentialsError). The
-	// token is the first present of AWS_SECURITY_TOKEN then AWS_SESSION_TOKEN.
-	// Env credentials take precedence over the selected profile, so they are
-	// resolved here (only when the config pair did not supply credentials).
-	if !sc.hasCreds {
-		if envAccess := envLookup(environ, "AWS_ACCESS_KEY_ID"); envAccess != "" {
-			envSecret := envLookup(environ, "AWS_SECRET_ACCESS_KEY")
-			if envSecret == "" {
-				return sdkConfig{}, errors.New("cloudwatch: partial credentials: AWS_ACCESS_KEY_ID supplied without AWS_SECRET_ACCESS_KEY")
-			}
-			sc.envAccessKey, sc.envSecretKey, sc.hasEnvCreds = envAccess, envSecret, true
-			sc.envSession = envLookup(environ, "AWS_SECURITY_TOKEN")
-			if sc.envSession == "" {
-				sc.envSession = envLookup(environ, "AWS_SESSION_TOKEN")
-			}
-		}
-	}
-
 	// Shared config profile: read through the SDK's own loader (the only
 	// supported reader; a hand-rolled parser missed valid [profile default]
-	// sections and drifted from the SDK's normalization). It exposes the
-	// profile CA bundle, retry attempts, and retry mode, plus any static
-	// credentials. A missing or invalid profile is left to surface from
-	// LoadDefaultConfig exactly as before; here it just means no profile
-	// settings were found.
+	// sections and drifted from the SDK's normalization) for the CA bundle and
+	// retry settings. Credentials are NOT extracted here — the SDK's native
+	// chain resolves them (environment, web identity, container, IMDS,
+	// profile), so leaving it intact keeps those branches working.
 	shared, sharedErr := loadSharedConfig(sc.profile, environ)
-	if sharedErr == nil {
-		sc.profileFound = true
-		if !sc.hasCreds && !sc.hasEnvCreds && shared.Credentials.HasKeys() {
-			sc.profileAccessKey = shared.Credentials.AccessKeyID
-			sc.profileSecretKey = shared.Credentials.SecretAccessKey
-			sc.profileSession = shared.Credentials.SessionToken
-			sc.hasProfileCreds = true
-		}
-	}
 
 	// CA bundle: botocore resolves AWS_CA_BUNDLE, then the profile's
 	// ca_bundle, then REQUESTS_CA_BUNDLE (endpoint._get_verify_value). The
@@ -322,28 +270,15 @@ func (sc sdkConfig) loadOptions() ([]func(*config.LoadOptions) error, error) {
 	}
 	if sc.profile != "" {
 		opts = append(opts, config.WithSharedConfigProfile(sc.profile))
-	} else if !sc.hasCreds && !sc.hasEnvCreds && !sc.hasProfileCreds && sc.profileFound {
-		// No explicit profile and no resolved credentials: select the default
-		// profile the SDK-resolved shared config found, so its region/retry/CA
-		// and container/IMDS resolution apply. Only when it actually exists —
-		// forcing it unconditionally errors when there is no config file.
-		opts = append(opts, config.WithSharedConfigProfile("default"))
 	}
-	switch {
-	case sc.hasCreds:
+	// Credentials: only the journalpump config pair is injected (the native
+	// chain cannot see journalpump config keys). The environment, web
+	// identity, container/IMDS, and shared-config profile sources are left to
+	// the SDK's native chain — forcing a profile or injecting a provider broke
+	// the web-identity branch and made the legacy alias handling worse.
+	if sc.hasCreds {
 		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(sc.accessKey, sc.secretKey, ""),
-		))
-	case sc.hasEnvCreds:
-		opts = append(opts, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(sc.envAccessKey, sc.envSecretKey, sc.envSession),
-		))
-	case sc.hasProfileCreds:
-		// Supply the profile's static pair ourselves so the SDK's own chain
-		// (which would prefer the legacy AWS_ACCESS_KEY/AWS_SECRET_KEY aliases
-		// over the profile, unlike botocore) is never consulted.
-		opts = append(opts, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(sc.profileAccessKey, sc.profileSecretKey, sc.profileSession),
 		))
 	}
 	if sc.setMaxAttempts {

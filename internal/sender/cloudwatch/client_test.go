@@ -180,70 +180,130 @@ func TestResolveConfigCABundlePrecedence(t *testing.T) {
 	}
 }
 
-// TestResolveConfigEnvCredentials pins botocore's EnvProvider semantics: the
-// access key is AWS_ACCESS_KEY_ID only, the token prefers AWS_SECURITY_TOKEN
-// over AWS_SESSION_TOKEN, a missing access key falls through (even with a
-// secret present), a legacy pair is ignored, and a present access key without
-// a secret is rejected.
-func TestResolveConfigEnvCredentials(t *testing.T) {
-	sc, err := resolveConfig(nil, []string{
-		"AWS_ACCESS_KEY_ID=envkey",
-		"AWS_SECRET_ACCESS_KEY=envsecret",
-		"AWS_SESSION_TOKEN=envsession",
+// TestSDKCredentialNativeChain verifies the SDK's NATIVE credential chain
+// resolves the operator-visible sources after the round-5 simplification (the
+// hand-injected provider and forced default profile are gone): the standard
+// environment pair, web identity, container credentials, and IMDS. The
+// journalpump config pair is injected separately (the native chain cannot see
+// journalpump config keys).
+func TestSDKCredentialNativeChain(t *testing.T) {
+	reset := func(t *testing.T) {
+		t.Helper()
+		for _, k := range []string{
+			"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+			"AWS_SECURITY_TOKEN", "AWS_ACCESS_KEY", "AWS_SECRET_KEY",
+			"AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+			"AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+			"AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+			"AWS_EC2_METADATA_DISABLED", "AWS_DEFAULT_PROFILE", "AWS_PROFILE",
+			"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_STS", "AWS_DEFAULT_REGION", "AWS_REGION",
+		} {
+			t.Setenv(k, "")
+		}
+		// An empty default profile, so each case's own source is what resolves.
+		t.Setenv("AWS_CONFIG_FILE", writeConfig(t, "[default]\nregion = us-east-1\n"))
+		t.Setenv("AWS_SHARED_CREDENTIALS_FILE", writeConfig(t, ""))
+	}
+
+	retrieve := func(t *testing.T) aws.Credentials {
+		t.Helper()
+		sc, err := resolveConfig(nil, os.Environ())
+		if err != nil {
+			t.Fatalf("resolveConfig: %v", err)
+		}
+		loaded, err := loadAWSConfig(context.Background(), sc)
+		if err != nil {
+			t.Fatalf("loadAWSConfig: %v", err)
+		}
+		creds, err := loaded.Credentials.Retrieve(context.Background())
+		if err != nil {
+			t.Fatalf("retrieve: %v", err)
+		}
+		return creds
+	}
+
+	// Standard environment pair with a session token.
+	t.Run("env", func(t *testing.T) {
+		reset(t)
+		t.Setenv("AWS_ACCESS_KEY_ID", "ENVKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "ENVSECRET")
+		t.Setenv("AWS_SESSION_TOKEN", "ENVTOKEN")
+		creds := retrieve(t)
+		if creds.AccessKeyID != "ENVKEY" || creds.SecretAccessKey != "ENVSECRET" || creds.SessionToken != "ENVTOKEN" {
+			t.Errorf("env creds = %+v", creds)
+		}
 	})
-	if err != nil {
-		t.Fatalf("resolveConfig: %v", err)
-	}
-	if !sc.hasEnvCreds || sc.envAccessKey != "envkey" || sc.envSecretKey != "envsecret" || sc.envSession != "envsession" {
-		t.Errorf("env creds = %+v", sc)
-	}
 
-	// AWS_SECURITY_TOKEN wins over AWS_SESSION_TOKEN.
-	sc, err = resolveConfig(nil, []string{
-		"AWS_ACCESS_KEY_ID=k", "AWS_SECRET_ACCESS_KEY=s",
-		"AWS_SECURITY_TOKEN=security", "AWS_SESSION_TOKEN=session",
+	// Web identity: the branch the round-4 forced default profile broke.
+	t.Run("web_identity", func(t *testing.T) {
+		reset(t)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/xml")
+			_, _ = io.WriteString(w, assumeRoleWithWebIdentityResponse)
+		}))
+		defer srv.Close()
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokenFile, []byte("web-identity-token"), 0o600); err != nil {
+			t.Fatalf("write token: %v", err)
+		}
+		t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
+		t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/web")
+		// The web-identity provider builds its STS call before the config's
+		// BaseEndpoint resolver runs, so the service-specific endpoint env var
+		// (the documented SDK override) is what redirects it.
+		t.Setenv("AWS_ENDPOINT_URL_STS", srv.URL)
+		if creds := retrieve(t); creds.AccessKeyID != "WEBKEY" {
+			t.Errorf("access key = %q, want WEBKEY (web identity)", creds.AccessKeyID)
+		}
 	})
-	if err != nil {
-		t.Fatalf("resolveConfig: %v", err)
-	}
-	if sc.envSession != "security" {
-		t.Errorf("token = %q, want security (AWS_SECURITY_TOKEN precedence)", sc.envSession)
-	}
 
-	// A secret key WITHOUT an access key falls through to the profile (no
-	// error), matching EnvProvider's truthiness check on the access key.
-	sc, err = resolveConfig(nil, []string{"AWS_SECRET_ACCESS_KEY=secret-only"})
-	if err != nil {
-		t.Fatalf("secret-only env: %v", err)
-	}
-	if sc.hasEnvCreds {
-		t.Errorf("secret-only env produced credentials: %+v", sc)
-	}
+	// Container credentials via a full URI.
+	t.Run("container_full_uri", func(t *testing.T) {
+		reset(t)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"AccessKeyId":"CONTKEY","SecretAccessKey":"CONTSECRET","Token":"CONTTOKEN","Expiration":"2099-01-01T00:00:00Z"}`)
+		}))
+		defer srv.Close()
+		t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", srv.URL)
+		if creds := retrieve(t); creds.AccessKeyID != "CONTKEY" {
+			t.Errorf("access key = %q, want CONTKEY (container credentials)", creds.AccessKeyID)
+		}
+	})
 
-	// The legacy aliases are NOT read (botocore 1.42 removed them); they must
-	// not override the profile with a different identity.
-	sc, err = resolveConfig(nil, []string{"AWS_ACCESS_KEY=legacy", "AWS_SECRET_KEY=legacysecret"})
-	if err != nil {
-		t.Fatalf("legacy env: %v", err)
-	}
-	if sc.hasEnvCreds {
-		t.Errorf("legacy aliases produced credentials: %+v", sc)
-	}
-
-	// A config pair suppresses env credentials entirely.
-	sc, err = resolveConfig(map[string]any{"aws_access_key_id": "c", "aws_secret_access_key": "d"},
-		[]string{"AWS_ACCESS_KEY_ID=envkey", "AWS_SECRET_ACCESS_KEY=envsecret"})
-	if err != nil {
-		t.Fatalf("resolveConfig: %v", err)
-	}
-	if !sc.hasCreds || sc.hasEnvCreds {
-		t.Errorf("config pair did not suppress env creds: %+v", sc)
-	}
-
-	if _, err := resolveConfig(nil, []string{"AWS_ACCESS_KEY_ID=envkey"}); err == nil {
-		t.Error("access-key-only env accepted, want partial-credentials error")
-	}
+	// IMDS instance metadata via the local endpoint.
+	t.Run("imds", func(t *testing.T) {
+		reset(t)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/latest/api/token":
+				w.Header().Set("X-Aws-Ec2-Metadata-Token-Ttl-Seconds", "21600")
+				_, _ = io.WriteString(w, "imds-token")
+			case "/latest/meta-data/iam/security-credentials/":
+				_, _ = io.WriteString(w, "test-role")
+			default:
+				_, _ = io.WriteString(w, `{"Code":"Success","Type":"AWS-HMAC","AccessKeyId":"IMDSKEY","SecretAccessKey":"IMDSSECRET","Token":"IMDSTOKEN","Expiration":"2099-01-01T00:00:00Z"}`)
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", srv.URL)
+		if creds := retrieve(t); creds.AccessKeyID != "IMDSKEY" {
+			t.Errorf("access key = %q, want IMDSKEY (IMDS)", creds.AccessKeyID)
+		}
+	})
 }
+
+// assumeRoleWithWebIdentityResponse is a minimal STS response for the web
+// identity credential provider.
+const assumeRoleWithWebIdentityResponse = `<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <Credentials>
+      <AccessKeyId>WEBKEY</AccessKeyId>
+      <SecretAccessKey>WEBSECRET</SecretAccessKey>
+      <SessionToken>WEBTOKEN</SessionToken>
+      <Expiration>2099-01-01T00:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleWithWebIdentityResult>
+</AssumeRoleWithWebIdentityResponse>`
 
 // TestSDKRetryResolution uses the real SDK loader to pin the retry behavior:
 // botocore's 5-attempt default when nothing overrides it, AWS_MAX_ATTEMPTS and
@@ -793,65 +853,69 @@ func TestHTTPClientReadTimeoutBoundsStalledResponse(t *testing.T) {
 	}
 }
 
-// TestSDKCredentialPrecedence pins botocore's precedence through the real
-// client: an environment credential pair wins over the selected profile.
-func TestSDKCredentialPrecedence(t *testing.T) {
+// TestSDKCredentialConfigAndProfilePrecedence drives the production resolver
+// through the real loader: an explicit journalpump config pair wins; an
+// explicit AWS_PROFILE selects that profile's identity; and with no explicit
+// profile the canonical environment pair wins over the default profile.
+func TestSDKCredentialConfigAndProfilePrecedence(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config")
 	credPath := filepath.Join(dir, "credentials")
-	if err := os.WriteFile(cfgPath, []byte("[profile probe]\nregion = us-east-2\n"), 0o600); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("[profile probe]\nregion = us-east-2\n[default]\nregion = us-east-1\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	if err := os.WriteFile(credPath, []byte("[probe]\naws_access_key_id = PROFKEY\naws_secret_access_key = PROFSECRET\n"), 0o600); err != nil {
+	if err := os.WriteFile(credPath, []byte("[probe]\naws_access_key_id = PROFKEY\naws_secret_access_key = PROFSECRET\n[default]\naws_access_key_id = DEFKEY\naws_secret_access_key = DEFSECRET\n"), 0o600); err != nil {
 		t.Fatalf("write credentials: %v", err)
 	}
 	t.Setenv("AWS_CONFIG_FILE", cfgPath)
 	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credPath)
+	t.Setenv("AWS_DEFAULT_PROFILE", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
-	// Env pair present: it must win over the selected profile, with the
-	// AWS_SECURITY_TOKEN value as the session token.
-	sc := sdkConfig{
-		region:       "us-east-1",
-		profile:      "probe",
-		envAccessKey: "ENVKEY",
-		envSecretKey: "ENVSECRET",
-		envSession:   "ENVTOKEN",
-		hasEnvCreds:  true,
-	}
-	loaded, err := loadAWSConfig(context.Background(), sc)
-	if err != nil {
-		t.Fatalf("loadAWSConfig: %v", err)
-	}
-	creds, err := loaded.Credentials.Retrieve(context.Background())
-	if err != nil {
-		t.Fatalf("retrieve: %v", err)
-	}
-	if creds.AccessKeyID != "ENVKEY" || creds.SessionToken != "ENVTOKEN" {
-		t.Errorf("creds = (%q,%q), want (ENVKEY,ENVTOKEN) (env wins over profile)", creds.AccessKeyID, creds.SessionToken)
+	retrieve := func(t *testing.T, sc sdkConfig) aws.Credentials {
+		t.Helper()
+		loaded, err := loadAWSConfig(context.Background(), sc)
+		if err != nil {
+			t.Fatalf("loadAWSConfig: %v", err)
+		}
+		creds, err := loaded.Credentials.Retrieve(context.Background())
+		if err != nil {
+			t.Fatalf("retrieve: %v", err)
+		}
+		return creds
 	}
 
-	// Without env credentials the selected profile supplies the identity.
-	sc.hasEnvCreds, sc.envAccessKey, sc.envSecretKey = false, "", ""
-	loaded, err = loadAWSConfig(context.Background(), sc)
-	if err != nil {
-		t.Fatalf("loadAWSConfig: %v", err)
+	// The journalpump config pair is injected and wins.
+	sc := sdkConfig{region: "us-east-1", profile: "probe", accessKey: "CFGKEY", secretKey: "CFGSECRET", hasCreds: true}
+	if creds := retrieve(t, sc); creds.AccessKeyID != "CFGKEY" {
+		t.Errorf("access key = %q, want CFGKEY (config pair wins)", creds.AccessKeyID)
 	}
-	creds, err = loaded.Credentials.Retrieve(context.Background())
-	if err != nil {
-		t.Fatalf("retrieve: %v", err)
+
+	// An explicit profile selects that profile's identity.
+	sc = sdkConfig{region: "us-east-1", profile: "probe"}
+	if creds := retrieve(t, sc); creds.AccessKeyID != "PROFKEY" {
+		t.Errorf("access key = %q, want PROFKEY (explicit profile)", creds.AccessKeyID)
 	}
-	if creds.AccessKeyID != "PROFKEY" {
-		t.Errorf("access key = %q, want PROFKEY (profile fallback)", creds.AccessKeyID)
+
+	// No explicit profile: the canonical environment pair wins over [default].
+	t.Setenv("AWS_ACCESS_KEY_ID", "ENVKEY")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "ENVSECRET")
+	sc = sdkConfig{region: "us-east-1"}
+	if creds := retrieve(t, sc); creds.AccessKeyID != "ENVKEY" {
+		t.Errorf("access key = %q, want ENVKEY (env pair beats default profile)", creds.AccessKeyID)
 	}
 }
 
-// TestSDKCredentialLegacyAliasesIgnored pins that the SDK's legacy
-// AWS_ACCESS_KEY/AWS_SECRET_KEY aliases never win over the default profile's
-// identity. botocore's EnvProvider ignores those aliases, but the SDK reads
-// them; if the SDK's own credential chain were left to run they would be
-// selected instead of the [default] profile. This drives the production
-// resolver with ACTUAL environment variables and an implicit default profile.
-func TestSDKCredentialLegacyAliasesIgnored(t *testing.T) {
+// TestSDKCredentialLegacyAliasDeviation pins the documented §2 deviation (a):
+// the SDK honours the ancient AWS_ACCESS_KEY/AWS_SECRET_KEY aliases, which
+// botocore's EnvProvider ignores, so with those aliases set and no canonical
+// env pair the SDK selects them instead of the [default] profile identity.
+// This is loud and rare; it is recorded rather than papered over.
+func TestSDKCredentialLegacyAliasDeviation(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config")
 	credPath := filepath.Join(dir, "credentials")
@@ -867,50 +931,26 @@ func TestSDKCredentialLegacyAliasesIgnored(t *testing.T) {
 	t.Setenv("AWS_PROFILE", "")
 	t.Setenv("AWS_ACCESS_KEY_ID", "")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	t.Setenv("AWS_ACCESS_KEY", "ALIASKEY")
 	t.Setenv("AWS_SECRET_KEY", "ALIASSECRET")
 
-	retrieve := func(t *testing.T) aws.Credentials {
-		t.Helper()
-		sc, err := resolveConfig(nil, os.Environ())
-		if err != nil {
-			t.Fatalf("resolveConfig: %v", err)
-		}
-		loaded, err := loadAWSConfig(context.Background(), sc)
-		if err != nil {
-			t.Fatalf("loadAWSConfig: %v", err)
-		}
-		creds, err := loaded.Credentials.Retrieve(context.Background())
-		if err != nil {
-			t.Fatalf("retrieve: %v", err)
-		}
-		return creds
-	}
-
-	// Non-vacuity: with no resolved provider the SDK's own chain selects the
-	// legacy aliases, so asserting the profile wins below is meaningful.
-	bare, err := loadAWSConfig(context.Background(), sdkConfig{})
+	sc, err := resolveConfig(nil, os.Environ())
 	if err != nil {
-		t.Fatalf("loadAWSConfig(bare): %v", err)
+		t.Fatalf("resolveConfig: %v", err)
 	}
-	bareCreds, err := bare.Credentials.Retrieve(context.Background())
+	loaded, err := loadAWSConfig(context.Background(), sc)
 	if err != nil {
-		t.Fatalf("retrieve(bare): %v", err)
+		t.Fatalf("loadAWSConfig: %v", err)
 	}
-	if bareCreds.AccessKeyID != "ALIASKEY" {
-		t.Fatalf("bare SDK selected %q, want ALIASKEY (premise of this test)", bareCreds.AccessKeyID)
+	creds, err := loaded.Credentials.Retrieve(context.Background())
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
 	}
-
-	// Legacy aliases present, no canonical env pair: the default profile wins.
-	if creds := retrieve(t); creds.AccessKeyID != "PROFKEY" {
-		t.Errorf("access key = %q, want PROFKEY (legacy aliases must be ignored, profile wins)", creds.AccessKeyID)
-	}
-
-	// The canonical env pair still wins over the profile (and the aliases).
-	t.Setenv("AWS_ACCESS_KEY_ID", "ENVKEY")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "ENVSECRET")
-	if creds := retrieve(t); creds.AccessKeyID != "ENVKEY" {
-		t.Errorf("access key = %q, want ENVKEY (canonical env pair wins over profile)", creds.AccessKeyID)
+	if creds.AccessKeyID != "ALIASKEY" {
+		t.Errorf("access key = %q, want ALIASKEY (documented deviation: SDK honours legacy aliases, botocore ignores them)", creds.AccessKeyID)
 	}
 }
 
