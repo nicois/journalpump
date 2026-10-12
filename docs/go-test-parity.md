@@ -3038,3 +3038,46 @@ Execution after `2f614e3` (UNCACHED): `go test -race -count=1 ./...` PASS;
 systest ./systest-go/...` PASS (143.5 s); `JOURNALPUMP_BIN=go python -m pytest
 -q systest/` 38 passed; `python -m pytest -q test/` 160 passed. Ledger row 25
 stays `review`.
+
+### Task 25 review round 4 (changes-required: 3 majors)
+
+- **Item 1 — legacy credential aliases (`client.go`).** Round 3 stopped reading
+  `AWS_ACCESS_KEY`/`AWS_SECRET_KEY` in `resolveConfig`, but the SDK's OWN
+  credential chain still reads them, and `config.resolveCredentialChain` picks
+  the environment branch (aliases included) whenever no explicit profile is
+  set. So an implicit default-profile identity could be replaced by the
+  aliases. The resolver now ALWAYS passes an explicit static provider — the
+  config pair, else the env pair (`AWS_ACCESS_KEY_ID` only), else the
+  default/selected profile's static pair, resolved per botocore precedence — so
+  the SDK never performs its own source selection and never mutates the
+  process-global environment. `TestSDKCredentialLegacyAliasesIgnored` drives
+  `resolveConfig` → `loadAWSConfig` → `Retrieve` with ACTUAL environment
+  variables and an implicit default profile: a bare SDK chain selects the
+  aliases (asserted non-vacuously), while the resolved provider yields the
+  profile identity; the canonical env pair still wins.
+- **Item 2 — profile resolution (`client.go`).** The hand-rolled shared-config
+  scanner is replaced by `config.LoadSharedConfigProfile` (the SDK's own
+  loader), which exposes `CustomCABundle`, `RetryMaxAttempts`, and `RetryMode`.
+  The scanner missed valid `[profile default]` sections, so a profile
+  `max_attempts` was wrongly overridden by the 5-attempt default and a profile
+  `ca_bundle` could lose to `REQUESTS_CA_BUNDLE`. The loader is pinned to the
+  botocore file paths (`AWS_CONFIG_FILE`/`AWS_SHARED_CREDENTIALS_FILE` else
+  `~/.aws/...`) because the SDK fixes its default file list at package init.
+  Regressions: `TestSDKRetryResolution` (`[profile default] max_attempts = 7`
+  → 7) and `TestResolveConfigCABundlePrecedence` (`[profile default]
+  ca_bundle` beats `REQUESTS_CA_BUNDLE`).
+- **Item 3 — charter §2 retry scope (`docs/migration-charter.md`).** The "single
+  deviation" wording overstated parity. The attempt COUNT matches botocore's
+  default 5, but the STRATEGY does not: botocore's default mode is `legacy`,
+  which the SDK lacks, so an unset mode uses the SDK's `standard` policy (its
+  retry quota can stop before the maximum). The charter now distinguishes
+  strategy (accepted deviation) from attempt count (matched) and documents BOTH
+  the env (`AWS_RETRY_MODE=legacy`) and the profile (`retry_mode = legacy`)
+  rejection precisely; the "unset/standard/adaptive behave as botocore" claim
+  is removed.
+
+Execution after the round-4 code commit (UNCACHED): `go test -race -count=1
+./...` PASS; `make lint-go` 0 issues (go vet + golangci-lint); `make build-go`
+green; `go test -race -count=1 -tags systest ./systest-go/...` PASS (144.4 s);
+`JOURNALPUMP_BIN=go python -m pytest -q systest/` 38 passed; `python -m
+pytest -q test/` 160 passed. Ledger row 25 stays `review`.
