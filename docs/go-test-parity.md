@@ -3364,7 +3364,8 @@ Execution (UNCACHED): `go test -race -count=1 ./...` PASS;
 
 Not a Go source port: packaging only, so no Python test is ported, changed
 or dropped. The diff touches `journalpump.spec`, `debian/control`,
-`debian/rules`, `debian/install`, `debian/compat` and the `Makefile` deb/rpm
+`debian/rules`, `debian/install`, `debian/compat`, the new
+`journalpump.default.json`, the packaging scripts and the `Makefile` deb/rpm
 targets; the unchanged `journalpump.unit` and the Python tree
 (`journalpump/`, `test/`, `systest/`) are untouched.
 
@@ -3392,6 +3393,12 @@ What changed, per the plan (D1/D7):
   and the `~golang` version suffix (`dch -v $(long_ver)~golang`); two new
   `.PHONY` targets wrap the packaging tests.
 
+User decisions (2026-10-12) add two further changes: the RPM `Summary` is
+rewritten (76 chars, rpmlint-clean with no `summary-too-long` exception) and
+BOTH packages ship a minimal, safe default config
+(`journalpump.default.json` -> `/var/lib/journalpump/journalpump.json`); see
+the deviations below.
+
 Python-parity position: this is the one task whose subject is packaging, and
 the standing instruction is that packaging does not diverge from Python
 beyond the release-ID marker. The ACTUAL per-format Python payloads were NOT
@@ -3402,7 +3409,7 @@ a common one:
   (from `setup.py install`), the unit as
   `/usr/lib/systemd/system/journalpump.service` (an explicit
   `%{__install} -Dm0644 journalpump.unit ...`), and `/var/lib/journalpump`.
-  The Go RPM ships the same three paths.
+  The Go RPM ships those three paths plus the shipped default config (below).
 - The Python DEB shipped NO unit and NO `/var/lib/journalpump` entry: the
   old `debian/rules` only ran `dh $@ ... --buildsystem=pybuild`, `setup.py`
   has `data_files=[]`, and there was no `debian/install` manifest, so the
@@ -3416,16 +3423,17 @@ sanctioned §2 deviation by coordinator ruling: the Python deb's omission of
 the unit appears to be a gap (a packaged daemon with no unit is barely
 usable), and it is NOT reproduced. The `adduser` postinst is unchanged.
 
-CONFLICT flagged for adjudication: neither the Python nor the Go package
-ships a production config or state file, yet the unit's
-`ExecStart=/usr/bin/journalpump /var/lib/journalpump/journalpump.json`
-requires `/var/lib/journalpump/journalpump.json` to exist (the sample
-`journalpump.json` ships only as `%doc`). Starting the packaged service thus
-requires an operator-provided config; the packaging tests write `{}` to that
-path manually to exercise `READY=1`. Whether the package should ship a
-default config (or the unit should point elsewhere) needs a user decision —
-the same gap exists in the Python packages, so reproducing it is not a
-Task 27 divergence, but it blocks a zero-config `systemctl start`.
+SHIPPED DEFAULT CONFIG (user decision 2026-10-12): BOTH packages now ship a
+minimal default `/var/lib/journalpump/journalpump.json`, installed from the
+new in-tree `journalpump.default.json` (`{"readers": {}}`), so
+`systemctl start journalpump` works zero-config. The default is deliberately
+SAFE: it configures NO readers or senders, so the daemon starts
+(`Type=notify` `READY=1`) and idles cleanly, producing no output and no
+network traffic; operators opt in by editing it. The RPM marks it
+`%config(noreplace)` and keeps the Python spec's sample `journalpump.json`
+as `%doc`. Recorded as a sanctioned §2 deviation: this is NEW behavior vs
+the Python packages, which shipped no config and left a zero-config
+`systemctl start` broken (the earlier CONFLICT this replaces).
 
 Tests added (there is no Python counterpart to port — Python had no
 packaging test):
@@ -3436,28 +3444,34 @@ packaging test):
   (`golang-go` from the distro, whose `GOTOOLCHAIN=auto` fetches the
   go.mod-pinned toolchain) — no separate Go is injected. Asserts: the golang
   release/version marker; an arch-specific package (rpm `ARCH != noarch`, deb
-  `Architecture != all`); the expected payload manifests; the rpm `Requires`
+  `Architecture != all`); the expected payload manifests INCLUDING the shipped
+  default config `/var/lib/journalpump/journalpump.json`; the rpm `Requires`
   carry `libsystemd.so.0()(64bit)`; an ELF `/usr/bin/journalpump`; the shipped
-  unit BYTE-IDENTICAL to the in-tree `journalpump.unit` (`cmp`); and the
+  unit BYTE-IDENTICAL to the in-tree `journalpump.unit` (`cmp`); the shipped
+  config byte-identical to `journalpump.default.json` (`cmp`); and the
   Debian `postinst` byte-identical to `debian/postinst`. Linter gates are
   fail-closed: an `E:` line not on a narrow allowlist fails, a linter that
   did not run (rpmlint without its session banner; lintian reporting a
   processing failure) fails, and a gate self-test (negative controls) proves
-  both. The rpmlint allowlist names only the documented diagnostics — the
-  inherited-Summary `summary-too-long` and the `systemd`/`journald`/`logplex`
-  technology-name `spelling-error`s. The deb leg sets `DEBEMAIL`/`DEBFULLNAME`
+  both — including that `summary-too-long` is now REJECTED (it is no longer
+  allowlisted). The rpmlint allowlist names only the `systemd`/`journald`/
+  `logplex` technology-name `spelling-error`s, which persist in the Summary
+  and description. The deb leg sets `DEBEMAIL`/`DEBFULLNAME`
   to the package Maintainer so `dch` does not write a `user@hostname`
   changelog entry (which lintian flags as
   `bogus-mail-host-in-debian-changelog`).
 - `scripts/systest-package-on-podman` (`make systest-package-on-podman`):
   installs BOTH the rpm (in a privileged Fedora container) and the deb (in a
   privileged Debian container), each booted with systemd as PID 1 (derived
-  from the base image, which ships no systemd). Each leg asserts the
-  package's own `postinst` ran (`getent passwd journalpump` and
-  `/var/lib/journalpump` exist), writes the minimal `{}` config, and asserts
-  `journalpump.service` reaches `active` — for the unchanged `Type=notify`
-  unit that only happens after the Go binary sends `READY=1` — plus the
-  `ExecStart` target and an ELF binary at `/usr/bin/journalpump`. The Debian
+  from the base image, which ships no systemd). Each leg asserts
+  `/var/lib/journalpump` exists (the Debian leg also asserts its `adduser`
+  `postinst` ran via `getent passwd journalpump`; the RPM has no `postinst`),
+  then asserts the SHIPPED default config exists and matches
+  `journalpump.default.json`, and that `journalpump.service` reaches `active`
+  reading it — the leg writes NO config itself, so the zero-config start is
+  genuinely exercised — plus the `ExecStart` target and an ELF binary at
+  `/usr/bin/journalpump`. For the unchanged `Type=notify` unit, `active` only
+  happens after the Go binary sends `READY=1`. The Debian
   leg additionally proves the runtime `ca-certificates` dependency is real:
   `ca-certificates` must be ABSENT before the deb is installed and present
   (as a resolved dependency) after, so the TLS senders have system roots on a
@@ -3468,24 +3482,35 @@ Sanctioned/operator-visible packaging decisions (recorded in charter §6 row
 `libsystemd.so.0()(64bit)` soname dependency with `ExclusiveArch: x86_64
 aarch64` (the cgo reader is 64-bit only); `GOTOOLCHAIN=auto` network
 toolchain fetch at build time; the added Debian service (a §2 deviation from
-the Python deb's unit omission). The RPM `Summary` and `Section` are the
-ORIGINAL values (a metadata-adjudication ruling restored them); note the
-consequence below.
+the Python deb's unit omission); and the shipped default config (a §2
+deviation — new behavior vs Python, safe/no-output). The RPM `Section` is
+the original value; the `Summary` is a deliberate, user-approved metadata
+divergence (see below).
 
-TWO ITEMS RAISED FOR USER/COORDINATOR ADJUDICATION (not decided here):
+USER DECISIONS APPLIED (2026-10-12):
 
-1. Restoring the ORIGINAL RPM `Summary` ("Pump messages from systemd journal
-   to Elasticsearch, Kafka, Logplex or AWS CloudWatch", 85 chars) makes
-   rpmlint report `summary-too-long` (its limit is 80) plus a `systemd`
-   `spelling-error`; both are allowlisted in the gate as documented, inherited
-   diagnostics. This means the "rpmlint-clean" acceptance is met only with
-   those two exceptions. Options: keep the original Summary and the
-   exceptions, or rewrite the Summary (rejected by the metadata ruling).
-2. Runtime `ca-certificates` dependency added (the Python deb inherited it
-   via `python3-requests`); the Go package now declares it explicitly.
+1. The RPM `Summary` is REWRITTEN to a concise 76-char wording ("Pump
+   systemd journal messages to Elasticsearch, Kafka, Logplex or
+   CloudWatch") so rpmlint is clean WITHOUT a `summary-too-long` allowlist
+   entry. This is a deliberate divergence from Python's original 85-char
+   Summary (user-approved metadata divergence); the rpmlint allowlist is
+   narrowed to the remaining `systemd`/`journald`/`logplex` spelling
+   false-positives only, and the gate self-test now proves
+   `summary-too-long` is rejected.
+2. The packaged default config (above) is shipped in BOTH formats; the
+   packaging tests assert it is present and byte-identical to
+   `journalpump.default.json`, and the install-and-start legs no longer
+   write `{}` by hand, so they genuinely validate the shipped config.
+   Runtime `ca-certificates` remains a declared dependency (the Python deb
+   inherited it via `python3-requests`); the Go package declares it
+   explicitly.
 
-Execution (UNCACHED): `make check-packaging` PASS; `make
-systest-package-on-podman` PASS; `make build-go` / `make lint-go` (0 issues)
-/ `make unittest-go` / `make systest-go` green; `JOURNALPUMP_BIN=go pytest
--q systest/` 38 passed; `pytest -q test/` 160 passed. Ledger row 27 stays
-`review`.
+Execution (UNCACHED): `make check-packaging` PASS (rpm
+`journalpump-2.4.6-384.gbec15c8.golang.fc44.x86_64`, rpmlint clean apart from
+the allowlisted spelling false-positives; deb
+`journalpump_2.4.6-384-gbec15c8~golang_amd64`, lintian no `E:`); `make
+systest-package-on-podman` PASS (rpm + deb legs, zero-config start); `make
+build-go` / `make lint-go` (0 issues) / `go test -race -count=1 ./...` / `go
+test -race -count=1 -tags systest ./systest-go/...` green;
+`JOURNALPUMP_BIN=go pytest -q systest/` 38 passed; `pytest -q test/` 160
+passed. Ledger row 27 stays `review`.
