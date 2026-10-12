@@ -39,16 +39,80 @@ import time
 _GO_BINARY_PATH = Path(__file__).resolve().parent.parent / "build" / "journalpump"
 
 
-def _command(selection: str | None) -> list[str]:
+def command_for(selection: str | None) -> list[str]:
     """Return the argv for the journalpump implementation selected by
     the ``JOURNALPUMP_BIN`` value (see the module docstring). An empty
     string is treated like unset (the environment may carry an empty
-    variable where the intent was "no selection")."""
+    variable where the intent was "no selection").
+
+    Importable so the benchmark driver (``bench/journalpump_bench.py``)
+    selects the same binary as the systests without duplicating the rule.
+    """
     if not selection or selection == "python":
         return [sys.executable, "-m", "journalpump"]
     if selection == "go":
         return [str(_GO_BINARY_PATH)]
     return [selection]
+
+
+# Backwards-compatible private alias (the module-internal call sites and
+# any early callers used the underscored name).
+_command = command_for
+
+
+def build_environment(
+    *,
+    runtime_directory: Path,
+    notify_socket_name: str,
+    env: dict[str, str] | None = None,
+    export_runtime_directory: bool = True,
+) -> dict[str, str]:
+    """Return the environment a journalpump child is started with: the
+    caller's environment plus the optional overrides, ``RUNTIME_DIRECTORY``
+    (unless suppressed) and the abstract-socket ``NOTIFY_SOCKET``, and
+    ``PYTHONUNBUFFERED=1``.
+
+    Factored out of :meth:`JournalpumpProcess.start` with no behavior
+    change so the benchmark driver constructs an identical environment.
+    """
+    journalpump_env = os.environ.copy()
+    if env:
+        journalpump_env.update(env)
+    if export_runtime_directory:
+        journalpump_env["RUNTIME_DIRECTORY"] = str(runtime_directory)
+    else:
+        journalpump_env.pop("RUNTIME_DIRECTORY", None)
+    journalpump_env["NOTIFY_SOCKET"] = "@" + notify_socket_name
+    journalpump_env["PYTHONUNBUFFERED"] = "1"
+    return journalpump_env
+
+
+class NotifyListener:
+    """An abstract-socket ``NOTIFY_SOCKET`` listener: owns the bound
+    datagram socket, the reader thread and the decoded ``READY=1`` /
+    ``RELOADING=1`` / ``WATCHDOG=1`` notification queue.
+
+    Factored out of :class:`JournalpumpProcess` (same socket name shape and
+    read loop) so the benchmark driver can wait for ``READY=1`` with the
+    identical listener.
+    """
+
+    def __init__(self) -> None:
+        self.name = f"jp-systest-{os.getpid()}-{os.urandom(4).hex()}"
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.socket.bind("\0" + self.name)
+        self.notifications: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=_read_notifications,
+            args=(self.socket, self.notifications),
+            name="journalpump-notify-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self.socket.close()
+        self._thread.join(timeout=2)
 
 
 def _raise_if_journalpump_exited(journalpump: subprocess.Popen[str] | None, *, waiting_for: str) -> None:
@@ -77,24 +141,15 @@ def _read_notifications(
 class JournalpumpProcess:
     def __enter__(self) -> Self:
         self.runtime_directory = Path(tempfile.mkdtemp(prefix="jp-runtime-"))
-        self._notify_socket_name = f"jp-systest-{os.getpid()}-{os.urandom(4).hex()}"
-        self._notify_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self._notify_socket.bind("\0" + self._notify_socket_name)
-        self._notifications: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self._listener = NotifyListener()
+        self._notify_socket_name = self._listener.name
+        self._notifications = self._listener.notifications
         self._journalpump: subprocess.Popen[str] | None = None
-        self._notify_reader_thread = threading.Thread(
-            target=_read_notifications,
-            args=(self._notify_socket, self._notifications),
-            name="journalpump-notify-reader",
-            daemon=True,
-        )
-        self._notify_reader_thread.start()
         return self
 
     def __exit__(self, *_exc: object) -> None:
         self.stop()
-        self._notify_socket.close()
-        self._notify_reader_thread.join(timeout=2)
+        self._listener.close()
         shutil.rmtree(self.runtime_directory, ignore_errors=True)
 
     def _wait_notification(self, notification: str, *, timeout: float) -> None:
@@ -111,16 +166,13 @@ class JournalpumpProcess:
         raise TimeoutError(f"journalpump did not send {notification}")
 
     def start(self, config_path: Path, *, env: dict[str, str] | None = None, export_runtime_directory: bool = True) -> None:
-        journalpump_env = os.environ.copy()
-        if env:
-            journalpump_env.update(env)
-        if export_runtime_directory:
-            journalpump_env["RUNTIME_DIRECTORY"] = str(self.runtime_directory)
-        else:
-            journalpump_env.pop("RUNTIME_DIRECTORY", None)
-        journalpump_env["NOTIFY_SOCKET"] = "@" + self._notify_socket_name
-        journalpump_env["PYTHONUNBUFFERED"] = "1"
-        argv = _command(journalpump_env.get("JOURNALPUMP_BIN"))
+        journalpump_env = build_environment(
+            runtime_directory=self.runtime_directory,
+            notify_socket_name=self._notify_socket_name,
+            env=env,
+            export_runtime_directory=export_runtime_directory,
+        )
+        argv = command_for(journalpump_env.get("JOURNALPUMP_BIN"))
         self._journalpump = subprocess.Popen(
             [*argv, str(config_path)],
             env=journalpump_env,

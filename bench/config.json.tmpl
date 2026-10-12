@@ -1,0 +1,19 @@
+{
+    "log_level": "WARNING",
+    "statsd": {
+        "host": "$statsd_host",
+        "port": $statsd_port
+    },
+    "readers": {
+        "bench": {
+            "journal_path": "$journal_path",
+            "initial_position": "head",
+            "senders": {
+                "out": {
+                    "output_type": "file",
+                    "file_output": "$file_output"
+                }
+            }
+        }
+    }
+}

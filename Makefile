@@ -79,6 +79,43 @@ lint-go:
 	$(GO) vet ./...
 	golangci-lint run ./...
 
+# --- Performance baseline (plan Task 31, Phase 4b) ---
+# bench measures both binaries whole-run over one deterministic journal
+# fixture; see bench/journalpump_bench.py and bench/report.py.  A baseline
+# needs >= 200000 entries and >= 60 s of median Go wall time; the tripwire
+# (bench-check) compares Go against the committed Go baseline only.
+BENCH_TMPFS = /run/user/$(shell id -u)/journalpump-bench
+
+.PHONY: bench
+bench: build-go
+	$(PYTHON) bench/journalpump_bench.py
+
+.PHONY: bench-go
+bench-go: build-go
+	BENCH_IMPL=go $(PYTHON) bench/journalpump_bench.py
+
+.PHONY: bench-python
+bench-python:
+	BENCH_IMPL=python $(PYTHON) bench/journalpump_bench.py
+
+.PHONY: bench-fixture
+bench-fixture:
+	$(PYTHON) bench/gen_journal.py --out $(BENCH_TMPFS)/fixture-$${BENCH_ENTRIES:-200000}-$${BENCH_SEED:-20261012}
+
+.PHONY: bench-baseline
+bench-baseline: build-go
+	$(PYTHON) bench/journalpump_bench.py --baseline
+
+.PHONY: bench-check
+bench-check: build-go
+	$(PYTHON) bench/journalpump_bench.py --check
+
+# Deliberately not part of the required correctness checks: it drives real
+# processes and needs the fixture toolchain.
+.PHONY: bench-test
+bench-test: build-go
+	$(PYTHON) -m pytest bench/ systest/test_bench_smoke.py
+
 clean:
 	$(RM) -r *.egg-info/ build/ dist/
 	$(RM) ../journalpump_* test-*.xml coverage.xml

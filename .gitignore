@@ -8,6 +8,8 @@
 /dist/
 /journalpump.egg-info/
 /rpm/
+# bench ad-hoc runs; the committed baselines (baseline-*.json) are NOT ignored
+/bench/results/run-*.json
 /venv/
 /.venv/
 /.idea
