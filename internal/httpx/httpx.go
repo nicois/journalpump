@@ -16,8 +16,10 @@
 //     the server through requests (logplex.py builds a requests.Session;
 //     elasticsearch_opensearch_sender.py calls
 //     journalpump.util.get_requests_session, also requests — NOT
-//     elasticsearch-py/urllib3). GCL, whose Python client is
-//     google-cloud-logging, will be parameterized separately.
+//     elasticsearch-py/urllib3). GCL uses Httplib2Proxy: its Python client is
+//     googleapiclient.discovery.build, whose default HTTP object wraps
+//     httplib2.Http (google-auth-httplib2), so its proxy semantics are
+//     httplib2's, not requests'.
 //   - request timing: Do applies an optional per-request context
 //     deadline/cancellation, and the requests-compatible senders use an
 //     INACTIVITY timeout (the deadline resets on every read/write).
@@ -517,6 +519,97 @@ func ShouldBypassProxies(u *url.URL) bool {
 			continue
 		}
 		if hostLower == name || strings.HasSuffix(hostLower, "."+name) {
+			return true
+		}
+	}
+	return false
+}
+
+// Httplib2Proxy reproduces httplib2's proxy selection
+// (proxy_info_from_environment / proxy_info_from_url / ProxyInfo.bypass_host),
+// which is what the Google Cloud Logging sender's Python client uses: the
+// GCL sender is built with googleapiclient.discovery.build, whose default HTTP
+// object is google_auth_httplib2.AuthorizedHttp wrapping httplib2.Http, and
+// httplib2.Http defaults proxy_info to proxy_info_from_environment.
+//
+// Differences from the requests port (RequestsProxy) are deliberate and
+// quirk-locked:
+//
+//   - the proxy variable is <scheme>_proxy for the REQUEST scheme (https_proxy
+//     for an https target, http_proxy otherwise); a lowercase variable that is
+//     present but EMPTY disables proxying for that scheme (it does NOT fall
+//     back to the uppercase twin);
+//   - no_proxy is read lowercase-then-uppercase; a value of exactly "*" bypasses
+//     ALL hosts; otherwise it is split on commas with EMPTY entries dropped but
+//     NOT whitespace-stripped;
+//   - bypass matching is CASE-SENSITIVE and operates on the bare hostname
+//     (no port). A skip entry ending in "."-prefix form matches the host as a
+//     dotted suffix; otherwise it must equal the host exactly. Loopback is not
+//     special-cased.
+func Httplib2Proxy(req *http.Request) (*url.URL, error) {
+	u := req.URL
+	if u == nil || u.Hostname() == "" {
+		return nil, nil
+	}
+	if httplib2Bypass(u.Hostname()) {
+		return nil, nil
+	}
+	scheme := "http"
+	if u.Scheme == "https" {
+		scheme = "https"
+	}
+	proxy := envLowerThenUpper(scheme + "_proxy")
+	if proxy == "" {
+		return nil, nil
+	}
+	parsed, err := url.Parse(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("proxy %q: %w", proxy, err)
+	}
+	switch parsed.Scheme {
+	case "http", "https", "socks4", "socks5", "socks":
+	default:
+		// httplib2's proxy_info_from_url returns None for an unsupported scheme.
+		return nil, nil
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("proxy %q has no host", proxy)
+	}
+	return parsed, nil
+}
+
+// envLowerThenUpper mirrors httplib2's os.environ.get(lower, os.environ.get(UPPER)):
+// the lowercase variable wins when PRESENT, even when empty (an empty value is
+// falsy in the caller and disables that proxy).
+func envLowerThenUpper(name string) string {
+	if v, ok := os.LookupEnv(name); ok {
+		return v
+	}
+	return os.Getenv(strings.ToUpper(name))
+}
+
+// httplib2Bypass ports ProxyInfo.bypass_host fed by the no_proxy handling in
+// proxy_info_from_url.
+func httplib2Bypass(host string) bool {
+	noProxy := envLowerThenUpper("no_proxy")
+	if noProxy == "*" {
+		return true
+	}
+	if strings.TrimSpace(noProxy) == "" {
+		return false
+	}
+	hostname := "." + strings.TrimLeft(host, ".")
+	for _, entry := range strings.Split(noProxy, ",") {
+		if entry == "" {
+			continue
+		}
+		if strings.HasPrefix(entry, ".") {
+			if strings.HasSuffix(hostname, entry) {
+				return true
+			}
+			continue
+		}
+		if hostname == "."+entry {
 			return true
 		}
 	}

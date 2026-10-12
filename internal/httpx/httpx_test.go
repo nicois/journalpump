@@ -256,6 +256,53 @@ func TestRequestsProxyFallsBackToAllProxy(t *testing.T) {
 	}
 }
 
+// TestHttplib2Proxy pins httplib2's proxy selection, which is what the GCL
+// sender's Python client (googleapiclient + httplib2) uses: scheme-specific
+// variables, an empty lowercase variable disabling that scheme (no uppercase
+// fallback), no_proxy="*" bypassing everything, case-sensitive bare-hostname
+// matching, and no ALL_PROXY fallback.
+func TestHttplib2Proxy(t *testing.T) {
+	for _, k := range []string{"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("http_proxy", "http://proxy.example:8080")
+	t.Setenv("https_proxy", "http://sproxy.example:8443")
+	t.Setenv("ALL_PROXY", "http://all.example:3128")
+
+	httpReq, _ := http.NewRequest(http.MethodGet, "http://target.example/", nil)
+	if u, err := Httplib2Proxy(httpReq); err != nil || u == nil || u.String() != "http://proxy.example:8080" {
+		t.Fatalf("http proxy = %v, %v (want http://proxy.example:8080, no ALL_PROXY fallback)", u, err)
+	}
+	httpsReq, _ := http.NewRequest(http.MethodGet, "https://target.example/", nil)
+	if u, err := Httplib2Proxy(httpsReq); err != nil || u == nil || u.String() != "http://sproxy.example:8443" {
+		t.Fatalf("https proxy = %v, %v", u, err)
+	}
+
+	// An empty lowercase variable disables that scheme; the uppercase twin is
+	// NOT consulted.
+	t.Setenv("HTTP_PROXY", "http://upper.example:9999")
+	t.Setenv("http_proxy", "")
+	if u, err := Httplib2Proxy(httpReq); err != nil || u != nil {
+		t.Fatalf("empty http_proxy = %v, %v (want nil; uppercase ignored)", u, err)
+	}
+
+	// no_proxy="*" bypasses every host.
+	t.Setenv("no_proxy", "*")
+	if u, err := Httplib2Proxy(httpsReq); err != nil || u != nil {
+		t.Fatalf("no_proxy=* not bypassed: %v, %v", u, err)
+	}
+
+	// Case-sensitive, dotted-suffix matching on the bare hostname.
+	t.Setenv("no_proxy", ".example")
+	if u, err := Httplib2Proxy(httpsReq); err != nil || u != nil {
+		t.Fatalf("no_proxy .example did not bypass: %v, %v", u, err)
+	}
+	t.Setenv("no_proxy", "TARGET.EXAMPLE")
+	if u, err := Httplib2Proxy(httpsReq); err != nil || u == nil {
+		t.Fatalf("no_proxy matching is case-sensitive (uppercase entry should NOT bypass): %v, %v", u, err)
+	}
+}
+
 func TestNewClientNilProxyUsesNoProxy(t *testing.T) {
 	client := NewClient(ClientOptions{})
 	tr, ok := client.Transport.(*http.Transport)
