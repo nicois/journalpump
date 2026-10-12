@@ -9,9 +9,13 @@
 #   - the shipped unit is BYTE-IDENTICAL to the in-tree journalpump.unit
 #     (the plan requires the unit be unchanged);
 #   - the retained payload and the Debian postinst match expected manifests;
+#   - the shipped default config is present, byte-identical to
+#     journalpump.default.json, and marked %config(noreplace) (rpm) / a dpkg
+#     conffile (deb) so operator edits survive an upgrade;
 #   - rpmlint / lintian report no errors beyond the narrowly allowlisted,
-#     documented diagnostics -- and a linter that fails to run also fails
-#     this check (see the linter-gate self-test).
+#     documented diagnostics -- and a linter that fails to run to completion
+#     (unexpected exit status, or a status that disagrees with its output)
+#     also fails this check (see the linter-gate self-test).
 #
 # Both builds run in podman containers (a Fedora container for the rpm, a
 # Debian container for the deb) so the check works on any host with podman.
@@ -44,10 +48,12 @@ deb_image=${DEB_IMAGE:-docker.io/library/debian:trixie}
 # ---------------------------------------------------------------------------
 # Fail-closed linter gates.
 #
-# Each gate returns non-zero if the linter did not actually run, or if it
-# reported an E: line not on the narrow allowlist.  The allowlists name only
-# the documented diagnostics; a negative control (below) proves an unexpected
-# error or a failed linter run is rejected.
+# Each gate takes the linter's OUTPUT FILE and its EXIT STATUS and returns
+# non-zero if the linter failed to run to completion (an unexpected exit
+# status, a missing session banner, a processing failure, or a status that
+# disagrees with the diagnostics seen) OR if it reported an E: line not on the
+# narrow allowlist.  The allowlists name only the documented diagnostics; a
+# negative-control self-test (below) proves each rejection path.
 # ---------------------------------------------------------------------------
 
 # rpmlint diagnostics that are inherent to the package and documented:
@@ -57,18 +63,53 @@ deb_image=${DEB_IMAGE:-docker.io/library/debian:trixie}
 # rpmlint's 80-char limit (a user-approved divergence from the Python spec's
 # 85-char wording), so that diagnostic no longer occurs.
 RPM_E_ALLOW=": E: (spelling-error \('(systemd|journald|logplex)')"
-# The deb carries no allowlisted diagnostics.
-DEB_E_ALLOW='$^'
+# rpmlint exit statuses: 0 = no errors; 64 = one or more errors (where the
+# allowlisted spelling false-positives put it).  Anything else (e.g. 2, the
+# status for an unreadable package file) is a failed run.
+RPM_ALLOWED_RC="0 64"
+# The deb carries ONE allowlisted diagnostic:
+#   - non-etc-file-marked-as-conffile: the default config is a dpkg conffile
+#     (so operator edits survive install-over/upgrade, matching the RPM's
+#     %config(noreplace)) but cannot live in /etc because the unchanged unit's
+#     ExecStart names /var/lib/journalpump/journalpump.json (user decision
+#     2026-10-12: keep the path unchanged).  lintian reports this as an E:.
+DEB_E_ALLOW='non-etc-file-marked-as-conffile var/lib/journalpump/journalpump\.json'
+# lintian exit statuses: 0 = no E: tags; 2 = one or more E: tags.  Anything
+# else (1, or a usage/internal-error status) is a failed run.
+DEB_ALLOWED_RC="0 2"
+
+_rc_allowed() {
+    # $1 exit status, $2 space-separated allowlist.
+    case " $2 " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
 
 _unexpected_e() {
     # $1 output file, $2 allow regex; prints the offending E: lines.
     grep -E '(^|[[:space:]])E: ' "$1" | grep -vE "$2" || true
 }
 
+_e_count() {
+    # $1 output file; prints the number of E: lines (0 when there are none).
+    grep -cE '(^|[[:space:]])E: ' "$1" || true
+}
+
 rpmlint_gate() {
-    local out=$1 bad
+    local out=$1 rc=$2 bad ecount
+    if ! _rc_allowed "$rc" "$RPM_ALLOWED_RC"; then
+        echo "rpmlint exited $rc (expected one of: $RPM_ALLOWED_RC); treating as a failed run" >&2
+        return 1
+    fi
     if ! grep -qF 'rpmlint session starts' "$out"; then
         echo "rpmlint did not run (no session banner); treating as failure" >&2
+        return 1
+    fi
+    ecount=$(_e_count "$out")
+    # The status must describe the output: rc 0 <-> no errors, rc 64 <-> errors.
+    if { [ "$rc" = 0 ] && [ "$ecount" != 0 ]; } || { [ "$rc" = 64 ] && [ "$ecount" = 0 ]; }; then
+        echo "rpmlint exit status $rc disagrees with $ecount E: line(s); treating as failure" >&2
         return 1
     fi
     bad=$(_unexpected_e "$out" "$RPM_E_ALLOW")
@@ -80,9 +121,19 @@ rpmlint_gate() {
 }
 
 lintian_gate() {
-    local out=$1 bad
-    if grep -qE 'No packages selected|is not a Debian format archive|internal error|Traceback' "$out"; then
+    local out=$1 rc=$2 bad ecount
+    if ! _rc_allowed "$rc" "$DEB_ALLOWED_RC"; then
+        echo "lintian exited $rc (expected one of: $DEB_ALLOWED_RC); treating as a failed run" >&2
+        return 1
+    fi
+    if grep -qE 'No packages selected|is not a Debian format archive|is not a readable file|internal error|Traceback' "$out"; then
         echo "lintian failed to process the package; treating as failure" >&2
+        return 1
+    fi
+    ecount=$(_e_count "$out")
+    # The status must describe the output: rc 0 <-> no E: tags, rc 2 <-> E: tags.
+    if { [ "$rc" = 0 ] && [ "$ecount" != 0 ]; } || { [ "$rc" = 2 ] && [ "$ecount" = 0 ]; }; then
+        echo "lintian exit status $rc disagrees with $ecount E: line(s); treating as failure" >&2
         return 1
     fi
     bad=$(_unexpected_e "$out" "$DEB_E_ALLOW")
@@ -96,28 +147,46 @@ lintian_gate() {
 selftest_gates() {
     local t
     t=$(mktemp)
-    # allowlisted rpmlint output passes
+    # allowlisted rpmlint output with its expected status passes
     cat >"$t" <<'EOF'
 rpmlint session starts
 journalpump.x86_64: E: spelling-error ('journald', '%description -l en_US journald -> journals')
 journalpump.x86_64: E: spelling-error ('logplex', 'complex') and ('systemd', 'systems')
 EOF
-    rpmlint_gate "$t" || { echo "gate self-test: allowlisted input rejected" >&2; rm -f "$t"; return 1; }
+    rpmlint_gate "$t" 64 || { echo "gate self-test: allowlisted input rejected" >&2; rm -f "$t"; return 1; }
     # an unexpected E: must fail
     printf 'rpmlint session starts\nfoo.x86_64: E: unexpected-tag bar\n' >"$t"
-    if rpmlint_gate "$t"; then echo "gate self-test: unexpected error accepted" >&2; rm -f "$t"; return 1; fi
+    if rpmlint_gate "$t" 64; then echo "gate self-test: unexpected error accepted" >&2; rm -f "$t"; return 1; fi
     # summary-too-long is deliberately NOT allowlisted: it must fail
     printf "rpmlint session starts\nfoo.x86_64: E: summary-too-long a very long summary\n" >"$t"
-    if rpmlint_gate "$t"; then echo "gate self-test: summary-too-long accepted" >&2; rm -f "$t"; return 1; fi
+    if rpmlint_gate "$t" 64; then echo "gate self-test: summary-too-long accepted" >&2; rm -f "$t"; return 1; fi
     # a linter that did not run (no banner) must fail
     printf 'rpmlint: internal error\n' >"$t"
-    if rpmlint_gate "$t"; then echo "gate self-test: failed rpmlint run accepted" >&2; rm -f "$t"; return 1; fi
-    # lintian: an E: must fail
+    if rpmlint_gate "$t" 2; then echo "gate self-test: failed rpmlint run accepted" >&2; rm -f "$t"; return 1; fi
+    # an abnormal termination (nonzero status without a diagnostic) must fail
+    printf 'rpmlint session starts\n' >"$t"
+    if rpmlint_gate "$t" 1; then echo "gate self-test: abnormal rpmlint termination accepted" >&2; rm -f "$t"; return 1; fi
+    # a status that disagrees with the output (rc 0 but an E: present) must fail
+    printf 'rpmlint session starts\nfoo.x86_64: E: unexpected-tag bar\n' >"$t"
+    if rpmlint_gate "$t" 0; then echo "gate self-test: inconsistent rpmlint status accepted" >&2; rm -f "$t"; return 1; fi
+    # lintian: an E: with its expected status must fail (not allowlisted)
     printf 'E: journalpump: bogus-tag foo\n' >"$t"
-    if lintian_gate "$t"; then echo "gate self-test: lintian error accepted" >&2; rm -f "$t"; return 1; fi
+    if lintian_gate "$t" 2; then echo "gate self-test: lintian error accepted" >&2; rm -f "$t"; return 1; fi
+    # lintian: the allowlisted conffile diagnostic (with its status) passes
+    printf 'E: journalpump: non-etc-file-marked-as-conffile var/lib/journalpump/journalpump.json [conffiles:1]\n' >"$t"
+    lintian_gate "$t" 2 || { echo "gate self-test: allowlisted lintian input rejected" >&2; rm -f "$t"; return 1; }
     # lintian: a processing failure must fail
     printf 'No packages selected.\n' >"$t"
-    if lintian_gate "$t"; then echo "gate self-test: lintian processing failure accepted" >&2; rm -f "$t"; return 1; fi
+    if lintian_gate "$t" 2; then echo "gate self-test: lintian processing failure accepted" >&2; rm -f "$t"; return 1; fi
+    # lintian: an abnormal termination (nonzero status, no diagnostic) must fail
+    printf 'running with root privileges is not recommended!\n' >"$t"
+    if lintian_gate "$t" 1; then echo "gate self-test: abnormal lintian termination accepted" >&2; rm -f "$t"; return 1; fi
+    # lintian: a status that disagrees with the output (rc 2, no E:) must fail
+    printf 'W: probe: some-warning\n' >"$t"
+    if lintian_gate "$t" 2; then echo "gate self-test: inconsistent lintian status accepted" >&2; rm -f "$t"; return 1; fi
+    # lintian: a clean warnings-only run (rc 0) passes
+    printf 'W: probe: some-warning\n' >"$t"
+    lintian_gate "$t" 0 || { echo "gate self-test: clean lintian run rejected" >&2; rm -f "$t"; return 1; }
     rm -f "$t"
     echo "linter gate self-test: PASS"
 }
@@ -161,6 +230,15 @@ grep -qx 'libsystemd.so.0()(64bit)' <<<"$rpmreqs" || {
     echo "rpm lacks the libsystemd.so.0 soname requirement"; exit 1;
 }
 
+# The default config must be a %config(noreplace) file (FILEFLAGS "cn") so an
+# operator's edits survive an upgrade, matching the Debian conffile.
+rpmcfg=$(rpm -qp --qf '[%{FILENAMES} %{FILEFLAGS:fflags}\n]' "$rpmfile" \
+    | grep '/var/lib/journalpump/journalpump.json ' || true)
+case "$rpmcfg" in
+    *cn*) ;;
+    *) echo "rpm config is not %config(noreplace): $rpmcfg"; exit 1 ;;
+esac
+
 work=$(mktemp -d)
 cd "$work"
 rpm2cpio "/src/$rpmfile" | cpio -idm --quiet
@@ -176,15 +254,16 @@ cmp var/lib/journalpump/journalpump.json /src/journalpump.default.json || {
     echo "shipped default config differs from journalpump.default.json"; exit 1;
 }
 
-rpmlint "/src/$rpmfile" >/tmp/rpmlint.out 2>&1 || true
+rpmlint "/src/$rpmfile" >/tmp/rpmlint.out 2>&1 && rpm_rc=0 || rpm_rc=$?
 echo "=== rpmlint output ==="; cat /tmp/rpmlint.out
-rpmlint_gate /tmp/rpmlint.out
+echo "rpmlint exit status: $rpm_rc"
+rpmlint_gate /tmp/rpmlint.out "$rpm_rc"
 echo "rpmlint: clean (only the allowlisted technology-name spelling diagnostics)"
 RPM_SCRIPT
 
 # The gate functions are used inside the containers; pass their definitions
 # and the allowlist constants (via -e) into each container's shell.
-gates=$(declare -f _unexpected_e rpmlint_gate lintian_gate)
+gates=$(declare -f _rc_allowed _unexpected_e _e_count rpmlint_gate lintian_gate)
 
 read -r -d '' deb_script <<'DEB_SCRIPT' || true
 export DEBIAN_FRONTEND=noninteractive
@@ -252,20 +331,29 @@ cmp "$ctl/postinst" /src/debian/postinst || {
     echo "shipped postinst differs from debian/postinst"; exit 1;
 }
 
-lintian "$debfile" >/tmp/lintian.out 2>&1 || true
+# The default config must be a dpkg CONFFILE so an operator's edits survive
+# install-over and upgrade (matching the RPM %config(noreplace)).
+grep -qx '/var/lib/journalpump/journalpump.json' "$ctl/conffiles" || {
+    echo "deb does not mark the default config a conffile"; exit 1;
+}
+
+lintian "$debfile" >/tmp/lintian.out 2>&1 && deb_rc=0 || deb_rc=$?
 echo "=== lintian output ==="; cat /tmp/lintian.out
-lintian_gate /tmp/lintian.out
-echo "lintian: clean (no E: lines)"
+echo "lintian exit status: $deb_rc"
+lintian_gate /tmp/lintian.out "$deb_rc"
+echo "lintian: clean (only the allowlisted non-etc-conffile diagnostic)"
 DEB_SCRIPT
 
 echo "== rpm =="
 podman run --rm -v "$repo:/src:Z" -w /src \
     -e RPM_E_ALLOW="$RPM_E_ALLOW" -e DEB_E_ALLOW="$DEB_E_ALLOW" \
+    -e RPM_ALLOWED_RC="$RPM_ALLOWED_RC" -e DEB_ALLOWED_RC="$DEB_ALLOWED_RC" \
     "$rpm_image" bash -euo pipefail -c "$gates; $rpm_script"
 
 echo "== deb =="
 podman run --rm -v "$repo:/src:Z" \
     -e RPM_E_ALLOW="$RPM_E_ALLOW" -e DEB_E_ALLOW="$DEB_E_ALLOW" \
+    -e RPM_ALLOWED_RC="$RPM_ALLOWED_RC" -e DEB_ALLOWED_RC="$DEB_ALLOWED_RC" \
     "$deb_image" bash -euo pipefail -c "$gates; $deb_script"
 
 echo "check-packaging: PASS"

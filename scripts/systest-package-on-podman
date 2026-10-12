@@ -16,7 +16,10 @@
 #
 # The Debian leg installs the deb with apt so its declared Depends are
 # resolved -- in particular ca-certificates, which must NOT be pre-installed
-# (that would mask a missing runtime dependency for the TLS senders).
+# (that would mask a missing runtime dependency for the TLS senders).  It then
+# edits the shipped config and reinstalls/upgrades the package to prove the
+# config is a dpkg conffile whose operator edits are preserved (and the service
+# still starts from the preserved file).
 #
 # The build targets source `git archive HEAD` / a git clone, so the check
 # validates the committed tree only -- commit before running.
@@ -207,11 +210,28 @@ podman exec "$deb_container" getent passwd journalpump >/dev/null
 podman exec "$deb_container" test -d /var/lib/journalpump
 podman exec "$deb_container" test -e /etc/ssl/certs/ca-certificates.crt
 # The deb also ships a minimal, safe default config: the service must start
-# zero-config with the shipped file only -- this leg writes nothing.
+# zero-config with the shipped file only -- this leg writes nothing yet.
 podman exec "$deb_container" test -f /var/lib/journalpump/journalpump.json
 podman exec "$deb_container" cat /var/lib/journalpump/journalpump.json \
     | cmp - "$repo/journalpump.default.json"
 assert_service_active "$deb_container"
-echo "deb install-and-start: PASS"
+
+# The config is a dpkg CONFFILE: an operator's edit must survive an
+# install-over AND an upgrade, and the service must still start from the
+# preserved file (matching the RPM's %config(noreplace)).
+podman exec "$deb_container" sh -c \
+    'printf "{\n    \"readers\": {},\n    \"log_level\": \"WARNING\"\n}\n" >/var/lib/journalpump/journalpump.json'
+podman exec "$deb_container" dpkg --force-confold -i /tmp/journalpump.deb
+podman exec "$deb_container" grep -q log_level /var/lib/journalpump/journalpump.json
+# Rebuild the same package with a strictly higher version to exercise a real
+# upgrade path, then install it.
+podman exec "$deb_container" sh -c '
+    rm -rf /tmp/up && dpkg-deb -R /tmp/journalpump.deb /tmp/up \
+    && sed -i "s/^Version: .*/Version: 9.9.9~golangupgrade/" /tmp/up/DEBIAN/control \
+    && dpkg-deb -b /tmp/up /tmp/journalpump-upgrade.deb'
+podman exec "$deb_container" dpkg --force-confold -i /tmp/journalpump-upgrade.deb
+podman exec "$deb_container" grep -q log_level /var/lib/journalpump/journalpump.json
+assert_service_active "$deb_container"
+echo "deb install-and-start: PASS (incl. conffile preserved across install-over and upgrade)"
 
 echo "systest-package-on-podman: PASS"
