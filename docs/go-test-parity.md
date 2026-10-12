@@ -2945,9 +2945,8 @@ SDK keeps ownership of CA injection, transport timeouts, and retry resolution.
 - **Item 6 — construction bound (`client.go`).** The 5 s ctx bounds the
   profile/IMDS config load, but the container-credential provider's hostname
   validation calls a resolver that does not observe `ctx` — an SDK-internal
-  residual, not fixable from the config/extension model.
-  `TestBuildSDKClientBoundedConstruction` pins that a cancelled-context
-  construction returns promptly; the residual is documented in charter §2.
+  residual, not fixable from the config/extension model. (Round 3 replaces the
+  initial vacuous bound test; see the round-3 section.)
 - **Item 7 — wire assertions (`client_test.go`).** `TestSDKClientWireShape`
   now parses the full `PutLogEvents` documents (group/stream names, event
   timestamps and message bytes, token omission then `tok1`) and
@@ -2967,3 +2966,51 @@ Execution after `444c78f` (UNCACHED): `go test -race -count=1 ./...` PASS;
 systest ./systest-go/...` PASS (144.7 s); `JOURNALPUMP_BIN=go python -m pytest
 -q systest/` 38 passed; `python -m pytest -q test/` 160 passed. Ledger row 25
 stays `review` pending the confirmation verdict.
+
+### Task 25 review round 3 (changes-required: 5 majors)
+
+Items 1-4 fixed in `330d238`; item 5 (retry defaults/legacy boundary) is held
+for a user decision — the current SDK-resolved retry state is left unchanged.
+
+- **Item 1 — EnvProvider identity (`client.go`).** The environment-credential
+  handling now mirrors botocore 1.42's `EnvProvider` exactly: the access key is
+  `AWS_ACCESS_KEY_ID` ONLY (the legacy `AWS_ACCESS_KEY`/`AWS_SECRET_KEY`
+  aliases are no longer read, so they can no longer override the profile with a
+  different identity); a missing (empty) access key falls through to the
+  profile even when `AWS_SECRET_ACCESS_KEY` is present; a present access key
+  requires the secret key (else PartialCredentialsError); and the token is the
+  first present of `AWS_SECURITY_TOKEN` then `AWS_SESSION_TOKEN`.
+  `TestResolveConfigEnvCredentials` covers all four, and
+  `TestSDKCredentialPrecedence` resolves the identity through the real loader
+  (env key + env token win over the populated profile).
+- **Item 2 — CA precedence (`client.go`).** The order is now `AWS_CA_BUNDLE` →
+  the selected profile's `ca_bundle` → `REQUESTS_CA_BUNDLE` (the SDK has no
+  native `ca_bundle` key, so the profile value is parsed from the shared config
+  file, `[default]` / `[profile NAME]`, `AWS_CONFIG_FILE` else `~/.aws/config`).
+  Previously `REQUESTS_CA_BUNDLE` was applied unconditionally, overriding a
+  profile bundle. `TestResolveConfigCABundlePrecedence` pins the order, and
+  `TestClientCustomCATrustSet` proves it end to end with two servers carrying
+  genuinely different self-signed CAs (the profile bundle wins over a
+  conflicting `REQUESTS_CA_BUNDLE`).
+- **Item 3 — TLS handshake timeout (`client.go`).** The transport's
+  `TLSHandshakeTimeout` is set to botocore's connect timeout (60 s) instead of
+  the BuildableClient's 10 s default.
+  `TestHTTPClientTLSHandshakeTimeout` asserts the configured value and bounds a
+  stalled handshake.
+- **Item 4 — construction-bound test (`client_test.go`).** The previous test
+  supplied static credentials and an explicit region, activating no blocking
+  discovery path, so it passed even if construction ignored `ctx`. The
+  replacement (`TestBuildSDKClientDiscoveryBounded`) removes the static
+  credentials/region, points `AWS_EC2_METADATA_SERVICE_ENDPOINT` at a stalled
+  local IMDS endpoint with `AWS_DEFAULTS_MODE=auto`, and asserts discovery was
+  actually reached AND that the ctx deadline bounds completion. The charter §2
+  claim is corrected to match.
+- **Item 5 — HOLDOFF.** Retry defaults (botocore 5 vs SDK 3) and the
+  `AWS_RETRY_MODE=legacy` rejection boundary are unchanged this round; the §2
+  note stands pending the user ruling.
+
+Execution after `330d238` (UNCACHED): `go test -race -count=1 ./...` PASS;
+`make lint-go` 0 issues; `make build-go` green; `go test -race -count=1 -tags
+systest ./systest-go/...` PASS (145.1 s); `JOURNALPUMP_BIN=go python -m pytest
+-q systest/` 38 passed; `python -m pytest -q test/` 160 passed. Ledger row 25
+stays `review`.

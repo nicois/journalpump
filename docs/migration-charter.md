@@ -530,18 +530,23 @@ NEWS entry — plan Task 28):
   (botocore ignores `AWS_REGION`), profile from `AWS_DEFAULT_PROFILE` then
   `AWS_PROFILE`, credentials rejected as a PARTIAL explicit pair
   (botocore `PartialCredentialsError`), CA bundle from `AWS_CA_BUNDLE` then
-  `REQUESTS_CA_BUNDLE`, a botocore-compatible transport proxy selector
-  (urllib `getproxies_environment` + `proxy_bypass_environment`: lowercase
-  wins, present-empty lowercase removes, no `ALL_PROXY` fallback, loopback NOT
-  special-cased, scheme-relative `//host:port` completed with `http`), and
-  construction bounded by a 5 s config-load timeout. Credentials keep
-  botocore's precedence: an explicit config pair wins, then the environment
-  pair (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` + `AWS_SESSION_TOKEN`,
-  legacy `AWS_ACCESS_KEY`/`AWS_SECRET_KEY` fallback; a partial pair is
-  rejected), then the selected profile. The HTTP client is built through the
-  SDK's `awshttp.BuildableClient` so the SDK itself injects the custom CA
-  (`config.WithCustomCABundle`) and owns the transport; botocore's 60 s
-  connect and read-inactivity timeouts are applied through it. Retry is left
+  the selected profile's `ca_bundle` then `REQUESTS_CA_BUNDLE` (the profile
+  key is parsed from the shared config file), a botocore-compatible transport
+  proxy selector (urllib `getproxies_environment` + `proxy_bypass_environment`:
+  lowercase wins, present-empty lowercase removes, no `ALL_PROXY` fallback,
+  loopback NOT special-cased, scheme-relative `//host:port` completed with
+  `http`), and construction bounded by a 5 s config-load timeout.
+  Credentials keep botocore's `EnvProvider` precedence exactly: an explicit
+  config pair wins, else the environment pair — access key from
+  `AWS_ACCESS_KEY_ID` ONLY (no legacy alias), secret key required when the
+  access key is present (`PartialCredentialsError` otherwise), a missing
+  access key falls through to the profile even when a secret key is present,
+  and the token is the first present of `AWS_SECURITY_TOKEN` then
+  `AWS_SESSION_TOKEN` — then the selected profile. The HTTP client is built
+  through the SDK's `awshttp.BuildableClient` so the SDK itself injects the
+  custom CA (`config.WithCustomCABundle`) and owns the transport; botocore's
+  60 s connect, read-inactivity and TLS-handshake timeouts are applied through
+  it. Retry is left
   to the SDK's own env/profile resolution: standard/adaptive default to 3
   attempts and `AWS_MAX_ATTEMPTS`/profile `max_attempts` win. Recorded
   deviations rather than reproductions: (a) the DEFAULT trust set uses Go's
