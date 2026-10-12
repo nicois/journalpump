@@ -1,3 +1,10 @@
+Unreleased
+==========
+* Serialization is now semantically equivalent instead of byte-identical:
+  the JSON payloads carry the same keys and values as before, but key order
+  and free numeric/whitespace formatting may differ between the Python and
+  Go implementations (charter amendment, Task 32).
+
 journalpump 2.5.0 (2023-11-20)
 ==============================
 * Migrate From oauth2client to google-auth

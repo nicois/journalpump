@@ -353,6 +353,41 @@ most of the win), then re-measure at GOMAXPROCS=1 to confirm the *serial*
 work fell. Treat Option B as a separate, spec-driven follow-up. Both need
 a decision on scope from the user; **no optimisation has been made.**
 
+## Task 32 outcome — ledger closed (2026-10-13)
+
+The streaming-pipeline rewrite (design `docs/design-journal-pipeline.md`,
+plan Task 32) takes the **Option B** path: the handler now consumes raw
+batch entries and emits JSON straight from the field byte views, with no
+`[]Field`, no per-entry maps and no JSON re-parse on the cache-hit path.
+
+Re-recorded baseline (same host, same 300,000-entry fixture,
+`bench/results/baseline-2026-10-13-e8bfe10d6f4c.json`):
+
+| metric | before (Task 31) | after (Task 32) |
+|---|---:|---:|
+| Go whole-run CPU (default GOMAXPROCS, median of 5) | 13.35 s | **6.88 s** |
+| Python whole-run CPU, same run | 8.94 s | 8.47 s |
+| Go/Python CPU ratio | 1.49 (Go worse) | **0.81 (Go better)** |
+| Go whole-run wall (median) | 74.51 s | 76.53 s (poll-paced, within the 10 s bound) |
+| Go peak RSS | 253.5 MiB | 252.0 MiB |
+
+Whole-run CPU now sits below CPython's with non-overlapping run ranges
+(6.36-7.00 s vs 8.15-8.79 s); the earlier "+49 % worse" finding is gone.
+The per-entry transform micro-benchmark on the same 16-field fixture
+falls from 23,045 ns/op, 9,696 B/op, 113 allocs/op (old chain) to
+4,607 ns/op, 520 B/op, 16 allocs/op (`BenchmarkEmitJSON`,
+`internal/journal/transform_bench_test.go`) — about 5x faster and 7x
+fewer allocations, short of the ~4-alloc target because the emitter still
+allocates the payload per filter key (shared across senders) and the
+cache map.
+
+Still open, deliberately: the §2.6 in-process severity pre-filter (design
+§2.6.1) is specified but not implemented, so the debug-heavy pruned-path
+micro-benchmark variant is not recorded; and the old converted
+reader/handler chain is retained as the semantic-equivalence oracle
+rather than deleted (design §5.2 step 2 keeps it as the oracle; step 7's
+"delete the old chain" is in tension with that and needs a scope ruling).
+
 ## Reproduction
 
 - `make bench-profile` — whole-run CPU + heap profiles.
