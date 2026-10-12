@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -747,6 +748,24 @@ func clearProxyEnv(t *testing.T) {
 	}
 }
 
+// unsetConfigEnv removes key for the test and restores the prior value after.
+// GCL distinguishes an UNSET HTTPLIB2_CA_CERTS (use the default roots) from an
+// EMPTY one (rejected), so tests must genuinely unset it.
+func unsetConfigEnv(t *testing.T, key string) {
+	t.Helper()
+	old, ok := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if ok {
+			_ = os.Setenv(key, old)
+			return
+		}
+		_ = os.Unsetenv(key)
+	})
+}
+
 // writeADCFile writes an authorized_user application-default-credentials file
 // whose token endpoint is tokenURI and points GOOGLE_APPLICATION_CREDENTIALS at
 // it, so FindDefaultCredentials picks it up exactly as in production.
@@ -784,7 +803,7 @@ func tokenHandler(token string) http.HandlerFunc {
 // through the oauth2-wrapped client must carry that token.
 func TestTokenFetchAfterConstructionAndAuthSend(t *testing.T) {
 	clearProxyEnv(t)
-	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	unsetConfigEnv(t, "HTTPLIB2_CA_CERTS")
 	tokenSrv := httptest.NewServer(tokenHandler("test-token"))
 	defer tokenSrv.Close()
 	writeADCFile(t, tokenSrv.URL)
@@ -837,7 +856,7 @@ func TestTokenFetchAfterConstructionAndAuthSend(t *testing.T) {
 // exchange must be sent to the proxy (absolute-form request URI).
 func TestTokenFetchUsesProxyTransport(t *testing.T) {
 	clearProxyEnv(t)
-	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	unsetConfigEnv(t, "HTTPLIB2_CA_CERTS")
 	var mu sync.Mutex
 	var seen []string
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -882,7 +901,7 @@ func TestTokenFetchUsesProxyTransport(t *testing.T) {
 // bounds it.
 func TestStalledTokenFetchIsBounded(t *testing.T) {
 	clearProxyEnv(t)
-	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	unsetConfigEnv(t, "HTTPLIB2_CA_CERTS")
 	old := socketTimeout
 	socketTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { socketTimeout = old })
@@ -922,7 +941,7 @@ func TestStalledTokenFetchIsBounded(t *testing.T) {
 // slow-but-progressing transfer that legitimately outlasts the timeout.
 func TestAPIInactivityTimeoutBounds(t *testing.T) {
 	clearProxyEnv(t)
-	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	unsetConfigEnv(t, "HTTPLIB2_CA_CERTS")
 	old := socketTimeout
 	socketTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { socketTimeout = old })
@@ -1074,5 +1093,130 @@ func TestHTTPLIB2CACertsInvalid(t *testing.T) {
 	t.Setenv("HTTPLIB2_CA_CERTS", t.TempDir())
 	if _, err := tlsConfigFromEnv(); err == nil {
 		t.Error("a directory HTTPLIB2_CA_CERTS path was accepted")
+	}
+}
+
+// TestReusedConnectionGetsFreshDeadline is the review item 1 regression. The
+// fixed-dial IdleTimeoutDialer arms a read deadline when net/http's background
+// Peek on an IDLE pooled connection begins, so a request reusing that
+// connection carries the remaining time rather than a fresh socket-operation
+// timeout. Here the connection idles for 200ms of a 300ms timeout and the
+// second response takes another 250ms (~450ms from the idle Peek), which would
+// trip a dial-baked deadline; the phase-aware transport clears the deadline at
+// the request boundary and arms it only for the response read, so the healthy
+// send succeeds.
+func TestReusedConnectionGetsFreshDeadline(t *testing.T) {
+	clearProxyEnv(t)
+	unsetConfigEnv(t, "HTTPLIB2_CA_CERTS")
+	old := socketTimeout
+	socketTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { socketTimeout = old })
+
+	var (
+		mu     sync.Mutex
+		count  int
+		remote []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		count++
+		n := count
+		remote = append(remote, r.RemoteAddr)
+		mu.Unlock()
+		if n == 2 {
+			time.Sleep(250 * time.Millisecond)
+		}
+		_, _ = fmt.Fprintf(w, "resp-%d", n)
+	}))
+	defer srv.Close()
+
+	cfg, err := tlsConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newBaseClient(cfg)
+
+	get := func() string {
+		t.Helper()
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	if got := get(); got != "resp-1" {
+		t.Fatalf("first body = %q", got)
+	}
+	// Let the connection sit idle, then issue a second request whose response
+	// takes long enough that idle+response exceeds the timeout.
+	time.Sleep(200 * time.Millisecond)
+	if got := get(); got != "resp-2" {
+		t.Fatalf("second body = %q, want resp-2 (a reused connection must get a fresh deadline)", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(remote) != 2 {
+		t.Fatalf("server saw %d requests, want 2", len(remote))
+	}
+	if remote[0] != remote[1] {
+		t.Fatalf("connection was NOT reused (%q vs %q); the regression did not exercise the idle-connection path", remote[0], remote[1])
+	}
+}
+
+// TestHTTPLIB2CACertsEmptyRejected is the review item 3 regression: httplib2
+// distinguishes UNSET from EMPTY and rejects an empty path (it is not a file),
+// so an explicitly empty HTTPLIB2_CA_CERTS must error rather than silently
+// selecting the system roots.
+func TestHTTPLIB2CACertsEmptyRejected(t *testing.T) {
+	t.Setenv("HTTPLIB2_CA_CERTS", "")
+	if _, err := tlsConfigFromEnv(); err == nil {
+		t.Error("an empty HTTPLIB2_CA_CERTS was accepted; want an error")
+	}
+}
+
+// TestNewEmptyServiceAccountSelectsADC is the review item 5 construction
+// regression: an empty object ({}), a null and an omitted
+// google_service_account_credentials all fall through to application default
+// credentials, and the CONFIGURED project id is preserved.
+func TestNewEmptyServiceAccountSelectsADC(t *testing.T) {
+	clearProxyEnv(t)
+	unsetConfigEnv(t, "HTTPLIB2_CA_CERTS")
+	writeADCFile(t, "http://token.invalid/token")
+
+	cases := []struct {
+		name  string
+		creds any
+		omit  bool
+	}{
+		{"empty_object", map[string]any{}, false},
+		{"null", nil, false},
+		{"omitted", nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := map[string]any{
+				"google_cloud_logging_project_id": "config-project",
+				"google_cloud_logging_log_id":     "log-id",
+			}
+			if !tc.omit {
+				config["google_service_account_credentials"] = tc.creds
+			}
+			inst, err := New(sender.ConstructorArgs{Name: "gcl", Config: config})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			s, ok := inst.Transport.(*Sender)
+			if !ok {
+				t.Fatalf("transport = %T", inst.Transport)
+			}
+			if s.projectID != "config-project" {
+				t.Errorf("projectID = %q, want the configured config-project (ADC has no service-account project id)", s.projectID)
+			}
+		})
 	}
 }

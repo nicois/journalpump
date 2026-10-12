@@ -670,8 +670,8 @@ func TestHTTPClientUsesRequestsProxySemantics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, ok := client.Client().Transport.(*http.Transport)
-	if !ok || tr.Proxy == nil {
+	tr := client.Transport()
+	if tr == nil || tr.Proxy == nil {
 		t.Fatalf("transport.Proxy not installed: %T", client.Client().Transport)
 	}
 	t.Setenv("http_proxy", "http://proxy.example:8080")

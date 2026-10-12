@@ -309,23 +309,25 @@ func TestHttplib2Proxy(t *testing.T) {
 // TestNormalizeHttplib2Proxy pins httplib2's proxy_info_from_url translation
 // (review item 4): the PORT is defaulted from the DESTINATION scheme (not the
 // proxy URL's own scheme), and the proxy URL SCHEME selects the transport —
-// socks4/socks5/socks map to SOCKS, while http, https and any unknown scheme
-// become a plain HTTP proxy.
+// socks5/socks map to SOCKS5, while http, https and any unknown scheme become
+// a plain HTTP proxy; socks4 is REJECTED (Go has no SOCKS4 dialer and would
+// otherwise treat it as a plain HTTP proxy).
 func TestNormalizeHttplib2Proxy(t *testing.T) {
 	cases := []struct {
 		name       string
 		proxy      string
 		destScheme string
 		want       string
+		wantErr    bool
 	}{
-		{"omitted_port_https_dest_defaults_443", "http://proxy.example", "https", "http://proxy.example:443"},
-		{"omitted_port_http_dest_defaults_80", "http://proxy.example", "http", "http://proxy.example:80"},
-		{"explicit_port_preserved", "http://proxy.example:3128", "https", "http://proxy.example:3128"},
-		{"https_proxy_is_plain_http", "https://proxy.example:8443", "https", "http://proxy.example:8443"},
-		{"unknown_scheme_is_plain_http", "foo://proxy.example", "https", "http://proxy.example:443"},
-		{"socks5_scheme", "socks5://proxy.example:1080", "https", "socks5://proxy.example:1080"},
-		{"socks_alias_is_socks5", "socks://proxy.example:1080", "https", "socks5://proxy.example:1080"},
-		{"socks4_scheme", "socks4://proxy.example:1080", "https", "socks4://proxy.example:1080"},
+		{"omitted_port_https_dest_defaults_443", "http://proxy.example", "https", "http://proxy.example:443", false},
+		{"omitted_port_http_dest_defaults_80", "http://proxy.example", "http", "http://proxy.example:80", false},
+		{"explicit_port_preserved", "http://proxy.example:3128", "https", "http://proxy.example:3128", false},
+		{"https_proxy_is_plain_http", "https://proxy.example:8443", "https", "http://proxy.example:8443", false},
+		{"unknown_scheme_is_plain_http", "foo://proxy.example", "https", "http://proxy.example:443", false},
+		{"socks5_scheme", "socks5://proxy.example:1080", "https", "socks5://proxy.example:1080", false},
+		{"socks_alias_is_socks5", "socks://proxy.example:1080", "https", "socks5://proxy.example:1080", false},
+		{"socks4_rejected", "socks4://proxy.example:1080", "https", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -334,6 +336,12 @@ func TestNormalizeHttplib2Proxy(t *testing.T) {
 				t.Fatal(err)
 			}
 			got, err := normalizeHttplib2Proxy(parsed, tc.destScheme)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("normalize(%q) = %v, want an error", tc.proxy, got)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -341,6 +349,28 @@ func TestNormalizeHttplib2Proxy(t *testing.T) {
 				t.Errorf("normalize(%q, %q) = %q, want %q", tc.proxy, tc.destScheme, got.String(), tc.want)
 			}
 		})
+	}
+}
+
+// TestHttplib2ProxySocks4Rejected proves a socks4:// proxy is refused at
+// SELECTION time, so the transport never attempts a connection (returning the
+// URL unchanged would let Go treat it as a plain HTTP proxy and emit a CONNECT
+// handshake).
+func TestHttplib2ProxySocks4Rejected(t *testing.T) {
+	for _, k := range []string{"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("https_proxy", "socks4://proxy.example:1080")
+	req, _ := http.NewRequest(http.MethodGet, "https://target.example/", nil)
+	u, err := Httplib2Proxy(req)
+	if err == nil {
+		t.Fatalf("socks4 proxy = %v, want an error (no connection attempted)", u)
+	}
+	if u != nil {
+		t.Errorf("socks4 proxy URL = %v, want nil", u)
+	}
+	if !strings.Contains(err.Error(), "SOCKS4") {
+		t.Errorf("error = %v, want it to name the unsupported SOCKS4 protocol", err)
 	}
 }
 

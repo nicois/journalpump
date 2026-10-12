@@ -31,11 +31,13 @@
 //     (a progressing upload that outlasts the timeout is not aborted), and
 //     the phase is reset for EVERY request attempt, so a redirected upload
 //     re-enters the upload phase rather than inheriting the previous
-//     attempt's read deadline; IdleTimeoutDialer is the fixed-dial variant
-//     for a sender with a constant session timeout (logplex). Senders whose
-//     Python client uses requests' socket timeout use one of these so a
+//     attempt's read deadline; RequestTimeout supplies a FALLBACK for requests
+//     that carry no per-request value (GCL's oauth2 token fetches). Senders
+//     whose Python client uses a socket timeout use one of these so a
 //     slow-but-progressing response is not aborted the way a total deadline
-//     would abort it.
+//     would abort it; IdleTimeoutDialer is the fixed-dial variant for a sender
+//     with a constant session timeout whose deadline may never be reused
+//     across requests (logplex).
 //
 // It deliberately provides NO retry hook: retries are owned by the shared
 // sender.Loop (a failed SendMessages retains the batch and retries after
@@ -82,6 +84,11 @@ type ClientOptions struct {
 	// sender's inactivity-timeout conn wrapper); nil uses the default
 	// dialer.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	// RequestTimeout is the FALLBACK per-request inactivity timeout used by
+	// NewInactivityClient when a request carries no WithRequestTimeout value
+	// on its context (e.g. oauth2 token fetches, which build their own
+	// request). Zero means no fallback.
+	RequestTimeout time.Duration
 }
 
 // NewClient builds an *http.Client with the given transport options. The
@@ -196,11 +203,24 @@ func IdleTimeoutDialer(fallback time.Duration) func(ctx context.Context, network
 type InactivityClient struct {
 	client *http.Client
 
+	// fallback is the inactivity timeout applied when a request carries no
+	// WithRequestTimeout value (e.g. oauth2 token fetches).
+	fallback time.Duration
+
 	mu    sync.Mutex
 	idle  time.Duration
 	phase connPhase
 	conns map[*dynamicIdleConn]struct{}
 }
+
+// inactivityTransport is the phase-aware http.RoundTripper used by
+// InactivityClient (see its comment).
+type inactivityTransport struct {
+	base  http.RoundTripper
+	owner *InactivityClient
+}
+
+var _ http.RoundTripper = (*inactivityTransport)(nil)
 
 // connPhase is the phase of the request attempt currently in flight. The read
 // deadline is armed in phaseConnect (connection establishment) and phaseRead
@@ -216,17 +236,18 @@ const (
 
 // NewInactivityClient builds an InactivityClient with the given transport
 // options, mirroring NewClient (idle pooled connections are bounded at 90 s).
+// opts.RequestTimeout, when non-zero, is the fallback inactivity timeout for
+// requests that carry no WithRequestTimeout value (see inactivityTransport).
 func NewInactivityClient(opts ClientOptions) *InactivityClient {
-	c := &InactivityClient{conns: map[*dynamicIdleConn]struct{}{}}
-	c.client = &http.Client{Transport: &http.Transport{
+	c := &InactivityClient{conns: map[*dynamicIdleConn]struct{}{}, fallback: opts.RequestTimeout}
+	base := &http.Transport{
 		Proxy:           opts.Proxy,
 		TLSClientConfig: opts.TLSClientConfig,
 		IdleConnTimeout: 90 * time.Second,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var idle time.Duration
-			if v, ok := ctx.Value(timeoutKey{}).(time.Duration); ok && v > 0 {
-				idle = v
-			}
+			c.mu.Lock()
+			idle := c.idle
+			c.mu.Unlock()
 			dialer := &net.Dialer{Timeout: idle}
 			conn, err := dialer.DialContext(ctx, network, addr)
 			if err != nil {
@@ -247,30 +268,65 @@ func NewInactivityClient(opts ClientOptions) *InactivityClient {
 			c.mu.Unlock()
 			return wrapped, nil
 		},
-	}}
+	}
+	c.client = &http.Client{Transport: &inactivityTransport{base: base, owner: c}}
 	return c
 }
 
-// Client returns the wrapped *http.Client (for transport inspection in tests).
+// inactivityTransport installs the per-request inactivity timeout at the
+// RoundTrip boundary — ONE request attempt — rather than at connection-dial
+// time. A fixed-dial deadline (IdleTimeoutConn) is armed when net/http's
+// background read on an IDLE pooled connection begins, so a request that
+// reuses that connection shortly before the deadline would inherit the
+// remaining time instead of a fresh socket-operation timeout and could fail a
+// healthy send; clearing the deadline here (beginRequest) and arming it only
+// in the read phase (WroteRequest) gives every attempt a fresh budget.
+func (t *inactivityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	idle := t.owner.fallback
+	if v, ok := req.Context().Value(timeoutKey{}).(time.Duration); ok && v > 0 {
+		idle = v
+	}
+	t.owner.beginRequest(idle)
+	if idle <= 0 {
+		return t.base.RoundTrip(req)
+	}
+	// The httptrace hooks re-enter the upload phase for EVERY actual request
+	// attempt (GotConn) and arm the read deadline when an attempt has been
+	// fully written (WroteRequest), so a redirect re-enters the upload phase
+	// instead of inheriting the first attempt's read phase.
+	trace := &httptrace.ClientTrace{
+		GotConn:      func(httptrace.GotConnInfo) { t.owner.beginUpload() },
+		WroteRequest: func(httptrace.WroteRequestInfo) { t.owner.beginRead() },
+	}
+	return t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+}
+
+// Client returns the wrapped *http.Client (its Transport is the phase-aware
+// inactivityTransport, so callers may also use it directly as an
+// oauth2.HTTPClient or option.WithHTTPClient target).
 func (c *InactivityClient) Client() *http.Client { return c.client }
 
-// Do installs the request's inactivity timeout at this request boundary and
-// delegates to the wrapped client. The httptrace hooks re-enter the upload
-// phase for EVERY actual request attempt (GotConn) and arm the read deadline
-// when an attempt has been fully written (WroteRequest), so a redirect
-// re-enters the upload phase instead of inheriting the first attempt's read
-// phase.
+// Transport exposes the underlying *http.Transport for proxy/TLS inspection.
+func (c *InactivityClient) Transport() *http.Transport {
+	it, ok := c.client.Transport.(*inactivityTransport)
+	if !ok {
+		return nil
+	}
+	tr, _ := it.base.(*http.Transport)
+	return tr
+}
+
+// CloseIdleConnections forwards to the underlying transport so
+// http.Client.CloseIdleConnections releases pooled connections.
+func (t *inactivityTransport) CloseIdleConnections() {
+	if ci, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		ci.CloseIdleConnections()
+	}
+}
+
+// Do delegates to the wrapped client; the phase-aware transport applies the
+// per-request timeout (WithRequestTimeout) or the fallback.
 func (c *InactivityClient) Do(req *http.Request) (*http.Response, error) {
-	v, ok := req.Context().Value(timeoutKey{}).(time.Duration)
-	if !ok || v <= 0 {
-		return c.client.Do(req)
-	}
-	c.beginRequest(v)
-	trace := &httptrace.ClientTrace{
-		GotConn:      func(httptrace.GotConnInfo) { c.beginUpload() },
-		WroteRequest: func(httptrace.WroteRequestInfo) { c.beginRead() },
-	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	return c.client.Do(req)
 }
 
@@ -559,9 +615,10 @@ func ShouldBypassProxies(u *url.URL) bool {
 //
 // The returned URL is NORMALIZED for Go's http.Transport (see
 // normalizeHttplib2Proxy): scheme mapped to http/socks5 and the port resolved.
-// One residual deviation: Go's transport has no SOCKS4, so a socks4:// proxy
-// is returned as-is and fails at dial time where httplib2 (via PySocks) would
-// use it — documented in charter §2.
+// One residual deviation: Go's transport has no SOCKS4 dialer, so a socks4://
+// proxy is REJECTED with an error (rather than returned as-is, which Go would
+// treat as a plain HTTP proxy and could drive a CONNECT handshake) where
+// httplib2 (via PySocks) would use SOCKS4 — documented in charter §2.
 //
 // Note the reference environment: httplib2 only uses a proxy when PySocks is
 // importable (ProxyInfo.isgood() is `socks and ...`), so a deployment without
@@ -608,7 +665,12 @@ func normalizeHttplib2Proxy(parsed *url.URL, destScheme string) (*url.URL, error
 	out := *parsed
 	switch parsed.Scheme {
 	case "socks4":
-		out.Scheme = "socks4" // Go has no SOCKS4; fails at dial (documented).
+		// Go's http.Transport implements SOCKS5 only: handed a "socks4" URL it
+		// would fall back to a plain HTTP-proxy path and could emit a CONNECT
+		// handshake rather than the SOCKS4 negotiation httplib2/PySocks would
+		// perform. Reject it explicitly so no connection is attempted, instead
+		// of silently producing the wrong protocol.
+		return nil, fmt.Errorf("proxy scheme %q is not supported (Go has no SOCKS4 dialer)", parsed.Scheme)
 	case "socks5", "socks":
 		out.Scheme = "socks5"
 	default:

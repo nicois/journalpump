@@ -80,8 +80,9 @@ const (
 // socket.getdefaulttimeout() if the process set one, else
 // DEFAULT_HTTP_TIMEOUT_SEC = 60. httplib2 applies it as a single scalar to
 // connect, read AND write (Python's socket.settimeout is a per-operation
-// timeout), which httpx.IdleTimeoutDialer reproduces (dial timeout plus a
-// per-read/write inactivity deadline). A var so tests can shorten it.
+// timeout), which httpx.NewInactivityClient reproduces (phase-aware connect
+// plus per-read/write inactivity, applied per request). A var so tests can
+// shorten it.
 var socketTimeout = 60 * time.Second
 
 // severityMapping ports _SEVERITY_MAPPING (journald PRIORITY → Cloud
@@ -356,12 +357,22 @@ func New(args sender.ConstructorArgs) (sender.Instance, error) {
 // inactivity), matching googleapiclient's one build_http() httplib2.Http
 // (googleapiclient/http.py:2013-2042 wires Http(timeout=socket.getdefaulttimeout()
 // or 60)).
+//
+// It uses the phase-aware InactivityClient (RequestTimeout = the socket
+// timeout) rather than the fixed-dial IdleTimeoutDialer: a dial-baked deadline
+// is armed when net/http's background read on an IDLE pooled connection
+// begins, so a request REUSING that connection shortly before the deadline
+// would inherit the remaining time instead of a fresh socket-operation
+// timeout and could fail a healthy send. The phase-aware path clears the
+// deadline at each request boundary and arms it only for the response read;
+// the RequestTimeout fallback covers requests that carry no WithRequestTimeout
+// value (the oauth2 token fetches).
 func newBaseClient(tlsCfg *tls.Config) *http.Client {
-	return httpx.NewClient(httpx.ClientOptions{
+	return httpx.NewInactivityClient(httpx.ClientOptions{
 		Proxy:           httpx.Httplib2Proxy,
 		TLSClientConfig: tlsCfg,
-		DialContext:     httpx.IdleTimeoutDialer(socketTimeout),
-	})
+		RequestTimeout:  socketTimeout,
+	}).Client()
 }
 
 // buildAuthorizedClient resolves credentials and wraps the shared transport in
@@ -401,9 +412,16 @@ func buildAuthorizedClient(tlsCfg *tls.Config, opts options) (*http.Client, *goo
 // documented default-trust deviation, the same class as the ES/OS sender.
 func tlsConfigFromEnv() (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	path := os.Getenv("HTTPLIB2_CA_CERTS")
-	if path == "" {
+	// httplib2 distinguishes UNSET from EMPTY: it reads the variable with
+	// os.environ.get and, when it is present (even empty), requires a file —
+	// an empty value is not a file, so it raises. An empty value must
+	// therefore be REJECTED, not silently treated as "use the default roots".
+	path, present := os.LookupEnv("HTTPLIB2_CA_CERTS")
+	if !present {
 		return cfg, nil
+	}
+	if path == "" {
+		return nil, fmt.Errorf("HTTPLIB2_CA_CERTS: set but empty (not a CA bundle file)")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
