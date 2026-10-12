@@ -3117,3 +3117,32 @@ Execution after the round-5 code commit (UNCACHED): `go test -race -count=1
 -count=1 -tags systest ./systest-go/...` PASS (144.0 s); `JOURNALPUMP_BIN=go
 python -m pytest -q systest/` 38 passed; `python -m pytest -q test/` 160
 passed. Ledger row 25 stays `review`.
+
+### Task 25 review round 6 (documentation accuracy + test quality; native chain accepted)
+
+No production-code change — the native-chain boundary stands.
+
+- **Two restored env-credential differences documented + pinned (charter §2
+  c/d).** `TestSDKCredentialEnvDeviations` drives the real loader: (1)
+  `AWS_SECURITY_TOKEN` is IGNORED (the SDK reads only `AWS_SESSION_TOKEN`, so
+  the retrieved session token is empty; botocore prefers `AWS_SECURITY_TOKEN`);
+  (2) an `AWS_ACCESS_KEY_ID` with no secret falls through to the container
+  identity instead of raising botocore's `PartialCredentialsError`.
+- **Explicit-profile precedence extended to web identity (charter §2 b).**
+  `TestSDKCredentialExplicitProfileSkipsWebIdentity` sets a region-only
+  `[profile probe]` plus web identity and a container fallback: with no explicit
+  profile the chain resolves `WEBKEY` via the (local STS) web-identity branch
+  (non-vacuity), while `AWS_PROFILE=probe` makes the SDK skip web identity and
+  resolve `CONTKEY` from the container, unlike Python.
+- **Precedence test fixed (item 3).** `TestSDKCredentialConfigAndProfilePrecedence`
+  now sets BOTH the conflicting environment pair and the profile and runs
+  `resolveConfig` → `loadAWSConfig` → `Retrieve`, asserting the selected
+  identity: the injected config pair wins; with `AWS_PROFILE=probe` the profile
+  identity `PROFKEY` wins over the env pair (deviation b); with no profile the
+  env pair `ENVKEY` wins over `[default]`.
+
+Execution after the round-6 test commit (UNCACHED): `go test -race -count=1
+./...` PASS; `make lint-go` 0 issues; `make build-go` green; `go test -race
+-count=1 -tags systest ./systest-go/...` PASS (144.0 s); `JOURNALPUMP_BIN=go
+python -m pytest -q systest/` 38 passed; `python -m pytest -q test/` 160
+passed. Ledger row 25 stays `review`.
