@@ -12,6 +12,34 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/filter"
 )
 
+// TestUnitLogLevelDecide pins Decide to Filter over the same entries.
+func TestUnitLogLevelDecide(t *testing.T) {
+	t.Parallel()
+	ull, err := filter.NewUnitLogLevel("test", []config.UnitLogLevelEntry{
+		{ServiceGlob: "*.service", LogLevel: "WARNING"},
+		{ServiceGlob: "sshd.service", LogLevel: "ERROR"},
+	})
+	if err != nil {
+		t.Fatalf("NewUnitLogLevel: %v", err)
+	}
+	entries := []map[string]any{
+		{"SYSTEMD_UNIT": "foo.service", "PRIORITY": int64(6)},
+		{"SYSTEMD_UNIT": "foo.service", "PRIORITY": int64(4)},
+		{"SYSTEMD_UNIT": "sshd.service", "PRIORITY": int64(3)},
+		{"SYSTEMD_UNIT": "foo.service"},
+		{"PRIORITY": int64(6)},
+		{"SYSTEMD_UNIT": "bar.socket", "PRIORITY": int64(7)},
+		{"SYSTEMD_UNIT": "foo.service", "PRIORITY": nil},
+	}
+	for i, entry := range entries {
+		unit, _ := entry["SYSTEMD_UNIT"].(string)
+		want := ull.Filter(entry)
+		if got := ull.Decide(unit, entry["PRIORITY"]); got != want {
+			t.Errorf("entry %d: Decide = %v want %v", i, got, want)
+		}
+	}
+}
+
 // TestUnitLogLevels ports test/test_journalpump.py:TestUnitLogLevels
 // (9 methods) plus the most-restrictive-wins quirk lock: an entry is
 // dropped when ANY matching glob is more restrictive, regardless of

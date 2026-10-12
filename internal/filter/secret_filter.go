@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/Aiven-Open/journalpump/internal/config"
 )
@@ -547,4 +548,35 @@ func ApplySecretFilters(data map[string]any, filters []*SecretFilter) bool {
 	}
 	data["MESSAGE"] = text
 	return true
+}
+
+// ApplySecretFiltersRaw is the byte-view counterpart of
+// ApplySecretFilters: it redacts the raw MESSAGE bytes and reports
+// whether they changed. A falsy (empty) or non-UTF-8 MESSAGE is left
+// untouched, matching ApplySecretFilters' falsy guard and its
+// string-only substitution (a []byte MESSAGE is never substituted
+// there).
+//
+// The redacted text is written into scratch[:0] when it fits, so the
+// common caller can hand in a reused buffer and avoid an allocation per
+// hit; the caller keeps the returned slice only until the next call
+// with the same scratch.
+func ApplySecretFiltersRaw(msg []byte, filters []*SecretFilter, scratch []byte) ([]byte, bool) {
+	if len(msg) == 0 {
+		return msg, false
+	}
+	if !utf8.Valid(msg) {
+		return msg, false
+	}
+	text := string(msg)
+	original := text
+	for _, f := range filters {
+		text = f.regex.ReplaceAllString(text, f.replacement)
+	}
+	if text == original {
+		return msg, false
+	}
+	scratch = scratch[:0]
+	scratch = append(scratch, text...)
+	return scratch, true
 }

@@ -84,6 +84,47 @@ func TestApplySecretFilters(t *testing.T) {
 	}
 }
 
+// TestApplySecretFiltersRaw pins the byte-view entry point to the
+// map-based one over the same inputs.
+func TestApplySecretFiltersRaw(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"simple", "complex", "none"} {
+		filters := secretFilterReader(kind)
+		for _, in := range []string{
+			"This is a field with a trailing SECRET",
+			"SECRET message with sensitive SECOND at the start",
+			"message with no sensitive data",
+			"",
+		} {
+			data := map[string]any{"MESSAGE": in}
+			wantChanged := filter.ApplySecretFilters(data, filters)
+			got, changed := filter.ApplySecretFiltersRaw([]byte(in), filters, nil)
+			if changed != wantChanged {
+				t.Errorf("%s %q: changed = %v want %v", kind, in, changed, wantChanged)
+			}
+			if string(got) != data["MESSAGE"] {
+				t.Errorf("%s %q: got %q want %q", kind, in, got, data["MESSAGE"])
+			}
+		}
+	}
+	// Non-UTF-8 bytes are never substituted (ApplySecretFilters only
+	// substitutes a string MESSAGE).
+	filters := secretFilterReader("simple")
+	raw := []byte{0xff, 0xfe, 'S', 'E', 'C', 'R', 'E', 'T'}
+	if _, changed := filter.ApplySecretFiltersRaw(raw, filters, nil); changed {
+		t.Error("invalid UTF-8 MESSAGE should be untouched")
+	}
+	// The scratch buffer is reused: the returned slice aliases it.
+	scratch := make([]byte, 0, 64)
+	out, changed := filter.ApplySecretFiltersRaw([]byte("a SECRET b"), filters, scratch)
+	if !changed || string(out) != "a [REDACTED] b" {
+		t.Fatalf("scratch reuse: got %q changed %v", out, changed)
+	}
+	if &out[0] != &scratch[:1][0] {
+		t.Error("redacted bytes did not reuse the scratch buffer")
+	}
+}
+
 // TestApplySecretFiltersEdgeCases locks the MESSAGE truthiness and
 // type guards of journalpump.py:820-830.
 func TestApplySecretFiltersEdgeCases(t *testing.T) {

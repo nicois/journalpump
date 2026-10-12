@@ -71,8 +71,15 @@ func (u *UnitLogLevel) Filter(entry map[string]any) bool {
 		// Python: `if not entry: return {}`.
 		return false
 	}
-	unit := entryValueString(entry["SYSTEMD_UNIT"])
-	priority := entry["PRIORITY"]
+	return u.Decide(entryValueString(entry["SYSTEMD_UNIT"]), entry["PRIORITY"])
+}
+
+// Decide is Filter's decision over the two views the streaming handler
+// has: the unit name (the converted SYSTEMD_UNIT) and the priority
+// value (the converted PRIORITY, nil when the field is absent). It is
+// exported so the raw pipeline can reach the decision without
+// materialising a map.
+func (u *UnitLogLevel) Decide(unit string, priority any) bool {
 	if !truthy(priority) || unit == "" {
 		// If the entry does not contain a unit or priority, return it
 		// as-is (Python: `if (not priority) or (not unit)`).

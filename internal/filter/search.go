@@ -333,6 +333,12 @@ func (s *Searcher) Searches() []*Search {
 	return s.searches
 }
 
+// FieldValueFunc yields the search string for one raw field name (the
+// pre-conversion key, underscores intact). ok=false means the field is
+// absent, repeated, empty or not representable as a search string — the
+// same no-match outcomes searchFieldValue gives for the converted entry.
+type FieldValueFunc func(field string) (string, bool)
+
 // PerformSearches runs all searches against a raw (pre-conversion)
 // entry and reports whether at least one matched; the caller drops the
 // entry when searches are configured and this returns false. Named
@@ -346,12 +352,46 @@ func (s *Searcher) Searches() []*Search {
 // the documented deviation.
 func (s *Searcher) PerformSearches(entry map[string]any) bool {
 	byteFields := make(map[string]string)
+	return s.run(valueFromMap(entry, byteFields))
+}
+
+// MatchRawValues runs the searches against a raw entry through value,
+// the byte-view lookup the reader supplies. It is the streaming
+// counterpart of PerformSearches: the field strings are produced lazily
+// per search field, and the per-field decode cache keeps a field shared
+// by several searches from being converted twice.
+func (s *Searcher) MatchRawValues(value FieldValueFunc) bool {
+	cache := make(map[string]string)
+	return s.run(func(field string) (string, bool) {
+		if v, ok := cache[field]; ok {
+			return v, v != ""
+		}
+		v, ok := value(field)
+		if !ok {
+			return "", false
+		}
+		cache[field] = v
+		return v, true
+	})
+}
+
+// valueFromMap adapts PerformSearches' converted-entry view to the
+// field-value lookup, keeping the per-call decode cache keyed by field.
+func valueFromMap(entry map[string]any, byteFields map[string]string) FieldValueFunc {
+	return func(field string) (string, bool) {
+		return searchFieldValue(field, entry, byteFields)
+	}
+}
+
+// run evaluates every search through value and applies the hit metrics
+// and counters.
+func (s *Searcher) run(value FieldValueFunc) bool {
 	matched := false
 	for _, search := range s.searches {
 		allMatch := true
 		tags := make(map[string]string)
 		for _, field := range search.fields {
-			line, ok := searchFieldValue(field.name, entry, byteFields)
+			line, ok := value(field.name)
 			if !ok {
 				allMatch = false
 				break
