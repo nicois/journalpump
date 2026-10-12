@@ -1054,7 +1054,7 @@ with Tasks 19–20.
 | 28 | Docs and NEWS (sanctioned deviations) | not-started | - | - |
 | 29 | Final parity sweep (~127 tests, fixtures flip to Go parity) | not-started | - | - |
 | 30 | CI systest job + podman script | not-started | - | - |
-| 31 | Go-vs-Python performance baseline (Phase 4b) | not-started | - | - |
+| 31 | Go-vs-Python performance baseline (Phase 4b) | review | 5eec581 | pending cross-review. Whole-run harness over one deterministic 300k-entry fixture; bench-check vs the committed Go baseline is COMPATIBLE with no regression. Go-vs-Python as measured: startup Go ~4x faster (0.01 s vs 0.06 s), Go LOSES peak RSS (251.3 vs 217.6 MiB, ratio 1.15) and uses ~60% more CPU (13.2 vs 8.1 s); wall (74.5 vs 71.2 s) and throughput (~4,030 vs ~4,210 entries/s) differ by less than the 10 s statsd sampling bound, so they are reported as no clear difference. OPERATOR-VISIBLE: the reference host runs the powersave governor, so the baseline was taken with BENCH_ALLOW_ANY_GOVERNOR=1; and wall is poll-paced (the reader advances one CHUNK_SIZE per poll), so it mainly reflects shared reader pacing. | - | - |
 
 **Update rule**: after the cross-reviewer approves a task's diff and the
 coordinator accepts it, the builder (or coordinator) sets the row to

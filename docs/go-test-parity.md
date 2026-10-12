@@ -3537,3 +3537,45 @@ build-go` / `make lint-go` (0 issues) / `go test -race -count=1 ./...` / `go
 test -race -count=1 -tags systest ./systest-go/...` green;
 `JOURNALPUMP_BIN=go pytest -q systest/` 38 passed; `pytest -q test/` 160
 passed. Ledger row 27 stays `review`.
+
+## Task 31 — Go-vs-Python performance baseline harness
+
+Performance harness, no Python counterpart: the plan's three new test
+artifacts are recorded as `go-native`.
+
+- `bench/test_report.py` — `go-native`. Unit tests for the reporting and
+  comparison logic (`bench/report.py`): median/min/max, ratio arithmetic in
+  both directions, the per-metric uncertainty rule ("no clear difference"
+  when a wall difference is smaller than one reporting interval even with
+  non-overlapping ranges, and when ranges overlap even beyond the bound),
+  the Go-vs-Go baseline tripwire on regressed / improved / no-change /
+  incompatible inputs (incompatible downgrades to INFORMATIONAL, never a
+  failure), secondaries ignored by the comparator, and the canonical config
+  hash (equal across two renders with different run-local paths/ports;
+  changed by a behavior key).
+- `bench/test_gen_journal.py` — `go-native`. The deterministic fixture
+  generator: SHA-256 pinned for a seed (the fixture identity is part of the
+  baseline compatibility key), exactly N blank-line-terminated entries, the
+  mandatory journal fields, the 80–400 B `MESSAGE` band and the
+  every-1000th-entry invalid-UTF-8 cadence (D8 repr path).
+- `systest/test_bench_smoke.py` — `go-native`. End-to-end smoke of the
+  driver against BOTH real binaries (the dual-implementation pattern of the
+  other systest suites): fixture generation through
+  `systemd-journal-remote`, the UNSHIMMED preflight, the
+  `journal.sent_lines`-driven run protocol, the single `os.wait4`, the
+  lifecycle timestamps (`t_spawn <= t_ready <= t_confirm <= t_sigterm <=
+  t_exit`), the output line-count rule, and the `bench-check` refusal below
+  the baseline minimum.
+
+Reason for `go-native`: this is a performance harness, not a behavior port.
+No Python test is ported, changed or dropped, and the ~127-entry Python
+parity set Task 29 counts is unaffected. The harness reuses the Task 10
+systest helpers (`systest/journalpump_process.py`) through a
+behavior-preserving extraction of `command_for`, `build_environment` and
+`NotifyListener`; the systest suites are the regression gate for that
+extraction and stay green.
+
+Ownership note: the bench does NOT reuse the harness's process reaping,
+which would make `os.wait4` unable to recover the whole-run rusage. It owns
+spawning and performs exactly one `os.wait4` on the child, never
+`poll()`/`wait()`/`communicate()`.
