@@ -8,7 +8,9 @@ package journal
 import (
 	"bytes"
 	"encoding/json"
-	"strconv"
+	"errors"
+	"io"
+	"math/big"
 	"testing"
 	"time"
 
@@ -127,18 +129,35 @@ func extraFragments(t *testing.T, extras []Field) []ExtraFragment {
 }
 
 // semanticEqual reports whether two JSON payloads carry the same keys and
-// values (numbers compared as float64, or as decimal strings beyond 2^53;
-// object key order is irrelevant).
+// values (object key order is irrelevant). Numbers are decoded with
+// UseNumber and compared as exact rationals, so an integer beyond 2^53 is
+// NOT rounded to a float64 and silently matched against a neighbour.
 func semanticEqual(t *testing.T, a, b []byte) bool {
 	t.Helper()
-	var va, vb any
-	if err := json.Unmarshal(a, &va); err != nil {
+	va, err := decodeJSONNumber(a)
+	if err != nil {
 		t.Fatalf("payload a is not JSON: %v (%s)", err, a)
 	}
-	if err := json.Unmarshal(b, &vb); err != nil {
+	vb, err := decodeJSONNumber(b)
+	if err != nil {
 		t.Fatalf("payload b is not JSON: %v (%s)", err, b)
 	}
 	return deepEqualJSON(va, vb)
+}
+
+// decodeJSONNumber decodes one JSON value with json.Number, rejecting any
+// trailing content after it.
+func decodeJSONNumber(data []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("trailing data after JSON value")
+	}
+	return v, nil
 }
 
 func deepEqualJSON(a, b any) bool {
@@ -166,18 +185,63 @@ func deepEqualJSON(a, b any) bool {
 			}
 		}
 		return true
-	case float64:
-		bv, ok := b.(float64)
+	case json.Number:
+		bv, ok := b.(json.Number)
 		if !ok {
 			return false
 		}
-		if av > 1<<53 || bv > 1<<53 {
-			return strconv.FormatFloat(av, 'g', -1, 64) == strconv.FormatFloat(bv, 'g', -1, 64)
-		}
-		return av == bv
+		return jsonNumbersEqual(av, bv)
 	default:
 		return a == b
 	}
+}
+
+// jsonNumbersEqual compares two JSON number literals by exact value: the
+// literal spellings first (the common case), then as arbitrary-precision
+// rationals so "6" and "6.000" compare equal but 9007199254740993 and
+// 9007199254740992 do not (a float64 round-trip would conflate them).
+func jsonNumbersEqual(a, b json.Number) bool {
+	if a.String() == b.String() {
+		return true
+	}
+	ra, ok := new(big.Rat).SetString(a.String())
+	if !ok {
+		return false
+	}
+	rb, ok := new(big.Rat).SetString(b.String())
+	if !ok {
+		return false
+	}
+	return ra.Cmp(rb) == 0
+}
+
+// TestSemanticEqualNumberPrecision is the negative control for the
+// comparison oracle: numbers that a float64 decode would conflate must
+// compare unequal, and equal numbers spelled differently must compare
+// equal.
+func TestSemanticEqualNumberPrecision(t *testing.T) {
+	t.Run("values beyond 2^53 differ", func(t *testing.T) {
+		// 2^53+1 and 2^53 are the same float64.
+		if semanticEqual(t, []byte(`{"n":9007199254740993}`), []byte(`{"n":9007199254740992}`)) {
+			t.Fatal("2^53+1 and 2^53 compared equal (float64 precision loss)")
+		}
+	})
+	t.Run("huge integers match exactly", func(t *testing.T) {
+		n := []byte(`{"n":123456789012345678901234567890}`)
+		if !semanticEqual(t, n, n) {
+			t.Fatal("identical huge integer compared unequal")
+		}
+	})
+	t.Run("huge integers one apart differ", func(t *testing.T) {
+		if semanticEqual(t, []byte(`{"n":123456789012345678901234567891}`), []byte(`{"n":123456789012345678901234567890}`)) {
+			t.Fatal("huge integers one apart compared equal")
+		}
+	})
+	t.Run("equivalent spellings match", func(t *testing.T) {
+		if !semanticEqual(t, []byte(`{"n":6}`), []byte(`{"n":6.000}`)) {
+			t.Fatal("6 and 6.000 compared unequal")
+		}
+	})
 }
 
 func whitelistFilter(t *testing.T, fields ...string) *filter.FieldFilter {
