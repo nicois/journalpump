@@ -598,6 +598,69 @@ func TestPartialWriteFailKeepsCompleteLinesReplaysValidJSONL(t *testing.T) {
 	}
 }
 
+// newlineFailFile wraps a real file and fails the next `fails` writes that
+// are exactly the one-byte newline — the body writes succeed, the direct
+// newline write fails.
+type newlineFailFile struct {
+	f     *os.File
+	fails int
+}
+
+func (w *newlineFailFile) Write(p []byte) (int, error) {
+	if w.fails > 0 && len(p) == 1 && p[0] == '\n' {
+		w.fails--
+		return 0, errWriteBoom
+	}
+	return w.f.Write(p)
+}
+
+func (w *newlineFailFile) Truncate(size int64) error  { return w.f.Truncate(size) }
+func (w *newlineFailFile) Close() error               { return w.f.Close() }
+func (w *newlineFailFile) Stat() (os.FileInfo, error) { return w.f.Stat() }
+
+// TestDirectNewlineWriteFailureRepairsBoundary is item 11's regression: a
+// body larger than the buffer is written straight through (bufio flushes
+// it), so the newline also goes straight to the file. A failure there
+// bypasses bufio's sticky error, leaving the body on disk without its
+// newline; the sender must roll back to the last complete-line boundary so
+// a retry (or the shutdown flush) appends a clean line rather than a
+// doubled partial one.
+func TestDirectNewlineWriteFailureRepairsBoundary(t *testing.T) {
+	const prior = "{\"old\":1}\n"
+	path, base := openPrepopulated(t, prior)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	of := &newlineFailFile{f: f, fails: 1}
+	tr := newSender(of, base)
+
+	big := bytes.Repeat([]byte("x"), pythonBufferSize+10)
+	if err := tr.SendMessages(context.Background(), [][]byte{big}, ""); err == nil || !errors.Is(err, errWriteBoom) {
+		t.Fatalf("SendMessages err = %v, want the newline write failure", err)
+	}
+	// The partial line (body without newline) is rolled back to the
+	// pre-existing complete line's edge; the checkpoint stays at zero.
+	if got := tr.FlushedPayloadBytes(); got != 0 {
+		t.Errorf("flushed = %d, want 0 (failed line not delivered)", got)
+	}
+	if got := readFile(t, path); got != prior {
+		t.Fatalf("output = %q, want %q (partial line rolled back)", got, prior)
+	}
+
+	// A retry appends exactly one clean line.
+	if err := tr.SendMessages(context.Background(), [][]byte{big}, ""); err != nil {
+		t.Fatalf("retry SendMessages: %v", err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got, want := readFile(t, path), prior+string(big)+"\n"; got != want {
+		t.Fatalf("retry output = %q, want %q", got, want)
+	}
+}
+
 // TestDiscardReopenReplayValidJSONL locks the auto-flush-through-a-line
 // case with REAL JSON payloads: a buffer auto-flush that cuts through a
 // JSON line is truncated to the last complete-line boundary, and a replay

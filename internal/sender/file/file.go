@@ -131,7 +131,18 @@ func (s *Sender) SendMessages(_ context.Context, batch [][]byte, _ string) error
 		_, err := s.buf.Write(msg)
 		if err == nil {
 			if s.buf.Buffered() == 0 {
-				_, err = s.count.Write(newline)
+				// The body went straight to the file (bufio flushed it
+				// because it did not fit the buffer), so the newline must
+				// too — through bufio it would sit buffered past a
+				// fully-written body and the line would not be visible on
+				// disk. This write BYPASSES bufio, so a failure does not set
+				// bufio's sticky error: the file now holds the body without
+				// its newline. Roll back to the last complete-line boundary
+				// so a retry (or the shutdown flush) appends a clean line
+				// instead of a doubled partial one.
+				if _, werr := s.count.Write(newline); werr != nil {
+					err = errors.Join(werr, s.discardUnflushedLocked())
+				}
 			} else {
 				_, err = s.buf.Write(newline)
 			}
