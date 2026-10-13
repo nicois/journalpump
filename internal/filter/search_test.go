@@ -441,9 +441,15 @@ func TestHitsConcurrentWithPerformSearches(t *testing.T) {
 	entry := map[string]any{"MESSAGE": "hit"}
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	firstDone := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// Guarantee at least one increment happens-before the reader loop
+		// starts (the scheduler may otherwise never run this goroutine
+		// before the 200k reads finish).
+		searcher.PerformSearches(entry)
+		close(firstDone)
 		for {
 			select {
 			case <-stop:
@@ -453,6 +459,7 @@ func TestHitsConcurrentWithPerformSearches(t *testing.T) {
 			}
 		}
 	}()
+	<-firstDone
 	var sink int64
 	for i := 0; i < 200000; i++ {
 		sink += searcher.Searches()[0].Hits()
