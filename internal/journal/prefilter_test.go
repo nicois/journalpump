@@ -199,9 +199,12 @@ func TestSeverityPrefilterPreservedRules(t *testing.T) {
 
 // TestSeverityPrefilterNeverChangesOutput is the property test: over
 // random sender configs and entries, running the raw path WITH the
-// pre-filter must produce exactly the same per-sender payloads (and
-// return tuple) as running it WITHOUT — the pre-filter may only
-// short-circuit an outcome that was already empty (design §2.6.1).
+// pre-filter must produce exactly the same per-sender payloads and
+// return tuple as the RETAINED converted-entry Process oracle — the
+// pre-filter may only short-circuit an outcome that was already empty
+// (design §2.6.1). Comparing the pre-filtered raw path against the
+// unfiltered raw path (the previous shape) shared every raw-path bug, so
+// it could not catch a wrong ShouldPrune.
 func TestSeverityPrefilterNeverChangesOutput(t *testing.T) {
 	rng := rand.New(rand.NewSource(20261013))
 	units := []string{"foo.service", "bar.socket", "bench-c.service", "other", ""}
@@ -216,12 +219,48 @@ func TestSeverityPrefilterNeverChangesOutput(t *testing.T) {
 		{{Key: "env", Value: "prod"}},
 		{{Key: "PRIORITY", Value: int64(2)}},
 		{{Key: "SYSTEMD_UNIT", Value: "override.service"}},
+		// Overlapping extras across senders (same key, different value) so
+		// the ruling-1 contamination is exercised on both paths.
+		{{Key: "env", Value: "stage"}, {Key: "PRIORITY", Value: int64(7)}},
 	}
 	levelOptions := []func(name string) *filter.UnitLogLevel{
 		func(string) *filter.UnitLogLevel { return nil },
 		func(name string) *filter.UnitLogLevel { return unitLevel(t, name, "*:INFO") },
 		func(name string) *filter.UnitLogLevel { return unitLevel(t, name, "*:WARNING") },
 		func(name string) *filter.UnitLogLevel { return unitLevel(t, name, "*.service:INFO") },
+	}
+
+	// run compares the pre-filtered raw path against the retained Process
+	// oracle for one sender list; both handlers get independent state.
+	run := func(iter int, targets []SenderTarget, fields []string) {
+		t.Helper()
+		b := buildBatch(t, 1700000000500000, "s=x;i=1a2b;b=1;m=2;t=3;x=4", fields...)
+		entry := &b.Entries[0]
+
+		gotWith := make([][]byte, len(targets))
+		hWith := NewHandler(HandlerConfig{Prefilter: NewSeverityPrefilter(targets)})
+		hm, brm, bsm, err := hWith.ProcessRaw(b, entry, collectTargets(targets, &gotWith))
+		if err != nil {
+			t.Fatalf("iter %d with: %v", iter, err)
+		}
+		oracle := make([][]byte, len(targets))
+		hOracle := NewHandler(HandlerConfig{})
+		hm2, brm2, bsm2, err := hOracle.Process(rawToEntry(t, b, entry), collectTargets(targets, &oracle))
+		if err != nil {
+			t.Fatalf("iter %d oracle: %v", iter, err)
+		}
+		if hm != hm2 || brm != brm2 || bsm != bsm2 {
+			t.Fatalf("iter %d: return (%v,%d,%v) != oracle (%v,%d,%v)", iter, hm, brm, bsm, hm2, brm2, bsm2)
+		}
+		for i := range oracle {
+			switch {
+			case gotWith[i] == nil && oracle[i] == nil:
+			case gotWith[i] == nil || oracle[i] == nil:
+				t.Fatalf("iter %d sender %d: prefiltered=%v oracle=%v", iter, i, gotWith[i], oracle[i])
+			case !semanticEqual(t, gotWith[i], oracle[i]):
+				t.Fatalf("iter %d sender %d semantic mismatch:\n with   %s\noracle %s", iter, i, gotWith[i], oracle[i])
+			}
+		}
 	}
 
 	for iter := 0; iter < 300; iter++ {
@@ -241,33 +280,21 @@ func TestSeverityPrefilterNeverChangesOutput(t *testing.T) {
 		}
 		if u := units[rng.Intn(len(units))]; u != "" {
 			fields = append(fields, "_SYSTEMD_UNIT="+u)
-		}
-		b := buildBatch(t, 1700000000500000, "s=x;i=1a2b;b=1;m=2;t=3;x=4", fields...)
-		entry := &b.Entries[0]
-
-		gotWith := make([][]byte, len(targets))
-		gotWithout := make([][]byte, len(targets))
-		hWith := NewHandler(HandlerConfig{Prefilter: NewSeverityPrefilter(targets)})
-		hm, brm, bsm, err := hWith.ProcessRaw(b, entry, collectTargets(targets, &gotWith))
-		if err != nil {
-			t.Fatalf("iter %d with: %v", iter, err)
-		}
-		hWithout := NewHandler(HandlerConfig{})
-		hm2, brm2, bsm2, err := hWithout.ProcessRaw(b, entry, collectTargets(targets, &gotWithout))
-		if err != nil {
-			t.Fatalf("iter %d without: %v", iter, err)
-		}
-		if hm != hm2 || brm != brm2 || bsm != bsm2 {
-			t.Fatalf("iter %d: return (%v,%d,%v) != (%v,%d,%v)", iter, hm, brm, bsm, hm2, brm2, bsm2)
-		}
-		for i := range gotWithout {
-			switch {
-			case gotWith[i] == nil && gotWithout[i] == nil:
-			case gotWith[i] == nil || gotWithout[i] == nil:
-				t.Fatalf("iter %d sender %d: prefiltered=%v unfiltered=%v", iter, i, gotWith[i], gotWithout[i])
-			case !semanticEqual(t, gotWith[i], gotWithout[i]):
-				t.Fatalf("iter %d sender %d semantic mismatch:\n with %s\nwithout %s", iter, i, gotWith[i], gotWithout[i])
+			// A distinct raw key that strips to the same processed name: a
+			// scalar collision on the oracle, a repeat on the raw path.
+			if rng.Intn(2) == 0 {
+				fields = append(fields, "SYSTEMD_UNIT="+u)
 			}
+		}
+		run(iter, targets, fields)
+		// The contamination quirk makes the sender ORDER observable; the
+		// pre-filtered path and the oracle must agree for both orders.
+		if nsenders > 1 && rng.Intn(2) == 0 {
+			rev := append([]SenderTarget(nil), targets...)
+			for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+				rev[i], rev[j] = rev[j], rev[i]
+			}
+			run(iter, rev, fields)
 		}
 	}
 }
