@@ -276,15 +276,38 @@ func effectiveUnitPriority(b *Batch, e *RawEntry, extras []Field) (string, any) 
 }
 
 // rawSearchValue yields the search string for one raw field, mirroring
-// searchFieldValue over the CONVERTED entry (the view PerformSearches
-// receives: keys with underscores, invalid bytes still []byte, duplicate
-// keys as a []any list — which never matches).
+// searchFieldValue over the CONVERTED entry PerformSearches receives: keys
+// WITH underscores (so the lookup is an EXACT raw-key match, never the
+// stripped-key grouping), invalid bytes still []byte, duplicate keys as a
+// []any list — which never matches. The reader's synthesised
+// __REALTIME_TIMESTAMP / __SEQNUM keys are resolved too.
 func rawSearchValue(b *Batch, e *RawEntry, field string) (string, bool) {
-	v, ok := rawGroupValue(b, e, field, convertedRawValue)
-	if !ok {
+	switch field {
+	case "__REALTIME_TIMESTAMP":
+		return searchStringValue(convertValue("__REALTIME_TIMESTAMP", int64(e.Realtime)))
+	case "__SEQNUM":
+		seqnum, ok := ParseSeqnumFromCursor(string(b.Cursor(e)))
+		if !ok {
+			return "", false
+		}
+		return searchStringValue(seqnum)
+	}
+	var result any
+	found := false
+	for i := range e.Fields {
+		if e.Fields[i].Duplicate {
+			continue
+		}
+		if string(b.Key(&e.Fields[i])) != field {
+			continue
+		}
+		result = groupFieldValue(b, e, i, convertedRawValue)
+		found = true
+	}
+	if !found {
 		return "", false
 	}
-	return searchStringValue(v)
+	return searchStringValue(result)
 }
 
 // searchStringValue mirrors filter.searchFieldValue's value handling
@@ -319,37 +342,44 @@ func searchStringValue(v any) (string, bool) {
 	}
 }
 
-// rawGroupValue resolves the value of the field whose stripped key is
-// name, reproducing the reader's conversion: a single occurrence is
-// mapped through toValue; repeated occurrences become a []any list of the
-// raw byte values (the reader merges duplicate keys before ConvertEntry,
-// so the list elements are never converted). ok is false when absent.
+// rawGroupValue resolves the PROCESSED entry value for the stripped key
+// name, reproducing ProcessEntry: keys are stripped of leading
+// underscores, repeated IDENTICAL raw keys were already merged into a
+// list by the reader, and where two DIFFERENT raw keys strip to the same
+// name the LAST one wins (dict assignment keeps the first position, the
+// last value). ok is false when absent.
 func rawGroupValue(b *Batch, e *RawEntry, name string, toValue func(*Batch, *RawField) any) (any, bool) {
-	first := -1
-	count := 0
-	for i := range e.Fields {
-		if string(stripUnderscore(b.Key(&e.Fields[i]))) == name {
-			if first < 0 {
-				first = i
-			}
-			count++
-		}
-	}
-	if first < 0 {
-		return nil, false
-	}
-	if count == 1 {
-		return toValue(b, &e.Fields[first]), true
-	}
-	list := make([]any, 0, count)
+	var result any
+	found := false
 	for i := range e.Fields {
 		field := &e.Fields[i]
+		if field.Duplicate {
+			continue
+		}
 		if string(stripUnderscore(b.Key(field))) != name {
 			continue
 		}
-		list = append(list, append([]byte(nil), b.ValueBytes(field)...))
+		result = groupFieldValue(b, e, i, toValue)
+		found = true
 	}
-	return list, true
+	return result, found
+}
+
+// groupFieldValue is one distinct exact raw key's converted value: toValue
+// for a single occurrence, or a []any list of the raw byte values when the
+// reader merged repeated identical keys (python-systemd _get_all) — the
+// list elements are never converted.
+func groupFieldValue(b *Batch, e *RawEntry, index int, toValue func(*Batch, *RawField) any) any {
+	dups := duplicateIndexes(b, e, index)
+	if len(dups) == 0 {
+		return toValue(b, &e.Fields[index])
+	}
+	list := make([]any, 0, len(dups)+1)
+	list = append(list, append([]byte(nil), b.ValueBytes(&e.Fields[index])...))
+	for _, d := range dups {
+		list = append(list, append([]byte(nil), b.ValueBytes(&e.Fields[d])...))
+	}
+	return list
 }
 
 // convertedRawValue converts one raw field value like ConvertEntry (the

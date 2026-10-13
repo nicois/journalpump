@@ -113,10 +113,12 @@ func TestSeverityPrefilterPreservedRules(t *testing.T) {
 			want:    true,
 		},
 		{
-			name:    "repeated unit is a list and passes",
+			name:    "distinct raw keys stripping alike are a scalar collision",
 			fields:  []string{"MESSAGE=hi", "PRIORITY=7", "_SYSTEMD_UNIT=foo.service", "SYSTEMD_UNIT=bar.service"},
 			targets: []SenderTarget{{Name: "a", UnitLogLevels: unitLevel(t, "l", "*:INFO")}},
-			want:    false,
+			// ProcessEntry keeps ONE scalar key (last value wins), so the
+			// unit filter sees a real unit and drops at WARNING+.
+			want: true,
 		},
 		{
 			name:    "no catch-all glob: matching unit prunes",

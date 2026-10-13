@@ -83,22 +83,43 @@ func TestProcessRawIndexDateSidecar(t *testing.T) {
 
 func runBoth(t *testing.T, fields []string, targets []SenderTarget) (raw, old [][]byte) {
 	t.Helper()
+	return runBothCfg(t, fields, targets, HandlerConfig{})
+}
+
+// runBothCfg is runBoth with a shared base config (searches, filters) on
+// both handlers, so the differential covers the gate-level state too.
+func runBothCfg(t *testing.T, fields []string, targets []SenderTarget, cfg HandlerConfig) (raw, old [][]byte) {
+	t.Helper()
 	cursor := "s=x;i=1a2b;b=1;m=2;t=3;x=4"
 	b := buildBatch(t, 1700000000500000, cursor, fields...)
 	entry := &b.Entries[0]
 
 	rawGot := make([][]byte, len(targets))
-	rawHandler := NewHandler(HandlerConfig{})
+	rawHandler := NewHandler(cfg)
 	if _, _, _, err := rawHandler.ProcessRaw(b, entry, collectTargets(targets, &rawGot)); err != nil {
 		t.Fatalf("ProcessRaw: %v", err)
 	}
 
 	oldGot := make([][]byte, len(targets))
-	oldHandler := NewHandler(HandlerConfig{})
+	oldHandler := NewHandler(cfg)
 	if _, _, _, err := oldHandler.Process(rawToEntry(t, b, entry), collectTargets(targets, &oldGot)); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	return rawGot, oldGot
+}
+
+// newRawSearcher builds a searcher over the given field patterns.
+func newRawSearcher(t *testing.T, fields map[string]any) *filter.Searcher {
+	t.Helper()
+	searches, err := filter.NewSearches([]any{map[string]any{"name": "s", "fields": fields}})
+	if err != nil {
+		t.Fatalf("NewSearches: %v", err)
+	}
+	searcher, err := filter.NewSearcher(searches, 1e9, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewSearcher: %v", err)
+	}
+	return searcher
 }
 
 func assertSamePayloads(t *testing.T, raw, old [][]byte) {
@@ -242,6 +263,93 @@ func runBothSecret(t *testing.T, fields []string, targets []SenderTarget, filter
 		t.Fatalf("Process: %v", err)
 	}
 	return rawGot, oldGot, rawMatches
+}
+
+// TestProcessRawSearchExactRawKeys locks item 5: searches resolve against
+// the EXACT raw (pre-strip) keys the oracle's perform_searches sees, so a
+// search on _SYSTEMD_UNIT / _PID matches (and hit metrics fire) instead
+// of silently dropping the entry.
+func TestProcessRawSearchExactRawKeys(t *testing.T) {
+	fields := []string{"MESSAGE=hello", "PRIORITY=6", "_SYSTEMD_UNIT=foo.service", "_PID=42"}
+	for _, name := range []string{"_SYSTEMD_UNIT", "_PID", "MESSAGE"} {
+		t.Run(name, func(t *testing.T) {
+			searcher := newRawSearcher(t, map[string]any{name: ".*"})
+			raw, old := runBothCfg(t, fields, []SenderTarget{{Name: "a"}}, HandlerConfig{Searcher: searcher})
+			assertSamePayloads(t, raw, old)
+			if raw[0] == nil {
+				t.Fatalf("search on %q dropped the entry", name)
+			}
+		})
+	}
+	// A search on a key the entry does not carry drops it in both paths.
+	searcher := newRawSearcher(t, map[string]any{"_UNKNOWN": ".*"})
+	raw, old := runBothCfg(t, fields, []SenderTarget{{Name: "a"}}, HandlerConfig{Searcher: searcher})
+	assertSamePayloads(t, raw, old)
+	if raw[0] != nil {
+		t.Errorf("search on an absent key should drop the entry, got %s", raw[0])
+	}
+}
+
+// TestProcessRawStrippedKeyCollision locks item 6: two different raw keys
+// that strip to the same name (_SYSTEMD_UNIT vs SYSTEMD_UNIT) are NOT a
+// repeated field — ProcessEntry keeps one scalar key (last value wins),
+// so matching, unit filtering and emission must all agree and no
+// duplicate JSON key may be emitted.
+func TestProcessRawStrippedKeyCollision(t *testing.T) {
+	fields := []string{"MESSAGE=hello", "PRIORITY=7", "_SYSTEMD_UNIT=foo.service", "SYSTEMD_UNIT=bar.service"}
+	raw, old := runBoth(t, fields, []SenderTarget{{Name: "a"}})
+	assertSamePayloads(t, raw, old)
+	if n := bytes.Count(raw[0], []byte(`"SYSTEMD_UNIT"`)); n != 1 {
+		t.Errorf("payload carries SYSTEMD_UNIT %d times: %s", n, raw[0])
+	}
+	if got := parsePayload(t, raw[0])["SYSTEMD_UNIT"]; got != "bar.service" {
+		t.Errorf("SYSTEMD_UNIT = %#v, want \"bar.service\" (last strips-key wins)", got)
+	}
+}
+
+// TestProcessRawRepeatedFieldClasses locks item 7: a repeated field is a
+// LIST in Python and convert_entry converts the AGGREGATED list as a
+// whole — only convert_mon accepts one (-> null); the rest stay a list of
+// raw bytes decoded by the serializer (so int-class repeats are STRINGS,
+// not numbers), and an invalid byte inside the list errors.
+func TestProcessRawRepeatedFieldClasses(t *testing.T) {
+	t.Run("int class repeats are strings", func(t *testing.T) {
+		raw, old := runBoth(t, []string{"MESSAGE=hello", "_PID=1", "_PID=2"}, []SenderTarget{{Name: "a"}})
+		assertSamePayloads(t, raw, old)
+		got := parsePayload(t, raw[0])["_PID"] // key keeps underscores? no: stripped to "PID"
+		_ = got
+		pid := parsePayload(t, raw[0])["PID"]
+		list, ok := pid.([]any)
+		if !ok || len(list) != 2 || list[0] != "1" || list[1] != "2" {
+			t.Errorf("PID = %#v, want [\"1\",\"2\"] (list of strings)", pid)
+		}
+	})
+
+	t.Run("monotonic class repeats are null", func(t *testing.T) {
+		raw, old := runBoth(t, []string{"MESSAGE=hello", "__MONOTONIC_TIMESTAMP=1", "__MONOTONIC_TIMESTAMP=2"}, []SenderTarget{{Name: "a"}})
+		assertSamePayloads(t, raw, old)
+		if got := parsePayload(t, raw[0])["MONOTONIC_TIMESTAMP"]; got != nil {
+			t.Errorf("MONOTONIC_TIMESTAMP = %#v, want null", got)
+		}
+	})
+
+	t.Run("uuid class repeats stay raw strings", func(t *testing.T) {
+		raw, old := runBoth(t, []string{"MESSAGE=hello", "MESSAGE_ID=0123456789abcdef0123456789abcdef", "MESSAGE_ID=0123456789abcdef0123456789abcdef"}, []SenderTarget{{Name: "a"}})
+		assertSamePayloads(t, raw, old)
+		list, ok := parsePayload(t, raw[0])["MESSAGE_ID"].([]any)
+		if !ok || len(list) != 2 || list[0] != "0123456789abcdef0123456789abcdef" {
+			t.Errorf("MESSAGE_ID = %#v, want a list of the raw strings", parsePayload(t, raw[0])["MESSAGE_ID"])
+		}
+	})
+
+	t.Run("invalid utf8 inside a list errors", func(t *testing.T) {
+		cursor := "s=x;i=1a2b;b=1;m=2;t=3;x=4"
+		b := buildBatch(t, 1, cursor, "MESSAGE=hello", "_PID=1", "_PID=\xff")
+		_, _, _, rawErr := NewHandler(HandlerConfig{}).ProcessRaw(b, &b.Entries[0], []SenderTarget{{Name: "a"}})
+		if rawErr == nil {
+			t.Error("ProcessRaw should error on an invalid byte inside a repeated field")
+		}
+	})
 }
 
 // TestProcessRawExtrasLastWins locks item 2: overlapping extra keys

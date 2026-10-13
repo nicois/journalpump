@@ -101,10 +101,16 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 		dst = append(dst, opts.Extras[idx].JSON...)
 	}
 
-	// Pass 1: raw fields, first occurrences only.
+	// Pass 1: raw fields. Distinct exact keys that strip to the SAME name
+	// are a dict collision (ProcessEntry keeps the last value), so only
+	// the LAST field of each stripped key is emitted; a repeated IDENTICAL
+	// key (Duplicate) is folded into its first occurrence by appendFieldValue.
 	for i := range e.Fields {
 		field := &e.Fields[i]
 		if field.Duplicate {
+			continue
+		}
+		if lastStrippedIndex(b, e, i) != i {
 			continue
 		}
 		key := stripUnderscore(b.Key(field))
@@ -273,20 +279,56 @@ func appendFieldValue(dst []byte, b *Batch, e *RawEntry, index int) ([]byte, err
 	if len(dups) == 0 {
 		return appendSingleValue(dst, rawKey, b.ValueBytes(field))
 	}
+	// Python's reader merged repeated identical keys into a LIST before
+	// convert_entry, which applies the converter to the LIST as a whole:
+	// only convert_mon accepts one (-> None). Every other class leaves the
+	// list unchanged, so the serializer decodes each element as a string
+	// (an int-class repeat is a list of STRINGS, not numbers) and errors on
+	// invalid UTF-8 (ProcessEntry never repr()s list elements).
+	if classOf(rawKey) == classMon {
+		return append(dst, "null"...), nil
+	}
 	dst = append(dst, '[')
 	var err error
-	dst, err = appendSingleValue(dst, rawKey, b.ValueBytes(field))
+	dst, err = appendListElement(dst, b.ValueBytes(field))
 	if err != nil {
 		return nil, err
 	}
 	for _, dup := range dups {
 		dst = append(dst, ", "...)
-		dst, err = appendSingleValue(dst, rawKey, b.ValueBytes(&e.Fields[dup]))
+		dst, err = appendListElement(dst, b.ValueBytes(&e.Fields[dup]))
 		if err != nil {
 			return nil, err
 		}
 	}
 	return append(dst, ']'), nil
+}
+
+// appendListElement renders one element of a repeated field like
+// Serialize renders a []byte list item: JSON-escaped string, or an error
+// for invalid UTF-8.
+func appendListElement(dst, value []byte) ([]byte, error) {
+	if !utf8.Valid(value) {
+		return nil, errors.New("undecodable byte value in repeated field")
+	}
+	return appendJSONString(dst, value), nil
+}
+
+// lastStrippedIndex returns the index of the LAST non-duplicate field whose
+// stripped key equals field index's stripped key (a dict collision;
+// ProcessEntry keeps the last value, so only this index is emitted).
+func lastStrippedIndex(b *Batch, e *RawEntry, index int) int {
+	key := stripUnderscore(b.Key(&e.Fields[index]))
+	last := index
+	for j := index + 1; j < len(e.Fields); j++ {
+		if e.Fields[j].Duplicate {
+			continue
+		}
+		if bytes.Equal(stripUnderscore(b.Key(&e.Fields[j])), key) {
+			last = j
+		}
+	}
+	return last
 }
 
 // duplicateIndexes returns the indexes of the fields after index whose
