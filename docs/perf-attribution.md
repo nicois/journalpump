@@ -23,6 +23,8 @@ config hash `5c45fb26…`, `GOMAXPROCS` default (16) unless stated.
 | allocation per entry (objects) | **46.0** | — |
 | allocation per entry (bytes) | **4.67 KB** | — |
 | live heap (in-use) after run | 5.2 MB | — |
+| allocation per entry, after §7 fixes 1+2 (objects) | **26.7** | — |
+| `BenchmarkEmitJSON` allocs/op, after fixes 1+2 | **8** | — |
 
 The workload is **poll-cycle-bound**, not CPU-bound: the reader drains up
 to `buffer.ChunkSize = 5000` entries per `readMessages` call and then
@@ -151,8 +153,10 @@ MESSAGE 240 B, UUID ids, the converter-hit keys):
 | encoder | ns/op | B/op | allocs/op | vs hand-rolled |
 |---|---:|---:|---:|---:|
 | **hand-rolled `EmitJSON`** (production) | 5,012 | 520 | **16** | — |
-| **`encoding/json/v2` over a struct** | 3,371 | 1,473 | **3** | 1.5× faster, 5.3× fewer allocs |
+| **hand-rolled `EmitJSON` after §7 fix 2** (commit `0797b5d`) | ~3,700-4,800 | 328 | **8** | — |
+| **`encoding/json/v2` over a struct** | 3,371 | 1,473 | **3** | 1.5× faster, 5.3× fewer allocs (fixed schema only) |
 | **`encoding/json/v2` over a map** | 7,224 | 1,184 | **23** | 1.4× slower, 1.4× more allocs |
+| **`jsontext` dynamic emitter** (probe bench) | ~1,600-2,000 | 216 | 15 | fastest ns/op but the 15 allocs are the bench table; cannot beat the emitter's conversions (§3.1) |
 | reference: `EmitJSON` into a reused buffer (`serializeRef`) | 1,796 | 154 | 6 | 2.8× faster |
 
 Findings:
@@ -187,6 +191,50 @@ Findings:
 **Recommendation:** keep the hand-rolled emitter (only it can reproduce
 Python's escaping, separators and raw field order) and cut its
 allocation count directly (§7). Do **not** adopt `json/v2`.
+
+### 3.1 Is the byte-exact format still required? (v2-format review item)
+
+The Task 32 charter amendment (`docs/migration-charter.md`, D8) states the
+serialization parity contract is **semantically equivalent (byte-identical
+where free)**: "the JSON must stay valid and carry the same keys, values
+and per-sender event stream, while key order, whitespace, escaping form
+and float spelling may differ". The committed canary already implements
+this — `TestSerializeGolden` / `TestSerializeGoldenRawPath` log a byte
+diff and fail only on a *semantic* diff, and the systest oracle
+(`assert_semantic_equal`) does the same. So the separator (`:` vs `": "`)
+and escaping (`\uXXXX` vs raw UTF-8) objections to `json/v2` are **not
+requirements** for message content; only the sink PROTOCOLS (framing
+bytes) stay exact.
+
+That removes the *format* objection but not the *structural* one:
+
+- **`json/v2` over a struct cannot express the field set.** The payload's
+  keys are raw journald field order, data-dependent. A struct's fields are
+  fixed, and — verified by probe
+  (`internal/journal/jsonstruct_probe_test.go`, `TestJSONv2HasNoInlineCatchAll`)
+  — `encoding/json/v2` (Go 1.27) has **no inline/catch-all mechanism**:
+  the `json:",inline"` tag and an embedded `map[string]jsontext.Value`
+  both compile and run but receive an EMPTY remainder; unmodelled members
+  are dropped, and the only knob is `RejectUnknownMembers(true)`, which
+  *errors* rather than captures. So a struct encoder would silently drop
+  unknown journald fields — a correctness failure regardless of format.
+- **A format-relaxed dynamic encoder is possible but not cheaper.** The
+  one mechanism that captures unmodelled members *with order preserved* is
+  a manual `jsontext.Decoder` loop (`TestJSONTextDecoderPreservesOrder`).
+  The escaping primitive behind it (`jsontext.AppendQuote`) measures
+  ~200-240 ns/op, 0 allocs, versus our `appendJSONString` ~190-220 ns/op,
+  0 allocs on the same 240 B MESSAGE — i.e. on par, so there is no
+  escaping win to capture. A `jsontext`-based dynamic emitter
+  (`BenchmarkEmitJSONjsontext`, ~1.6-2.0 µs, 15 allocs/op including the
+  benchmark's own table) would still have to do all of the
+  Python-fidelity conversion work (float repr, int canonicalisation,
+  UUID casing, timestamp) that dominates `EmitJSON`'s cost.
+
+**Conclusion:** `json/v2` stays rejected, but now for the structural
+reason (it cannot represent a dynamic field set) rather than the format
+one — which the charter has relaxed. Consumers parse JSON and accept both
+forms; nothing byte-compares message content. The canary asserts semantic
+equality for message content and stays byte-exact only for sink framing.
 
 ## 4. Maps and dynamic lookups still in the hot path
 
@@ -280,29 +328,39 @@ Realistic achievable ratios, if §7 is done: CPU-saturated wall ~9-11
 (poll-paced) but with ~2-3× less CPU-seconds, which matters on busy hosts,
 under a lower `pollInterval`, or with many readers.
 
-## 7. Ranked fixes (not applied)
+## 7. Ranked fixes
 
 Ranked by µs/entry recovered per unit of risk; all behaviour-preserving
 byte-for-byte unless noted.
 
-1. **Build the daemon pipeline once, not per entry.**
-   `daemon.pipeline` allocates a `map`, a slice, a closure and a fresh
-   `journal.Handler` on every entry, though all of its inputs are
-   construction-time. Cache it and rebuild only on reload.
-   *Recovers ~8.5 objects/entry ≈ 2-3 µs/entry CPU + GC.* **Lowest risk,
-   highest alloc payoff.**
-2. **Cut `EmitJSON`'s allocations** (16 → target ≤8): precompute the
-   synthesised key `[]byte`s as package vars, replace the three
-   `emitSynth` closures with straight-line code, append
-   `PythonFloatRepr`/`canonicalUUID` results without the intermediate
-   `[]byte`, and make `ParseSeqnumFromCursor` take `[]byte`.
-   *Recovers ~8 objects/entry ≈ 1.5-2 µs/entry.* Medium risk (byte-exact
-   output must be re-pinned by `TestSerializeGolden`).
+1. **Build the daemon pipeline once, not per entry. — APPLIED (commit
+   `0797b5d`).** `daemon.pipeline` allocated a `map`, a slice, a closure
+   and a fresh `journal.Handler` on every entry, though all of its inputs
+   are construction-time. It is now memoised on the reader runtime
+   (`pipelineCache`), rebuilt only when the pump settings pointer changes
+   (a reload) or `initSenders` runs (a sender-set change). *Removes the
+   ~8.5 objects/entry the profile attributed to `pipeline`.* **Lowest
+   risk, highest alloc payoff.**
+2. **Cut `EmitJSON`'s allocations (16 → 8). — APPLIED (commit
+   `0797b5d`).** The `emitKey`/`emitExtra`/`emitSynth` closures (whose
+   captures of `dst`/`e` escaped every entry) are replaced with
+   straight-line code and helper funcs, `PythonFloatRepr` is appended
+   without a `[]byte` conversion, and the UUID class uses the new
+   allocation-free `appendCanonicalUUID` instead of
+   `decodeUTF8`+`canonicalUUID`. *`BenchmarkEmitJSON`: 16 → 8 allocs/op,
+   520 → 328 B/op, **meets the ≤8 emitter sub-target**.* Medium risk
+   (byte-exact output re-pinned by `TestSerializeGolden` and the raw-path
+   canary — both green).
 3. **Typed gate lookups.** Replace `rawGroupValue`/`convertedRawValue`
    (`any` + `[]byte` copy) with a lookup that returns the raw value view
    plus its converter class, and only materialise a fallback string for
    the `check_match`/`unit_log_level` comparisons that actually need one.
    *Recovers ~7.5 objects/entry ≈ 1-1.5 µs/entry.* Medium risk.
+   **Measured headroom (bench §9):** the current two-key
+   `rawGroupValue` gate is 7 allocs/op ≈ 640 ns/op; a typed-index
+   resolution is 5 allocs/op ≈ 430 ns/op (and the remainder slice that
+   accounts for the extra bytes is avoidable, so ~2-3 allocs is the real
+   floor) — a ~200 ns + 2-4 object win per entry.
 4. **`emitRaw` cache:** for the single-sender (common) case use a
    stack-allocated 1-entry cache instead of `map[string]rawCacheEntry`.
    *Recovers ~1 object/entry.* Low risk.
@@ -324,32 +382,98 @@ byte-for-byte unless noted.
 
 | scope | objects/entry | vs gate |
 |---|---:|---|
-| whole-run Go binary (`alloc_objects`, §2) | **46.0** | 5.75× over |
-| `EmitJSON` alone (`BenchmarkEmitJSON`, §3) | **16** | 2× over |
-| best available encoder (`json/v2` struct, §3) | **3** | meets it — but cannot emit the dynamic field set or Python's bytes |
+| whole-run Go binary, baseline (`alloc_objects`, §2) | **46.0** | 5.75× over |
+| whole-run Go binary, **after §7 fixes 1+2** (commit `0797b5d`) | **26.7** | 3.34× over |
+| `EmitJSON` alone, baseline (`BenchmarkEmitJSON`) | **16** | 2× over |
+| `EmitJSON` alone, **after §7 fix 2** | **8** | **meets it** |
+| best available encoder (`json/v2` struct, §3) | **3** | meets it — but cannot emit the dynamic field set (§3.1) |
 
-**Disposition: the gate is EXCEEDED and cannot be met by the emitter
-alone.** 46 objects/entry is distributed across four independent phases
-(§2: emission 19.7, gates 7.5, per-entry pipeline 8.5, sender 3.2,
-reader/logging 3.0); even a zero-allocation emitter leaves ~26. §7's
-fixes are expected to reach ~15-20 objects/entry, still above 8.
+**What is actually achievable, measured.** The two committed fixes have
+already moved the number meaningfully: **46.0 → 26.7 objects/entry** whole
+run and **16 → 8 allocs/op** for the emitter (the emitter sub-target is
+met). The remaining §7 fixes are bounded and each has a measured source:
+
+| fix | objects/entry | status |
+|---|---:|---|
+| 1. daemon pipeline memoised | ~8.5 | **applied** |
+| 2. emitter closures/UUID | ~8 (16→8/op) | **applied** |
+| 3. typed gate lookups (bench §9) | ~2-4 | open |
+| 4. `emitRaw` 1-entry cache | ~1 | open |
+| 5. sender `rawString`/`durable` | ~3 | open |
+| 6. `lastStrippedIndex` O(n²) | 0 (time only) | open |
+
+So **≈18-21 objects/entry whole-run is the reachable floor** once 3-6 land
+(26.7 − ≈6-8), and it is reachable **without** abandoning byte-exact
+output for the framing the canary pins. The single hard "≤ 8 whole-run"
+figure is not reachable on the raw path — even a zero-allocation emitter
+leaves ~26 — but **≤ 8 is met at the emitter level**, which is where the
+original Task 31 figure (158 objects/entry converter chain → target ~4)
+was actually aimed.
 
 **Proposed plan amendment (needs coordinator sign-off; not applied
-here):** replace the single hard gate with a two-part, measured target
-and record the achieved number:
+here):** replace the single hard gate with a three-part, measured target
+that states numbers already hit plus the reachable floor:
 
 > **Amended 2026-10-13 (Task 32 item 16, evidence in
 > `docs/perf-attribution.md`):** the allocs/entry gate is restated as
-> (a) **≤ 20 objects/entry whole-run** with the §7 fixes applied, and
-> (b) **≤ 8 objects/entry for the emitter (`BenchmarkEmitJSON`)**, and
-> (c) the default-`GOMAXPROCS` whole-run CPU-below-Python gate (already
-> met: 6.49 s vs 9.04 s, non-overlapping ranges) stays as the headline
-> performance gate. The original "≤ 8 whole-run" figure came from the
-> Task 31 converter path (158 objects/entry) and is not reachable on the
-> raw path without removing the per-entry pipeline construction, gate
-> lookups, sender enqueue and the Python-fidelity byte work — none of
-> which is free under the byte-exact canary.
+> (a) **emitter ≤ 8 allocs/op** (`BenchmarkEmitJSON`; *met — 8*, commit
+> `0797b5d`), (b) **whole-run ≤ 30 objects/entry** immediately after
+> fixes 1+2 (*met — 26.7*), tightening to **≤ 21 objects/entry** once
+> §7 fixes 3-6 land (reachable floor ≈18-21), and (c) the
+> default-`GOMAXPROCS` whole-run CPU-below-Python gate (already met:
+> 6.49 s vs 9.04 s, non-overlapping ranges) as the headline performance
+> gate. The original "≤ 8 whole-run" came from the Task 31 converter path
+> (158 objects/entry) and is not reachable on the raw path: the floor is
+> set by the per-entry gate lookups, `emitRaw`/sender enqueue and the
+> Python-fidelity byte work, none of which is free under the byte-exact
+> framing the canary pins (message *content* is only semantically
+> constrained, §3.1 — the framing is not).
 
 I am **not** editing the plan: the plan is the architect/coordinator's
 artifact and ledger rows 31/32 remain "review". This section is the
 evidence package for that ruling.
+
+## 9. Entry representation: typed struct + opaque remainder (user question)
+
+**The question** (user, 2026-10-13): can Go decode a JSON payload into a
+struct with the remaining keys kept in a raw-JSON object?
+
+**Mechanism (probed, `internal/journal/jsonstruct_probe_test.go`):**
+
+- `encoding/json/v2` (Go 1.27) has **no inline/catch-all**. The
+  `json:",inline"` tag and an embedded `map[string]jsontext.Value`
+  compile and run but receive an EMPTY remainder; unmodelled members are
+  dropped. `RejectUnknownMembers(true)` is the only knob and it *errors*.
+- `encoding/json/v1` is the same: no catch-all; the usual pattern is a
+  second `Unmarshal` into `map[string]json.RawMessage`, which **loses
+  key order** (Go maps). A custom `UnmarshalJSON` over `json.Decoder`
+  (`Token`/`RawMessage`) preserves order but is hand-written.
+- **Only a manual `jsontext.Decoder` loop preserves order** — verified
+  (`TestJSONTextDecoderPreservesOrder`), which matters because the canary
+  pins journald field order.
+
+**Direction:** the hot path produces JSON *from* journald bytes; it does
+not decode JSON, so a decode-side catch-all buys nothing on the write
+path. The genuinely interesting application is the **entry
+representation**: a typed struct of the ~16 common fields plus an opaque
+remainder, avoiding map hashing / `any` boxing / per-key linear scans.
+`BenchmarkGateCurrent` vs `BenchmarkGateStructIndex` measure exactly the
+gate-lookup half:
+
+| shape | ns/op | allocs/op |
+|---|---:|---:|
+| current `rawGroupValue` gate (2 keys, `any` + `[]byte` copy) | ~640 | 7 |
+| typed index (SYSTEMD_UNIT/PRIORITY offsets, `[]byte` views) | ~430 | 5 |
+
+A type-switch on the resolved field, returning the raw `[]byte` view plus
+its converter class, is the ~200 ns + 2-4 object win already booked as
+§7 fix 3. It does **not** extend to `json/v2`'s struct encoder for
+emission: that cannot carry the remainder (§3.1), and its 3-alloc/3.1 µs
+result is for a fixed schema only.
+
+**Recommendation:** pursue the typed-entry index as §7 fix 3 (a small
+follow-up task, not this one); do **not** adopt a `json/v2` struct
+encoder. If the follow-up is taken, it must preserve the per-filter-key
+payload sharing, the extras last-wins rule (handlers ruling 1) and the
+repeated-field list semantics — all three are covered by the existing
+`TestSerializeGoldenRawPath` / `prefilter` / handler differential tests.
