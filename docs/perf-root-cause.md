@@ -167,10 +167,18 @@ same loop in C. What *is* removable:
 - the per-call `ffiSymbol` lookup (mutex + map) — cache the pointers once;
 - the 1 MiB pooled buffer and its `memcpy` per field (see below);
 - `sd_journal_get_cursor` per entry returns a `malloc`ed string we copy
-  and free (0.24 s + a `C.free`), and `sd_journal_get_realtime_usec`
-  could be replaced by reading `__REALTIME_TIMESTAMP` — which the
-  enumerate loop *already returns* (the field is in the entry!). That is
-  one crossing per entry removed for free.
+  and free (0.24 s + a `C.free`).
+
+  **Correction (2026-10-13):** an earlier draft of this section claimed
+  `sd_journal_get_realtime_usec` could be dropped by reading
+  `__REALTIME_TIMESTAMP` "which the enumerate loop already returns". That
+  is **wrong**: libsystemd does not return `__`-prefixed fields through
+  `sd_journal_enumerate_data`. `__REALTIME_TIMESTAMP` / `__MONOTONIC_TIMESTAMP`
+  are stored in the entry object itself, not as data objects, so the
+  enumerate loop never yields them. Keep the `get_realtime_usec` call —
+  inside the C loop it adds no extra cgo crossing and costs ~0.2 µs/entry.
+  (The same wrong suggestion is flagged in `docs/design-journal-pipeline.md`
+  §1.2.)
 
 There is no way to get the crossing count below ~17 per entry (one per
 field) with this API, so **~4 µs/entry of cgo is a floor**, not a bug.
@@ -228,9 +236,9 @@ of the per-entry map, and no `any` boxing on the hot path.
   robustness, not for CPU.
 - **`ffiSymbol` per call** (0.51 s, 4.2 %): mutex + string map lookup on
   every crossing. Cache once per process.
-- **`sd_journal_get_realtime_usec` per entry** when
-  `__REALTIME_TIMESTAMP` is already among the enumerated fields (and is
-  then overwritten by `SetField` anyway).
+- **`sd_journal_get_realtime_usec` per entry**: NOT removable — see the
+  correction above; `__REALTIME_TIMESTAMP` is not among the enumerated
+  fields. It stays (no extra crossing inside the C loop).
 - **`enumBufPool` 1 MiB buffers** partly defeat themselves: 284 pool
   misses allocate 1 MiB each (298 MB, 7.6 % of all bytes) and
   `memclrNoHeapPointers` flat is 350 ms.
@@ -328,8 +336,9 @@ way — it is poll-paced, ~71-74 s for both implementations (within the
    per-value copies, linear dedupe; `ConvertEntry` in place; no `any`
    boxing. Parity risk: low (lifetime discipline is the risk; the
    enumerate buffer must not outlive the entry).
-3. Cache `ffiSymbol` pointers; drop `sd_journal_get_realtime_usec` in
-   favour of the enumerated `__REALTIME_TIMESTAMP`; shrink the read
+3. Cache `ffiSymbol` pointers; keep `sd_journal_get_realtime_usec` (the
+   `__REALTIME_TIMESTAMP`-from-enumeration idea is retracted — see the
+   correction in the cgo section); shrink the read
    buffer to 64 KiB. Parity risk: low, but the realtime change touches
    entry semantics — needs the parity tests plus a review of the
    `TimestampFromRealtime` path.

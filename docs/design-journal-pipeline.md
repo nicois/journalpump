@@ -127,11 +127,13 @@ static int jp_read_batch(const jp_api* api, sd_journal* j,
   python-systemd `Reader` does not change it either — identical
   truncation behaviour).
 - `get_realtime_usec` stays (inside the loop it costs ~30 ns, no crossing).
-  Note: `perf-root-cause.md` claims `__REALTIME_TIMESTAMP` is among the
-  enumerated fields; libsystemd does **not** emit the `__`-prefixed address
-  fields from `enumerate_data` (they are synthesised by python-systemd and
-  `journalctl` from the entry header). The claim is unverified and moot
-  here.
+  Note: an earlier `perf-root-cause.md` draft claimed `__REALTIME_TIMESTAMP`
+  is among the enumerated fields; libsystemd does **not** emit the
+  `__`-prefixed address fields from `enumerate_data` (they are stored in
+  the entry object / synthesised by python-systemd and `journalctl` from the
+  entry header). The claim has since been retracted in `perf-root-cause.md`;
+  the `get_realtime_usec` call stays inside the C loop where it costs no
+  extra crossing.
 - `get_monotonic_usec` is not added (Go does not emit `__MONOTONIC_TIMESTAMP`
   today; the converter maps it to `null` anyway — unchanged behaviour).
 
