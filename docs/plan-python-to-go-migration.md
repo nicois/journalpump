@@ -1105,13 +1105,22 @@ the JSON body in `test_groundtruth_{file,kafka}.py` keeping raw comparison
 for framing/headers/partition/key/counts, `TestSerializeGolden` becomes
 the canary (`t.Logf` on byte diff, fail only on semantic diff), micro-benchmark
 rewired to `EmitJSON` plus a debug-heavy pruned-path variant (`*`/`INFO`
-config, `PRIORITY=7` entries — records the ~2.5-3 µs pruned figure;
+config, `PRIORITY=7` entries — records the Go-side pruned figure,
+measured 2026-10-13 at ~79 ns/op, 0 allocs for a 16-field entry;
 the committed bench fixture has no `unit_log_level`, so the pre-filter is
 inactive in the baseline and the main gate is measured without it),
 `make bench-baseline` re-recorded and `bench-check` re-armed; (g) cleanup
 — delete the adapter, old chain,
 `enumBufPool`; `-tags poison` build fills the batch buffer after each
 batch; `perf-root-cause.md` ledger closed.
+**Amended 2026-10-13 (coordinator ruling, option B):** the deletion is
+NOT performed — nothing on the converted path is provably dead. The
+converted chain stays as the differential-testing ORACLE, the `ReadBatch`
+adapter + `entryFromRaw` stay as a TEST SEAM (the pump prefers
+`readSingleRaw`), and `enumBufPool`/`enumerateData`/`materialize`/
+`readNext` stay LIVE for positioning (`applyInitial`/`Seek`); all three
+are marked in code. Rewiring the positioning paths onto `ReadRaw` and the
+`-tags poison` guard are recorded follow-ups. See design §5.2 step 7.
 Gates (all must hold before (g) closes the task):
 - **Bench performance gate** (Task 31 harness, same host and fixture as
   the committed baseline, COMPATIBLE comparison): Go CPU/entry serial

@@ -356,7 +356,7 @@ a decision on scope from the user; **no optimisation has been made.**
 ## Task 32 outcome — ledger closed (2026-10-13)
 
 The streaming-pipeline rewrite (design `docs/design-journal-pipeline.md`,
-plan Task 32) takes the **Option B** path: the handler now consumes raw
+plan Task 32) takes the streaming path: the handler now consumes raw
 batch entries and emits JSON straight from the field byte views, with no
 `[]Field`, no per-entry maps and no JSON re-parse on the cache-hit path.
 
@@ -381,12 +381,24 @@ fewer allocations, short of the ~4-alloc target because the emitter still
 allocates the payload per filter key (shared across senders) and the
 cache map.
 
-Still open, deliberately: the §2.6 in-process severity pre-filter (design
-§2.6.1) is specified but not implemented, so the debug-heavy pruned-path
-micro-benchmark variant is not recorded; and the old converted
-reader/handler chain is retained as the semantic-equivalence oracle
-rather than deleted (design §5.2 step 2 keeps it as the oracle; step 7's
-"delete the old chain" is in tension with that and needs a scope ruling).
+The §2.6 in-process severity pre-filter (design §2.6.1) is implemented
+in `internal/journal/prefilter.go`, built once per reader from its sender
+targets and consulted in `ProcessRaw` after the searches/match/secret
+gates. The debug-heavy pruned-path micro-benchmark is recorded
+(`transform_bench_test.go`, `*`/INFO config, `PRIORITY=7`, 16-field
+fixture): a pruned entry costs ~79 ns/op, 0 allocs/op on the Go side
+(tier-A byte scan ~78 ns/op, 0 allocs/op) versus full emission — the
+whole-run saving is the ~2.5-3 µs/entry of un-run emission (design
+§2.6.3). The pre-filter is inactive in this baseline config (no
+`unit_log_level`), so the committed numbers above are unaffected.
+
+Step 7 cleanup was ruled **option B** (coordinator, 2026-10-13): the old
+converted reader/handler chain is retained as the semantic-equivalence
+oracle (nothing on it is provably dead), the `ReadBatch` adapter as a
+test seam, and `enumBufPool`/`enumerateData`/`materialize`/`readNext` as
+live positioning code; each is marked in code. Rewiring the positioning
+paths onto `ReadRaw`, the `-tags poison` batch-buffer guard, and any
+further deletion are recorded follow-ups, not part of Task 32.
 
 ## Reproduction
 

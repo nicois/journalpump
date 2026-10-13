@@ -476,6 +476,22 @@ separate debug-heavy micro-benchmark (`transform_bench_test.go` variant
 with a `*`/`INFO` config and `PRIORITY=7` entries) records the pruned-path
 figure so the saving is measured, not asserted.
 
+**Measured 2026-10-13** (Intel Core Ultra 7 255H, `-benchtime=1s
+-count=5`, the 16-field `benchRawFields` fixture with `PRIORITY=7` and
+`_SYSTEMD_UNIT=bench-c.service`):
+
+| benchmark | ns/op (median) | allocs/op |
+|---|---|---|
+| `BenchmarkSeverityPrefilterScan` (tier-A byte scan only) | ~78 ns | 0 |
+| `BenchmarkSeverityPrefilterPruned` (gates + scan, pruned `ProcessRaw`) | ~79 ns | 0 |
+
+Both scan the whole 16-field index, so the ~20-50 ns estimate was
+optimistic for a wide entry (typical entries carry fewer fields), and a
+pruned entry allocates nothing. A pruned entry still pays the libsystemd
+read and index build (~2.4 µs) outside this Go-side micro-benchmark —
+that is why the whole-run saving is the ~2.5-3 µs per pruned entry of the
+table above, not the ~80 ns measured here.
+
 #### 2.6.4 Interaction with rulings 1 and 2
 
 - **Ruling 1.** The floor and every tier-B decision use the **effective**
@@ -506,20 +522,27 @@ reader for the **complement** (records missing either field). The
 question is whether the complement is expressible as a journald match
 at all. It is not, and the Match API was probed empirically to show it.
 
-Empirical result (`sd_journal_add_match` via the FFI's dlopen
-`libsystemd.so.0`, libsystemd 0.41.0, against the systest fixtures; two
-fixtures used, `rotated_logs` where all 40 records have `PRIORITY=6`, and
-`bad_msg` where 10 of 20 records carry `PRIORITY=6` and the other 10
-carry **no** `PRIORITY` at all):
+Empirical result (`sd_journal_add_match` via the FFI's dlopen of
+`libsystemd.so.0`, systemd 258.11 on Fedora 43, against the systest
+fixtures; two fixtures used, `rotated_logs` = 40 records **all** with
+`PRIORITY=6` and no unit, and `bad_msg` = 20 records of which 10 carry
+`PRIORITY=6` and the other 10 carry **no** `PRIORITY` at all):
 
 | match data | rc | matching entries |
 |---|---|---|
+| (no match) | — | 40 / 20 (fixture totals) |
 | `PRIORITY=6` | 0 | 40 / 10 (the records that have it) |
 | `PRIORITY=` (empty value) | 0 | **0** — literal empty value, **not** "present" |
 | `PRIORITY` (field only, no `=`) | **-EINVAL** | rejected |
 | `PRIORITY=*` (wildcard) | 0 | 0 — `*` has no wildcard meaning, matched literally |
 | `PRIORITY!=6` (negation) | **-EINVAL** | rejected |
+| `PRIORITY=0006` (non-canonical) | 0 | 0 — byte-exact, so `0006` ≠ `6` |
+| `SYSTEMD_UNIT` (field only) | **-EINVAL** | rejected |
+| `SYSTEMD_UNIT=*` (wildcard) | 0 | 0 — no wildcard, and no record has the field |
 | `NULL` data / empty string | **-EINVAL** | rejected |
+
+Re-probed 2026-10-13 (Task 32 step 7); the numbers reproduce the table
+above exactly.
 
 So there is **no existence match, no wildcard, no negation, and no
 "field absent" predicate**. The only expressible predicate is
@@ -769,9 +792,26 @@ Carried into the plan as Task 32 sub-steps (a)–(g).
    `make bench-baseline` re-recorded; `bench-check` tripwire re-armed at
    the new baseline; micro-benchmark rewired to `EmitJSON`, plus the
    debug-heavy pruned-path variant (§2.6.3).
-7. **cleanup.** Delete the adapter, old chain, `enumBufPool`; update
-   `perf-root-cause.md` ledger; NEWS entry for ruling 3 only (rulings 1
-   and 2 and the §2.6 pre-filter are behaviour-preserving and get none).
+7. **cleanup — AMENDED 2026-10-13 (coordinator ruling, option B).**
+   Original text ("delete the adapter, old chain, `enumBufPool`") is
+   narrowed: nothing on the converted path is provably dead, so the
+   deletion is **not** performed. Differential testing against the
+   converted chain is kept (it is worth keeping), so:
+   - the converted pipeline (`Process`, ConvertEntry/ProcessEntry/
+     Serialize, `getOrGenerateJSON`, `filterByLogLevel`, `fieldMap`) stays
+     as the semantic **oracle**, marked as such in `handler.go`;
+   - the `ReadBatch` adapter and `entryFromRaw` stay as a **test seam**
+     (the pump's `readSingleMessage` prefers `readSingleRaw`; the adapter
+     exists for the converted-entry fakes and `sdjournal_test.go`), marked
+     in `readraw.go`;
+   - `enumBufPool`/`enumerateData`/`materialize`/`readNext` stay: they are
+     still **live** for positioning (`applyInitial`/`Seek`), marked in
+     `ffi.go`/`sdjournal.go`. Rewiring the positioning paths onto `ReadRaw`
+     is a recorded possible follow-up, not part of Task 32.
+   Still required: update the `perf-root-cause.md` ledger; NEWS entry for
+   ruling 3 only (rulings 1 and 2 and the §2.6 pre-filter are
+   behaviour-preserving and get none). The `-tags poison` batch-buffer
+   guard remains a possible follow-up (not required to close the task).
 
 Order matters: 1 and 2 are independent and can be built in parallel; 4
 needs both; 6 before 7.
