@@ -466,6 +466,12 @@ func (h *ffiJournal) waitUsec(timeoutUsec uint64) (int, error) {
 // enumBufPool backs enumerateData: the C copy target (1 MiB, twice the
 // 64 KiB sd-journal data threshold, so the -EOVERFLOW path is dead in
 // practice).
+//
+// Still LIVE production code: enumerateData feeds materialize, which the
+// positioning path (sdjournal.go applyInitial/Seek, via readNext) uses to
+// land on the resume cursor and the tail. Task 32 step 7 (option B) left
+// it in place deliberately — rewiring those parity-sensitive positioning
+// paths onto ReadRaw is a possible follow-up, not part of this task.
 var enumBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 1<<20); return &b },
 }

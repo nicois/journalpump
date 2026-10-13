@@ -92,6 +92,11 @@ type HandlerConfig struct {
 	NoteSecretFilterMatch func()
 	// Log receives the too_long warning (Python log.warning).
 	Log HandlerLogger
+	// Prefilter is the §2.6 global severity pre-filter (design §2.6.1),
+	// built once per reader from its sender targets; nil disables pruning.
+	// It is consulted only by the raw path, after the searches/match/secret
+	// gates, and only short-circuits an all-dropped outcome.
+	Prefilter *SeverityPrefilter
 	// Now is the test seam for the fallback timestamp (Python
 	// datetime.now(UTC).replace(tzinfo=None)); nil = time.Now.
 	Now func() time.Time
@@ -161,6 +166,16 @@ func NewHandler(cfg HandlerConfig) *Handler {
 // A non-nil error corresponds to a Python exception escaping process()
 // (only the truncation-path UnicodeDecodeError can escape): the caller
 // routes it through the broad read_single_message handler.
+//
+// TEST ORACLE, not the live pipeline. The production reader
+// (*reader.SDJournal) implements rawReader, so the pump always takes
+// readSingleRaw/ProcessRaw; Process and the converted chain it drives
+// (ProcessEntry, ConvertEntry, Serialize, getOrGenerateJSON,
+// filterByLogLevel, fieldMap) are retained only as the differential
+// oracle for the raw path (see handler_raw_test.go and
+// emit_test.go's TestEmitJSONMatchesSerializeSemantically) — design §5.2
+// step 4 keeps them "because differential testing is worth keeping"
+// (Task 32 step-7 ruling, option B). Do NOT wire new callers here.
 func (h *Handler) Process(entry Entry, targets []SenderTarget) (hasMore bool, bytesRead int, hasBytes bool, err error) {
 	processed := ProcessEntry(entry.Fields)
 

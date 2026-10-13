@@ -61,6 +61,23 @@ func (u *UnitLogLevel) Name() string {
 	return u.name
 }
 
+// CatchAllLevel returns the severity level of the catch-all glob
+// (`service_glob` exactly "*"), if the config has one. A `*` glob makes
+// condition (iii) of Decide hold for every non-empty unit, so its level is
+// the most permissive threshold any entry must clear for this filter to
+// drop it; the caller of this accessor (the §2.6 tier-A floor, design
+// docs/design-journal-pipeline.md §2.6.1) takes the maximum across
+// senders. ok is false when there is no `*` glob (the filter can only
+// drop units matching a specific glob, so no unit-agnostic floor exists).
+func (u *UnitLogLevel) CatchAllLevel() (int64, bool) {
+	for i := range u.levels {
+		if u.levels[i].glob == "*" {
+			return u.levels[i].level, true
+		}
+	}
+	return 0, false
+}
+
 // Filter reports whether the entry passes the unit log level rules:
 // true keeps the entry as-is, false means the caller drops it (Python
 // returns {} for a dropped entry, which the caller renders as nothing).

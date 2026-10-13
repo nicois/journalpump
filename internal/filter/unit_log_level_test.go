@@ -40,6 +40,56 @@ func TestUnitLogLevelDecide(t *testing.T) {
 	}
 }
 
+// TestUnitLogLevelCatchAllLevel pins the §2.6 tier-A accessor: the level
+// of a `service_glob` of exactly "*", most-restrictive-wins across any
+// repeated `*` entries, and ok=false when the config has no catch-all glob.
+func TestUnitLogLevelCatchAllLevel(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		globs  []config.UnitLogLevelEntry
+		want   int64
+		wantOK bool
+	}{
+		{
+			name:   "no globs",
+			globs:  nil,
+			wantOK: false,
+		},
+		{
+			name:   "specific glob only",
+			globs:  []config.UnitLogLevelEntry{{ServiceGlob: "*.service", LogLevel: "INFO"}},
+			wantOK: false,
+		},
+		{
+			name:   "catch-all INFO",
+			globs:  []config.UnitLogLevelEntry{{ServiceGlob: "*", LogLevel: "INFO"}},
+			want:   6,
+			wantOK: true,
+		},
+		{
+			name: "specific globs plus catch-all",
+			globs: []config.UnitLogLevelEntry{
+				{ServiceGlob: "sshd.service", LogLevel: "ERROR"},
+				{ServiceGlob: "*", LogLevel: "WARNING"},
+			},
+			want:   4,
+			wantOK: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ull, err := filter.NewUnitLogLevel("test", tc.globs)
+			if err != nil {
+				t.Fatalf("NewUnitLogLevel: %v", err)
+			}
+			got, ok := ull.CatchAllLevel()
+			if ok != tc.wantOK || (ok && got != tc.want) {
+				t.Fatalf("CatchAllLevel = (%d, %v), want (%d, %v)", got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
 // TestUnitLogLevels ports test/test_journalpump.py:TestUnitLogLevels
 // (9 methods) plus the most-restrictive-wins quirk lock: an entry is
 // dropped when ANY matching glob is more restrictive, regardless of

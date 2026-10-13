@@ -51,14 +51,23 @@ type rawCacheEntry struct {
 // ProcessRaw is Process over a raw batch entry. Semantics are exactly
 // Process's; see handler.go for the pipeline contract.
 func (h *Handler) ProcessRaw(b *Batch, e *RawEntry, targets []SenderTarget) (hasMore bool, bytesRead int, hasBytes bool, err error) {
-	cursor := string(b.Cursor(e))
-	if cursor == "" {
+	if len(b.Cursor(e)) == 0 {
 		return false, 0, false, nil
 	}
 	msgOverride, keep := h.gateRaw(b, e)
 	if !keep {
 		return true, 0, false, nil
 	}
+	// §2.6 global severity pre-filter (design §2.6.1): after the
+	// searches/match/secret gates (whose counters must still see the
+	// entry) and before any emission — skip the entry when every sender
+	// would drop it. The result equals the all-dropped outcome below, and
+	// a pruned entry allocates nothing (the cursor string is built only
+	// once emission is known to happen).
+	if h.cfg.Prefilter.ShouldPrune(b, e) {
+		return true, 0, true, nil
+	}
+	cursor := string(b.Cursor(e))
 	cache, err := h.emitRaw(b, e, targets, cursor, msgOverride)
 	if err != nil {
 		return false, 0, false, err

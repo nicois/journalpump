@@ -494,6 +494,11 @@ type ReaderRuntime struct {
 	senderOrder []string
 	buffers     []*buffer.SenderBuffer
 	gate        *buffer.Gate
+	// prefilter is the §2.6 global severity pre-filter, built from the
+	// live sender targets on the first pipeline call and rebuilt after any
+	// sender (re)initialization (initSenders resets prefilterBuilt).
+	prefilter      *journal.SeverityPrefilter
+	prefilterBuilt bool
 
 	// reopener is the ensure/invalidate seam (*reader.Reopener or a
 	// test fake); openFlags and initialPosition feed its OpenConfig.
@@ -863,6 +868,9 @@ func isFalsyAny(v any) bool {
 func (rt *ReaderRuntime) initSenders() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	// A later open may start a sender that failed earlier, changing the
+	// target set; rebuild the §2.6 pre-filter on the next pipeline call.
+	rt.prefilterBuilt = false
 	for _, resolved := range rt.resolved {
 		if _, done := rt.initialised[resolved.name]; done {
 			continue
@@ -1303,6 +1311,14 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 			},
 		})
 	}
+	// Build the §2.6 pre-filter once from the sender targets (its inputs —
+	// the ordered unit_log_levels and extras — are construction-time); it
+	// is rebuilt if a later open starts a previously failed sender.
+	if !rt.prefilterBuilt {
+		rt.prefilter = journal.NewSeverityPrefilter(targets)
+		rt.prefilterBuilt = true
+	}
+	prefilter := rt.prefilter
 	rt.mu.Unlock()
 
 	handler := journal.NewHandler(journal.HandlerConfig{
@@ -1320,6 +1336,8 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 		NoteSecretFilterMatch: func() { rt.secretFilterMatches++ },
 		// Python logging.getLogger(self.__class__.__name__) == "JournalObjectHandler".
 		Log: namedLogger(rt.pump.log, "JournalObjectHandler"),
+		// §2.6 global severity pre-filter over the reader's senders.
+		Prefilter: prefilter,
 	})
 	return &enqueueErr, targets, handler
 }

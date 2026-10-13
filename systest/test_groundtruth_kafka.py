@@ -65,7 +65,7 @@ import subprocess
 import time
 
 from kafka import KafkaConsumer
-from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.admin import KafkaAdminClient
 
 _FIXTURE_NAME = "kafka"
 _BROKER_ENV = "JOURNALPUMP_KAFKA_BROKER"

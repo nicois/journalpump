@@ -288,6 +288,50 @@ func BenchmarkEmitJSON(b *testing.B) {
 	_ = dst
 }
 
+// BenchmarkSeverityPrefilterPruned measures the §2.6 pruned path over the
+// same fixture (which carries _SYSTEMD_UNIT=bench-c.service and
+// PRIORITY=7): a `*`/INFO sender config, the debug-heavy shape, so every
+// entry is pruned before emission. This is the per-entry cost of the
+// entry-level gates plus the tier-A byte scan — the "pruned figure" of
+// design §2.6.3 — with no EmitJSON, payload or sender work.
+func BenchmarkSeverityPrefilterPruned(b *testing.B) {
+	batch := benchBatch()
+	entry := &batch.Entries[0]
+	targets := []SenderTarget{{Name: "s", UnitLogLevels: unitLevel(b, "l", "*:INFO")}}
+	pre := NewSeverityPrefilter(targets)
+	if pre == nil {
+		b.Fatal("pre-filter disabled for a */INFO config")
+	}
+	if !pre.ShouldPrune(batch, entry) {
+		b.Fatal("fixture entry (PRIORITY=7) should be pruned")
+	}
+	handler := NewHandler(HandlerConfig{Prefilter: pre})
+	got := make([][]byte, len(targets))
+	collect := collectTargets(targets, &got)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, _, err := handler.ProcessRaw(batch, entry, collect); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSeverityPrefilterScan isolates the tier-A byte scan itself (no
+// gates, no emission) — the ~20-50 ns figure of design §2.6.1.
+func BenchmarkSeverityPrefilterScan(b *testing.B) {
+	batch := benchBatch()
+	entry := &batch.Entries[0]
+	pre := NewSeverityPrefilter([]SenderTarget{{Name: "s", UnitLogLevels: unitLevel(b, "l", "*:INFO")}})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !pre.ShouldPrune(batch, entry) {
+			b.Fatal("expected prune")
+		}
+	}
+}
+
 // BenchmarkEmitJSONWithSender adds a field filter and a few extras, the
 // realistic per-sender shape.
 func BenchmarkEmitJSONWithSender(b *testing.B) {

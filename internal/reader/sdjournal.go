@@ -419,6 +419,12 @@ func (s *SDJournal) Close() error {
 // one entry, materialize its fields, enrich with __REALTIME_TIMESTAMP
 // and __SEQNUM, convert. ok is false at the end of the journal or when
 // the entry has no fields (Python's falsy-entry skip).
+//
+// The per-entry read loop no longer uses this (the pump runs ReadRaw →
+// ProcessRaw); it remains LIVE for positioning — applyInitial's
+// resume-skip and tail landing — and as the converted oracle. Task 32
+// step 7 (option B) keeps it: moving the positioning paths onto ReadRaw
+// is a possible follow-up.
 func (s *SDJournal) readNext() (journal.Entry, bool, error) {
 	rc, err := s.h.next()
 	if err != nil {
@@ -470,7 +476,8 @@ var errFieldWithoutEquals = errors.New("journal gave us a field without '='")
 
 // materialize ports python-systemd's _get_all: enumerate the current
 // entry's data tuples in order; repeated fields collapse into a value
-// list, first occurrences stay scalar bytes. Field keys are ASCII.
+// list, first occurrences stay scalar bytes. Field keys are ASCII. Used
+// by readNext (positioning + oracle); see its note.
 func (s *SDJournal) materialize() ([]journal.Field, error) {
 	var fields []journal.Field
 	for {

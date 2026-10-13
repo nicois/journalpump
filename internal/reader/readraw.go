@@ -69,6 +69,13 @@ func (s *SDJournal) ReadRaw(limit int) (*journal.Batch, error) {
 // ReadBatch implements Reader.ReadBatch as an adapter over ReadRaw: the
 // converted journal.Entry view is what the run loop consumed before the
 // raw path existed, so every existing reader test keeps its meaning.
+//
+// TEST SEAM, not a production read path: the pump's readSingleMessage
+// prefers readSingleRaw whenever the reader implements rawReader
+// (*SDJournal does), so production never reaches this. It is kept (Task
+// 32 step-7 ruling, option B) because the converted-entry fakes and
+// sdjournal_test.go still exercise it, and rewiring them onto the raw
+// Batch is riskier than keeping the thin adapter.
 func (s *SDJournal) ReadBatch(n int) ([]journal.Entry, error) {
 	batch, err := s.ReadRaw(n)
 	out := make([]journal.Entry, 0, n)
@@ -90,6 +97,7 @@ func (s *SDJournal) ReadBatch(n int) ([]journal.Entry, error) {
 // the fields with their duplicate-key lists, the __REALTIME_TIMESTAMP /
 // __SEQNUM enrichment and ConvertEntry — byte-for-byte what readNext
 // produced. ok is false for a field-less entry (Python's falsy skip).
+// Part of the ReadBatch TEST SEAM above; not on the production path.
 func (s *SDJournal) entryFromRaw(batch *journal.Batch, e *journal.RawEntry) (journal.Entry, bool) {
 	if len(e.Fields) == 0 {
 		return journal.Entry{}, false
