@@ -126,19 +126,55 @@ def save_fixture(name: str, data: dict[str, Any]) -> None:
     fixture_path(name).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _reject_constant(token: str) -> Any:
+    """parse_constant hook: reject the non-standard NaN/Infinity tokens."""
+    raise ValueError(f"non-standard JSON constant {token!r}")
+
+
+def _json_values_equal(a: Any, b: Any) -> bool:
+    """Type-aware structural equality for parsed JSON values.
+
+    Python's ``==`` treats ``True == 1`` and ``False == 0``, so a payload
+    carrying a boolean would compare equal to one carrying the integer —
+    a real emitter divergence. Booleans therefore compare only with
+    booleans, ``None`` only with ``None``, and strings only with strings.
+    Numbers compare numerically (Python's int/float comparison is exact,
+    so no large-integer precision is lost).
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_json_values_equal(a[key], b[key]) for key in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_json_values_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, str) or isinstance(b, str):
+        return isinstance(a, str) and isinstance(b, str) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    return type(a) is type(b) and a == b
+
+
 def semantic_equal(a: bytes | str, b: bytes | str) -> bool:
     """Compare two JSON payloads by their parsed data, not their bytes.
 
     Task 32 charter amendment: serialization is "semantically-equivalent,
     byte-identical where free". Key order and free numeric/whitespace
     formatting may differ between the Python ground truth and the Go
-    emitter; the parsed values must not. Non-JSON input falls back to a
-    byte comparison (framing/header bytes are compared raw elsewhere).
+    emitter; the parsed values must not. Comparison is type-aware (bool is
+    not a number — Task 32 review item 13). Input that is not strict JSON
+    (including NaN/Infinity, which json.loads otherwise accepts) falls back
+    to a byte comparison, so framing/header bytes compare raw.
     """
     try:
-        return json.loads(a) == json.loads(b)
+        va = json.loads(a, parse_constant=_reject_constant)
+        vb = json.loads(b, parse_constant=_reject_constant)
     except (ValueError, TypeError):
         return a == b
+    return _json_values_equal(va, vb)
 
 
 def build_shim(directory: Path, extra_shim: str = "") -> Path:
