@@ -6,6 +6,8 @@
 package reader
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Aiven-Open/journalpump/internal/journal"
@@ -83,6 +85,116 @@ func TestReadRawGrowsForOversizedEntry(t *testing.T) {
 	}
 	if len(r.rawBuf) <= 8 {
 		t.Fatalf("buffer did not grow: %d bytes", len(r.rawBuf))
+	}
+}
+
+// TestReadRawEnumerationErrorConsumesEntry is item 10's regression: a
+// libsystemd enumerate_data failure must surface the error WITHOUT
+// rewinding onto the corrupt entry, so the next read reaches the
+// following entry instead of retrying the bad one forever.
+func TestReadRawEnumerationErrorConsumesEntry(t *testing.T) {
+	r := openFixture(t, "rotated_logs", nil)
+	enableBatchAPIFault(batchFaultEnumerate, 0)
+	defer enableBatchAPIFault(0, 0)
+
+	batch, err := r.ReadRaw(1)
+	if err == nil {
+		t.Fatal("want the injected enumerate failure")
+	}
+	if len(batch.Entries) != 0 {
+		t.Fatalf("rejected entry delivered %d payloads", len(batch.Entries))
+	}
+
+	// The rejected entry is consumed; the next read advances past it.
+	enableBatchAPIFault(0, 0)
+	batch, err = r.ReadRaw(1)
+	if err != nil {
+		t.Fatalf("follow-up ReadRaw: %v", err)
+	}
+	if len(batch.Entries) != 1 {
+		t.Fatalf("follow-up: %d entries, want 1", len(batch.Entries))
+	}
+	if msg, _ := rawFieldValue(t, batch, &batch.Entries[0], "MESSAGE"); msg != "Message 1" {
+		t.Fatalf("follow-up MESSAGE = %q, want %q (entry 0 was not consumed)", msg, "Message 1")
+	}
+}
+
+// TestReadRawMetadataFailurePropagates is item 9's regression: a failing
+// get_realtime/get_cursor return code must be propagated (never a bogus
+// epoch-timestamp or empty-cursor entry) while the entries completed
+// before the failure are preserved and the failing entry is consumed.
+func TestReadRawMetadataFailurePropagates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bit  int
+	}{
+		{"realtime", batchFaultRealtime},
+		{"cursor", batchFaultCursor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := openFixture(t, "rotated_logs", nil)
+			// Let two entries through, then fail the third entry's metadata.
+			enableBatchAPIFault(tc.bit, 2)
+			defer enableBatchAPIFault(0, 0)
+
+			batch, err := r.ReadRaw(5)
+			if err == nil {
+				t.Fatal("want the injected metadata failure")
+			}
+			if got := len(batch.Entries); got != 2 {
+				t.Fatalf("completed entries = %d, want 2", got)
+			}
+			for i := range batch.Entries {
+				want := fmt.Sprintf("Message %d", i)
+				if msg, _ := rawFieldValue(t, batch, &batch.Entries[i], "MESSAGE"); msg != want {
+					t.Fatalf("entry %d MESSAGE = %q, want %q", i, msg, want)
+				}
+			}
+			// The failed entry (index 2) is consumed: the next read starts
+			// at entry 3.
+			enableBatchAPIFault(0, 0)
+			batch, err = r.ReadRaw(1)
+			if err != nil {
+				t.Fatalf("follow-up ReadRaw: %v", err)
+			}
+			if len(batch.Entries) != 1 {
+				t.Fatalf("follow-up: %d entries, want 1", len(batch.Entries))
+			}
+			if msg, _ := rawFieldValue(t, batch, &batch.Entries[0], "MESSAGE"); msg != "Message 3" {
+				t.Fatalf("follow-up MESSAGE = %q, want %q (failed entry not consumed)", msg, "Message 3")
+			}
+		})
+	}
+}
+
+// TestReadRawOversizedEntryIsConsumed is item 10's other half: an entry
+// too large for the cap must be rejected once and CONSUMED, not retried
+// forever while the position stays before it.
+func TestReadRawOversizedEntryIsConsumed(t *testing.T) {
+	oldCap := maxRawBatchBuffer
+	maxRawBatchBuffer = 16
+	defer func() { maxRawBatchBuffer = oldCap }()
+
+	r := openFixture(t, "rotated_logs", nil)
+	r.rawBuf = make([]byte, 8) // too small for any entry
+
+	if _, err := r.ReadRaw(1); !errors.Is(err, ErrBadMessage) {
+		t.Fatalf("oversized entry: err = %v, want ErrBadMessage", err)
+	}
+
+	// The oversized first entry is consumed; with a normal buffer the next
+	// read reaches the second entry.
+	maxRawBatchBuffer = oldCap
+	r.rawBuf = nil
+	batch, err := r.ReadRaw(1)
+	if err != nil {
+		t.Fatalf("follow-up ReadRaw: %v", err)
+	}
+	if len(batch.Entries) != 1 {
+		t.Fatalf("follow-up: %d entries, want 1", len(batch.Entries))
+	}
+	if msg, _ := rawFieldValue(t, batch, &batch.Entries[0], "MESSAGE"); msg != "Message 1" {
+		t.Fatalf("follow-up MESSAGE = %q, want %q (oversized entry not consumed)", msg, "Message 1")
 	}
 }
 

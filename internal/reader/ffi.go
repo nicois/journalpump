@@ -148,6 +148,60 @@ static void jp_put_u16(uint8_t* p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)
 static void jp_put_u32(uint8_t* p, uint32_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
 static void jp_put_u64(uint8_t* p, uint64_t v) { for (int i=0;i<8;i++) { p[i]=(uint8_t)(v>>(8*i)); } }
 
+// Batch-loop fault injection (test seam; the production path uses the
+// real table directly and these globals stay zero).
+//
+// jp_read_batch's error arms — a failing get_realtime, get_cursor or
+// enumerate_data, a buffer overflow — are not reachable from a well-formed
+// journal fixture, so the sd-journal ABI alone gives the tests no way to
+// exercise them. jp_api_init_fault copies the resolved table and replaces
+// the three faultable entries with shims that consult two globals:
+// jp_fault_bits names the call to fail (bit 2 enumerate_data, 4
+// get_realtime, 8 get_cursor) and jp_fault_skip lets that many calls
+// through first, so a test can fail the Nth call. A fired bit is cleared
+// (single shot) so the retry succeeds.
+enum {
+	JP_FAULT_ENUMERATE = 2,
+	JP_FAULT_REALTIME  = 4,
+	JP_FAULT_CURSOR    = 8,
+};
+
+static int                jp_fault_bits = 0;
+static int                jp_fault_skip = 0;
+static fn_enumerate_data  jp_real_enumerate;
+static fn_get_realtime    jp_real_realtime;
+static fn_get_cursor      jp_real_cursor;
+
+static int jp_fault_take(int bit) {
+	if (!(jp_fault_bits & bit)) { return 0; }
+	if (jp_fault_skip > 0) { jp_fault_skip--; return 0; }
+	jp_fault_bits &= ~bit; // single shot: the retry must succeed
+	return 1;
+}
+static int jp_shim_enumerate(sd_journal* j, const void** p, size_t* l) {
+	if (jp_fault_take(JP_FAULT_ENUMERATE)) { return -74; } // -EBADMSG
+	return jp_real_enumerate(j, p, l);
+}
+static int jp_shim_realtime(sd_journal* j, uint64_t* o) {
+	if (jp_fault_take(JP_FAULT_REALTIME)) { return -5; } // -EIO
+	return jp_real_realtime(j, o);
+}
+static int jp_shim_cursor(sd_journal* j, char** o) {
+	if (jp_fault_take(JP_FAULT_CURSOR)) { return -5; }
+	return jp_real_cursor(j, o);
+}
+
+static void jp_api_init_fault(jp_api* a, const jp_api* real) {
+	*a = *real;
+	jp_real_enumerate = real->enumerate_data;
+	jp_real_realtime = real->get_realtime;
+	jp_real_cursor = real->get_cursor;
+	a->enumerate_data = jp_shim_enumerate;
+	a->get_realtime = jp_shim_realtime;
+	a->get_cursor = jp_shim_cursor;
+}
+static void jp_set_fault(int bits, int skip) { jp_fault_bits = bits; jp_fault_skip = skip; }
+
 // jp_read_batch reads up to max_entries entries, each atomic, into buf.
 // It returns the number of entry records written; *used is the bytes
 // written; *status is 0 (buffer full or max_entries reached), 1 (end of
@@ -158,12 +212,17 @@ static void jp_put_u64(uint8_t* p, uint64_t v) { for (int i=0;i<8;i++) { p[i]=(u
 //   u16 cursor_len, cursor bytes
 //   u32 nfields, then per field: u32 len, bytes (KEY=value)
 //
-// On a buffer overflow mid-entry the bytes of that entry are discarded and
-// the position is rewound with sd_journal_seek_cursor to just BEFORE the
-// entry (the cursor is read up front and kept for this), so a retry with a
-// larger buffer re-reads it. A mid-entry libsystemd error keeps the
-// fully-written entries, rewinds the partial one and leaves the position
-// before the failing entry.
+// Every failure keeps the entries already written; the partial entry is
+// always discarded. The recovery rule depends on the failure class:
+//
+//   * a BUFFER OVERFLOW (prologue or mid-entry) is recoverable: the
+//     position is rewound with sd_journal_seek_cursor to just BEFORE the
+//     entry (the cursor is read up front and kept for this) and *status
+//     stays 0, so the caller grows the buffer and re-reads the entry;
+//   * a LIBSYSTEMD FAILURE (next, get_realtime, get_cursor,
+//     enumerate_data) is not: its -errno is returned WITHOUT rewinding,
+//     leaving the failed entry CONSUMED so the next read reaches the
+//     following entry instead of retrying it forever.
 static int jp_read_batch(const jp_api* api, sd_journal* j, uint8_t* buf, size_t buflen,
                          int max_entries, size_t* used_out, int* status) {
 	size_t used = 0;
@@ -175,9 +234,11 @@ static int jp_read_batch(const jp_api* api, sd_journal* j, uint8_t* buf, size_t 
 		if (rc < 0) { *status = rc; break; }
 		size_t entry_start = used;
 		uint64_t rt = 0;
-		api->get_realtime(j, &rt); // a failure leaves rt zero, as today's zero-value would
+		rc = api->get_realtime(j, &rt);
+		if (rc < 0) { *status = rc; break; }
 		char* cursor = NULL;
-		api->get_cursor(j, &cursor);
+		rc = api->get_cursor(j, &cursor);
+		if (rc < 0) { *status = rc; break; }
 		size_t clen = cursor ? strlen(cursor) : 0;
 		if (clen > 0xffff) { clen = 0xffff; }
 		// Prologue: u64 realtime + u16 cursor_len + cursor + u32 nfields.
@@ -212,9 +273,16 @@ static int jp_read_batch(const jp_api* api, sd_journal* j, uint8_t* buf, size_t 
 			used += l;
 			nfields++;
 		}
-		if (failed) {
+		if (failed == 1) {
+			// Recoverable: rewind so a larger buffer re-reads the entry.
 			if (cursor) { api->seek_cursor(j, cursor); }
 			else { api->previous(j); }
+			free(cursor);
+			used = entry_start;
+			break;
+		}
+		if (failed == 2) {
+			// Non-recoverable: leave the entry consumed (no rewind).
 			free(cursor);
 			used = entry_start;
 			break;
@@ -234,6 +302,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -548,15 +617,21 @@ var batchAPINames = [...]string{
 }
 
 var (
-	batchAPIOnce sync.Once
-	batchAPIPtr  unsafe.Pointer
-	batchAPIErr  error
+	batchAPIOnce     sync.Once
+	batchAPIPtr      unsafe.Pointer // the real resolved table
+	batchAPIFaultPtr unsafe.Pointer // the fault-shim table (test seam)
+	batchAPIErr      error
+	batchAPIFault    atomic.Bool
 )
 
 // resolvedBatchAPI resolves the batch-loop symbols once and fills the C
 // side table, deleting the per-call ffiSymbol map+mutex lookup the read
 // loop used to pay for every field. The table lives in C memory so that
 // passing it to the C loop never hands cgo a Go pointer to Go pointers.
+//
+// A second table wrapping the same function pointers with the fault shims
+// is built alongside it (see jp_api_init_fault); readBatchRaw selects it
+// only while a test has armed enableBatchAPIFault.
 func resolvedBatchAPI() (*C.jp_api, error) {
 	batchAPIOnce.Do(func() {
 		var ptrs [7]unsafe.Pointer
@@ -575,11 +650,40 @@ func resolvedBatchAPI() (*C.jp_api, error) {
 		}
 		C.jp_api_init((*C.jp_api)(ptr), ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6])
 		batchAPIPtr = ptr
+		fptr := C.malloc(C.size_t(unsafe.Sizeof(C.jp_api{})))
+		if fptr == nil {
+			batchAPIErr = errors.New("cannot allocate the batch API fault table")
+			return
+		}
+		C.jp_api_init_fault((*C.jp_api)(fptr), (*C.jp_api)(ptr))
+		batchAPIFaultPtr = fptr
 	})
 	if batchAPIErr != nil {
 		return nil, batchAPIErr
 	}
 	return (*C.jp_api)(batchAPIPtr), nil
+}
+
+// Fault bits for enableBatchAPIFault, mirroring the C shims in the
+// preamble above.
+const (
+	batchFaultEnumerate = 2
+	batchFaultRealtime  = 4
+	batchFaultCursor    = 8
+)
+
+// enableBatchAPIFault arms the batch-loop fault shims: each function
+// selected by bits (batchFaultEnumerate/Realtime/Cursor) fails its
+// skip-th subsequent call with a synthetic errno, exercising
+// jp_read_batch's error arms from a well-formed fixture. bits == 0 clears
+// it. Test seam: production never calls it, so batchAPIFault stays false
+// and readBatchRaw uses the real table.
+func enableBatchAPIFault(bits, skip int) {
+	if _, err := resolvedBatchAPI(); err != nil {
+		return
+	}
+	C.jp_set_fault(C.int(bits), C.int(skip))
+	batchAPIFault.Store(bits != 0)
 }
 
 // readBatchRaw runs one jp_read_batch call, returning the entry count, the
@@ -589,6 +693,9 @@ func (h *ffiJournal) readBatchRaw(buf []byte, limit int) (count, used, status in
 	api, err := resolvedBatchAPI()
 	if err != nil {
 		return 0, 0, 0, err
+	}
+	if batchAPIFault.Load() {
+		api = (*C.jp_api)(batchAPIFaultPtr)
 	}
 	var cused C.size_t
 	var cstatus C.int

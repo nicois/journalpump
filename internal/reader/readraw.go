@@ -9,13 +9,21 @@ import (
 	"github.com/Aiven-Open/journalpump/internal/journal"
 )
 
+// maxRawBatchBuffer caps the grow-and-retry doubling in ReadRaw. An entry
+// that cannot fit even here is rejected as ErrBadMessage; the reader then
+// CONSUMES it (see ReadRaw) so the pump reaches the entries after it.
+// Package variable so tests can exercise the cap without a multi-megabyte
+// fixture.
+var maxRawBatchBuffer = 8 * 1024 * 1024
+
 // ReadRaw reads up to limit entries as one raw batch (one cgo crossing plus
 // the parse), reusing the reader's buffer and index across calls. The
 // returned Batch's views are valid only until the next ReadRaw call.
 //
 // Errors mirror ReadBatch: entries read before a failure are returned
-// together with the error, and the journal position is left on the entry
-// that failed.
+// together with the error. A libsystemd failure leaves the failing entry
+// consumed, so the next read reaches the following entry; only a buffer
+// overflow (which the grow-and-retry loop can recover from) is retried.
 func (s *SDJournal) ReadRaw(limit int) (*journal.Batch, error) {
 	if limit <= 0 {
 		limit = 1
@@ -34,7 +42,14 @@ func (s *SDJournal) ReadRaw(limit int) (*journal.Batch, error) {
 		if count == 0 && status == 0 {
 			// Not even one entry fit: grow and retry (the C loop stepped
 			// the position back onto it).
-			if len(s.rawBuf) >= 8*1024*1024 {
+			if len(s.rawBuf) >= maxRawBatchBuffer {
+				// The entry can never fit. The C loop rewound the position
+				// onto it; consume it so the next read reaches the entries
+				// after it instead of looping on the oversized record
+				// forever.
+				if _, advErr := s.h.next(); advErr != nil {
+					return nil, advErr
+				}
 				return nil, ErrBadMessage
 			}
 			s.rawBuf = make([]byte, len(s.rawBuf)*2)
