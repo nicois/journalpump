@@ -8,6 +8,7 @@ package journal
 import (
 	"bytes"
 	"strconv"
+	"time"
 
 	"github.com/Aiven-Open/journalpump/internal/filter"
 )
@@ -54,7 +55,7 @@ func (h *Handler) ProcessRaw(b *Batch, e *RawEntry, targets []SenderTarget) (has
 	if len(b.Cursor(e)) == 0 {
 		return false, 0, false, nil
 	}
-	msgOverride, keep := h.gateRaw(b, e)
+	msgOverride, overrideSet, keep := h.gateRaw(b, e)
 	if !keep {
 		return true, 0, false, nil
 	}
@@ -68,7 +69,7 @@ func (h *Handler) ProcessRaw(b *Batch, e *RawEntry, targets []SenderTarget) (has
 		return true, 0, true, nil
 	}
 	cursor := string(b.Cursor(e))
-	cache, err := h.emitRaw(b, e, targets, cursor, msgOverride)
+	cache, err := h.emitRaw(b, e, targets, cursor, msgOverride, overrideSet)
 	if err != nil {
 		return false, 0, false, err
 	}
@@ -86,47 +87,48 @@ func (h *Handler) ProcessRaw(b *Batch, e *RawEntry, targets []SenderTarget) (has
 
 // gateRaw runs the searches, the pump/reader match and the secret
 // redaction — the entry-level gates that run before any sender. keep is
-// false when the entry is dropped; otherwise msgOverride holds the
-// redacted MESSAGE bytes (nil when nothing changed).
-func (h *Handler) gateRaw(b *Batch, e *RawEntry) (msgOverride []byte, keep bool) {
+// false when the entry is dropped; otherwise overrideSet reports whether
+// the secret filter changed MESSAGE (in which case msgOverride holds the
+// redacted bytes, possibly EMPTY — Python writes data["MESSAGE"] = "").
+func (h *Handler) gateRaw(b *Batch, e *RawEntry) (msgOverride []byte, overrideSet, keep bool) {
 	if h.cfg.Searcher != nil && len(h.cfg.Searcher.Searches()) > 0 {
 		if !h.cfg.Searcher.MatchRawValues(func(field string) (string, bool) {
 			return rawSearchValue(b, e, field)
 		}) {
-			return nil, false
+			return nil, false, false
 		}
 	}
 	if !h.checkMatchRaw(b, e, h.cfg.PumpMatchKey, h.cfg.PumpMatchValue) {
-		return nil, false
+		return nil, false, false
 	}
 	if !h.checkMatchRaw(b, e, h.cfg.ReaderMatchKey, h.cfg.ReaderMatchValue) {
-		return nil, false
+		return nil, false, false
 	}
 	// Secret redaction mutates the shared entry before any sender runs, so
 	// the redacted MESSAGE applies to every sender (Python data["MESSAGE"]).
 	if len(h.cfg.SecretFilters) == 0 {
-		return nil, true
+		return nil, false, true
 	}
 	v, ok := rawGroupValue(b, e, "MESSAGE", processedRawValue)
 	if !ok {
-		return nil, true
+		return nil, false, true
 	}
 	text, ok := v.(string)
 	if !ok {
-		return nil, true
+		return nil, false, true
 	}
 	out, changed := filter.ApplySecretFiltersRaw([]byte(text), h.cfg.SecretFilters, nil)
 	if !changed {
-		return nil, true
+		return nil, false, true
 	}
 	if h.cfg.SecretFilterMetrics && h.cfg.NoteSecretFilterMatch != nil {
 		h.cfg.NoteSecretFilterMatch()
 	}
-	return append([]byte(nil), out...), true
+	return append([]byte(nil), out...), true, true
 }
 
 // emitRaw runs the per-sender loop, returning the per-filter-key cache.
-func (h *Handler) emitRaw(b *Batch, e *RawEntry, targets []SenderTarget, cursor string, msgOverride []byte) (map[string]rawCacheEntry, error) {
+func (h *Handler) emitRaw(b *Batch, e *RawEntry, targets []SenderTarget, cursor string, msgOverride []byte, overrideSet bool) (map[string]rawCacheEntry, error) {
 	cache := map[string]rawCacheEntry{}
 	var accFragments []ExtraFragment
 	var accFields []Field
@@ -143,7 +145,8 @@ func (h *Handler) emitRaw(b *Batch, e *RawEntry, targets []SenderTarget, cursor 
 			continue
 		}
 
-		effFragments := concatFragments(accFragments, targetExtraFragments(target))
+		ownFragments := targetExtraFragments(target)
+		effFragments := concatFragments(accFragments, ownFragments)
 		effFields := concatFields(accFields, target.ExtraFieldValues)
 
 		unit, priority := effectiveUnitPriority(b, e, effFields)
@@ -156,28 +159,49 @@ func (h *Handler) emitRaw(b *Batch, e *RawEntry, targets []SenderTarget, cursor 
 			continue
 		}
 
+		// Python reassigns data["timestamp"] on EVERY cache miss
+		// (journalpump.py:762-766), masking any earlier sender's timestamp
+		// extra; an earlier REALTIME_TIMESTAMP extra feeds this miss's
+		// computation. The sender's OWN timestamp extra is applied
+		// afterwards and wins the emission (see emitFragments below).
+		timestamp, err := h.effectiveTimestamp(e, accFields)
+		if err != nil {
+			return nil, err
+		}
+		tsISO := pythonISOFormat(timestamp)
+		emitFragments := maskEarlierTimestamps(effFragments, len(accFragments))
+
 		var indexDate [10]byte
 		payload, err := EmitJSON(nil, b, e, &EmitOptions{
-			Filter:          target.FieldFilter,
-			Extras:          effFragments,
-			MessageOverride: msgOverride,
-			IndexDate:       &indexDate,
+			Filter:             target.FieldFilter,
+			Extras:             emitFragments,
+			MessageOverride:    msgOverride,
+			MessageOverrideSet: overrideSet,
+			TimestampISO:       tsISO,
+			IndexDate:          &indexDate,
 		})
 		if err != nil {
 			return nil, err
 		}
+		keptPriority := target.FieldFilter == nil || target.FieldFilter.Keep("PRIORITY")
+		keptUnit := target.FieldFilter == nil || target.FieldFilter.Keep("SYSTEMD_UNIT")
 		if len(payload) > MaxKafkaMessageSize {
-			payload, err = h.truncateLongMessage(payload, rawEntryTimestamp(e))
+			payload, err = h.truncateLongMessage(payload, truncationTimestamp(target.FieldFilter, target.ExtraFieldValues, tsISO))
 			if err != nil {
 				return nil, err
 			}
+			// The truncation record {"error", "partial_data", "timestamp"}
+			// carries no PRIORITY/SYSTEMD_UNIT, so Python's cache-hit
+			// filter_by_level sees them absent and keeps the entry
+			// (journalpump.py:791-794).
+			keptPriority, keptUnit = false, false
 		}
 
 		cache[ffName] = rawCacheEntry{
 			payload:      payload,
 			empty:        len(payload) == 2,
-			keptPriority: target.FieldFilter == nil || target.FieldFilter.Keep("PRIORITY"),
-			keptUnit:     target.FieldFilter == nil || target.FieldFilter.Keep("SYSTEMD_UNIT"),
+			keptPriority: keptPriority,
+			keptUnit:     keptUnit,
 			unit:         unit,
 			priority:     priority,
 			indexDate:    indexDate,
@@ -397,12 +421,71 @@ func concatFields(a, b []Field) []Field {
 	return out
 }
 
-// rawEntryTimestamp is the truncation path's timestamp value, derived
-// from the raw realtime exactly like the synthesised timestamp field.
-func rawEntryTimestamp(e *RawEntry) any {
-	timestamp, err := TimestampFromRealtime(float64(e.Realtime) / 1e6)
-	if err != nil {
+// effectiveTimestamp is Python's data["timestamp"] for a cache miss
+// (journalpump.py:762-766): fromtimestamp(data["REALTIME_TIMESTAMP"]),
+// where the value is the entry's converted realtime unless an EARLIER
+// sender's extra (priorExtras) overrode it. The sender's own extras are
+// applied by Python AFTER this assignment, so they do not feed it.
+func (h *Handler) effectiveTimestamp(e *RawEntry, priorExtras []Field) (time.Time, error) {
+	var realtime any
+	found := false
+	for _, extra := range priorExtras {
+		if extra.Key == "REALTIME_TIMESTAMP" {
+			realtime = extra.Value
+			found = true
+		}
+	}
+	if found {
+		seconds, ok := realtime.(float64)
+		if !ok {
+			// Mirrors getOrGenerateJSON: a non-float REALTIME_TIMESTAMP
+			// override falls back to now() (Python would raise; the oracle
+			// keeps running).
+			return h.now(), nil
+		}
+		return TimestampFromRealtime(seconds)
+	}
+	return TimestampFromRealtime(float64(e.Realtime) / 1e6)
+}
+
+// maskEarlierTimestamps drops the "timestamp" fragments contributed by
+// EARLIER senders (the first priorCount entries) so the synth timestamp
+// (this miss's reassignment) wins; the sender's own timestamp extra is
+// kept and overrides it, exactly like Python's data["timestamp"] = ...
+// followed by data.update(own_extras).
+func maskEarlierTimestamps(fragments []ExtraFragment, priorCount int) []ExtraFragment {
+	mask := false
+	for i := 0; i < priorCount && i < len(fragments); i++ {
+		if fragments[i].Key == "timestamp" {
+			mask = true
+			break
+		}
+	}
+	if !mask {
+		return fragments
+	}
+	out := make([]ExtraFragment, 0, len(fragments))
+	for i := range fragments {
+		if i < priorCount && fragments[i].Key == "timestamp" {
+			continue
+		}
+		out = append(out, fragments[i])
+	}
+	return out
+}
+
+// truncationTimestamp is Python's _truncate_long_message timestamp
+// argument, data.get("timestamp") over the FIELD-FILTERED data: nil when
+// the filter drops the timestamp key, otherwise the sender's own
+// timestamp extra (the last one) or the synthesised ISO timestamp.
+func truncationTimestamp(ff *filter.FieldFilter, ownExtras []Field, tsISO string) any {
+	if ff != nil && !ff.Keep("timestamp") {
 		return nil
 	}
-	return timestamp
+	for i := len(ownExtras) - 1; i >= 0; i-- {
+		if ownExtras[i].Key == "timestamp" {
+			return ownExtras[i].Value
+		}
+	}
+	return tsISO
 }

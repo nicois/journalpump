@@ -6,12 +6,27 @@
 package journal
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Aiven-Open/journalpump/internal/config"
 	"github.com/Aiven-Open/journalpump/internal/filter"
 )
+
+func fieldFilter(name string) *filter.FieldFilter {
+	return filter.NewFieldFilter(name, config.FieldFilterConfig{Whitelist: false, Fields: []string{"_IRRELEVANT"}})
+}
+
+func parsePayload(t *testing.T, payload []byte) map[string]any {
+	t.Helper()
+	var parsed map[string]any
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		t.Fatalf("payload not JSON: %v (%s)", err, payload)
+	}
+	return parsed
+}
 
 // collectTargets gives each sender an AddItem that records its payload.
 func collectTargets(targets []SenderTarget, got *[][]byte) []SenderTarget {
@@ -196,6 +211,152 @@ func TestProcessRawUnitLevelCacheHitRuling2(t *testing.T) {
 	assertSamePayloads(t, raw, old)
 	if raw[1] == nil {
 		t.Error("sender b should pass on the cache hit (PRIORITY filtered out)")
+	}
+}
+
+// runBothSecret is runBoth with secret filters wired into both handlers;
+// it returns the raw-side secret-match count.
+func runBothSecret(t *testing.T, fields []string, targets []SenderTarget, filters []*filter.SecretFilter, metrics bool) (raw, old [][]byte, rawMatches int) {
+	t.Helper()
+	cursor := "s=x;i=1a2b;b=1;m=2;t=3;x=4"
+	b := buildBatch(t, 1700000000500000, cursor, fields...)
+	entry := &b.Entries[0]
+
+	rawGot := make([][]byte, len(targets))
+	rawHandler := NewHandler(HandlerConfig{
+		SecretFilters:         filters,
+		SecretFilterMetrics:   metrics,
+		NoteSecretFilterMatch: func() { rawMatches++ },
+	})
+	if _, _, _, err := rawHandler.ProcessRaw(b, entry, collectTargets(targets, &rawGot)); err != nil {
+		t.Fatalf("ProcessRaw: %v", err)
+	}
+
+	oldGot := make([][]byte, len(targets))
+	oldHandler := NewHandler(HandlerConfig{
+		SecretFilters:         filters,
+		SecretFilterMetrics:   metrics,
+		NoteSecretFilterMatch: func() {},
+	})
+	if _, _, _, err := oldHandler.Process(rawToEntry(t, b, entry), collectTargets(targets, &oldGot)); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	return rawGot, oldGot, rawMatches
+}
+
+// TestProcessRawExtrasLastWins locks item 2: overlapping extra keys
+// across distinct filter keys follow Python's successive data.update —
+// the LAST assignment wins the value, the FIRST insertion keeps the
+// position, and the key appears once.
+func TestProcessRawExtrasLastWins(t *testing.T) {
+	fields := []string{"MESSAGE=hello", "dup=raw"}
+	raw, old := runBoth(t, fields, []SenderTarget{
+		{Name: "a", FieldFilter: fieldFilter("f1"), ExtraFieldValues: []Field{{Key: "dup", Value: "a"}, {Key: "only_a", Value: "1"}}},
+		{Name: "b", FieldFilter: fieldFilter("f2"), ExtraFieldValues: []Field{{Key: "dup", Value: "b"}}},
+	})
+	assertSamePayloads(t, raw, old)
+	parsed := parsePayload(t, raw[1])
+	if parsed["dup"] != "b" {
+		t.Errorf("sender b dup = %#v, want \"b\" (last update wins)", parsed["dup"])
+	}
+	if parsed["only_a"] != "1" {
+		t.Errorf("sender b only_a = %#v, want \"1\" (contaminated)", parsed["only_a"])
+	}
+	if bytes.Count(raw[1], []byte(`"dup"`)) != 1 {
+		t.Errorf("sender b payload carries dup %d times: %s", bytes.Count(raw[1], []byte(`"dup"`)), raw[1])
+	}
+}
+
+// TestProcessRawTimestampResetAcrossMisses locks item 3: Python assigns
+// data["timestamp"] on EVERY cache miss, so an earlier sender's timestamp
+// extra is overwritten for a later miss, and an earlier REALTIME_TIMESTAMP
+// extra feeds the later miss's timestamp computation.
+func TestProcessRawTimestampResetAcrossMisses(t *testing.T) {
+	fields := []string{"MESSAGE=hello", "PRIORITY=6", "_SYSTEMD_UNIT=foo.service"}
+
+	t.Run("timestamp extra reset", func(t *testing.T) {
+		raw, old := runBoth(t, fields, []SenderTarget{
+			{Name: "a", FieldFilter: fieldFilter("f1"), ExtraFieldValues: []Field{{Key: "timestamp", Value: "1999-01-01T00:00:00"}}},
+			{Name: "b", FieldFilter: fieldFilter("f2")},
+		})
+		assertSamePayloads(t, raw, old)
+		if got := parsePayload(t, raw[0])["timestamp"]; got != "1999-01-01T00:00:00" {
+			t.Errorf("sender a timestamp = %#v, want its own extra", got)
+		}
+		got, _ := parsePayload(t, raw[1])["timestamp"].(string)
+		if strings.HasPrefix(got, "1999-") {
+			t.Errorf("sender b timestamp = %q, want the recomputed realtime timestamp", got)
+		}
+		if !strings.HasPrefix(got, "2023-11-14") {
+			t.Errorf("sender b timestamp = %q, want 2023-11-14T...", got)
+		}
+	})
+
+	t.Run("realtime override feeds later timestamp", func(t *testing.T) {
+		raw, old := runBoth(t, fields, []SenderTarget{
+			{Name: "a", FieldFilter: fieldFilter("g1"), ExtraFieldValues: []Field{{Key: "REALTIME_TIMESTAMP", Value: float64(0)}}},
+			{Name: "b", FieldFilter: fieldFilter("g2")},
+		})
+		assertSamePayloads(t, raw, old)
+		if got := parsePayload(t, raw[1])["REALTIME_TIMESTAMP"]; got != float64(0) {
+			t.Errorf("sender b REALTIME_TIMESTAMP = %#v, want 0", got)
+		}
+		got, _ := parsePayload(t, raw[1])["timestamp"].(string)
+		if !strings.HasPrefix(got, "1970-01-01") {
+			t.Errorf("sender b timestamp = %q, want 1970-01-01T... (from the overridden realtime)", got)
+		}
+	})
+}
+
+// TestProcessRawTruncationDecisionRecord locks item 4: a cache-hit sender
+// whose stricter unit level would drop the live entry must PASS on a
+// truncated payload, because Python parses the cached truncation record
+// (which carries no PRIORITY/SYSTEMD_UNIT).
+func TestProcessRawTruncationDecisionRecord(t *testing.T) {
+	big := strings.Repeat("x", MaxKafkaMessageSize+100)
+	fields := []string{"MESSAGE=" + big, "PRIORITY=7", "_SYSTEMD_UNIT=foo.service"}
+	keepAll := filter.NewFieldFilter("all", config.FieldFilterConfig{Whitelist: true, Fields: []string{"MESSAGE", "PRIORITY", "SYSTEMD_UNIT", "timestamp"}})
+	warnLevel, err := filter.NewUnitLogLevel("warn", []config.UnitLogLevelEntry{{ServiceGlob: "*.service", LogLevel: "WARNING"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, old := runBoth(t, fields, []SenderTarget{
+		{Name: "a", FieldFilter: keepAll},
+		{Name: "b", FieldFilter: keepAll, UnitLogLevels: warnLevel},
+	})
+	assertSamePayloads(t, raw, old)
+	if raw[1] == nil {
+		t.Error("sender b should pass on the truncated cache hit (no PRIORITY in the payload)")
+	}
+}
+
+// TestSecretFilterEmptyRedaction locks the cat-1 secret leak: a secret
+// filter that redacts the WHOLE MESSAGE to an empty string must emit
+// "MESSAGE": "" — never fall through to the unredacted original.
+func TestSecretFilterEmptyRedaction(t *testing.T) {
+	filters, warnings, err := filter.NewSecretFilters([]config.SecretFilterConfig{
+		{Pattern: `^.*$`, Replacement: ``},
+	})
+	if err != nil || len(warnings) != 0 {
+		t.Fatalf("NewSecretFilters: %v %v", err, warnings)
+	}
+	raw, old, note := runBothSecret(t, []string{"MESSAGE=top-secret", "PRIORITY=6"}, []SenderTarget{{Name: "a"}}, filters, true)
+	assertSamePayloads(t, raw, old)
+	if raw[0] == nil {
+		t.Fatal("raw payload is nil")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw[0], &parsed); err != nil {
+		t.Fatalf("payload not JSON: %v (%s)", err, raw[0])
+	}
+	if got, present := parsed["MESSAGE"]; !present || got != "" {
+		t.Fatalf("MESSAGE = %#v (present %v), want the empty redaction", got, present)
+	}
+	if bytes.Contains(raw[0], []byte("top-secret")) {
+		t.Fatalf("payload leaks the secret: %s", raw[0])
+	}
+	if note != 1 {
+		t.Fatalf("secret_filter_matches = %d, want 1", note)
 	}
 }
 

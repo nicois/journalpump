@@ -40,6 +40,16 @@ type EmitOptions struct {
 	// Extras still win over it, matching Python's data.update running
 	// after the redaction. When nil the MESSAGE field is emitted as-is.
 	MessageOverride []byte
+	// MessageOverrideSet reports that MessageOverride is present even when
+	// it is an EMPTY redaction (Python `data["MESSAGE"] = ""`), which
+	// len(MessageOverride)==0 cannot distinguish from "no override".
+	MessageOverrideSet bool
+	// TimestampISO, when non-empty, is the synthesised "timestamp" value
+	// (Python's data["timestamp"] after the per-miss reassignment and
+	// extra overrides). It is used only when no extra overrides the
+	// timestamp key; an empty value falls back to computing it from the
+	// raw realtime (the standalone EmitJSON callers' behaviour).
+	TimestampISO string
 	// IndexDate, when non-nil, receives the Elasticsearch index date
 	// (timestamp[:10]) of the emitted payload. It is filled only when the
 	// payload carries the SYNTHESISED ISO timestamp (the timestamp key is
@@ -108,13 +118,13 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 			markExtras(opts.Extras, usedExtras, key)
 			continue
 		}
-		if idx, ok := extraIndex(opts.Extras, key); ok {
-			usedExtras[idx] = true
+		if idx, ok := lastExtraIndex(opts.Extras, key); ok {
+			markExtras(opts.Extras, usedExtras, key)
 			emitExtra(idx)
 			continue
 		}
 		emitKey(key)
-		if len(opts.MessageOverride) > 0 && bytes.Equal(key, messageKey) {
+		if opts.MessageOverrideSet && bytes.Equal(key, messageKey) {
 			dst = appendJSONString(dst, opts.MessageOverride)
 			continue
 		}
@@ -128,8 +138,8 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 	// Pass 2: synthesised keys, in the old append order.
 	emitSynth := func(key string, render func() ([]byte, error)) error {
 		k := []byte(key)
-		if idx, ok := extraIndex(opts.Extras, k); ok {
-			usedExtras[idx] = true
+		if idx, ok := lastExtraIndex(opts.Extras, k); ok {
+			markExtras(opts.Extras, usedExtras, k)
 			if keeps(opts.Filter, k) {
 				emitExtra(idx)
 			}
@@ -161,11 +171,14 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 		}
 	}
 	if err := emitSynth("timestamp", func() ([]byte, error) {
-		timestamp, err := TimestampFromRealtime(float64(e.Realtime) / 1e6)
-		if err != nil {
-			return nil, err
+		iso := opts.TimestampISO
+		if iso == "" {
+			timestamp, err := TimestampFromRealtime(float64(e.Realtime) / 1e6)
+			if err != nil {
+				return nil, err
+			}
+			iso = pythonISOFormat(timestamp)
 		}
-		iso := pythonISOFormat(timestamp)
 		// render runs only when the synthesised value is actually emitted,
 		// so filling the sidecar here is exactly the "payload carries the
 		// synthesised timestamp" condition.
@@ -177,21 +190,24 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 		return nil, err
 	}
 
-	// Pass 3: extras not yet placed, in document order.
+	// Pass 3: extras not yet placed, in document order. A key's position
+	// is its FIRST insertion (Python dict update keeps it), but its value
+	// is the LAST assignment, so the first occurrence emits the last
+	// occurrence's JSON and later duplicates are skipped.
 	for i := range opts.Extras {
 		if usedExtras[i] {
 			continue
 		}
-		// A later extra sharing a key with an earlier one is dropped (old
-		// dict update keeps one key); the first occurrence already placed it.
-		if firstIdx, ok := extraIndex(opts.Extras, []byte(opts.Extras[i].Key)); ok && firstIdx != i {
+		k := []byte(opts.Extras[i].Key)
+		if firstIdx, ok := firstExtraIndex(opts.Extras, k); ok && firstIdx != i {
 			continue
 		}
-		k := []byte(opts.Extras[i].Key)
 		if !keeps(opts.Filter, k) {
 			continue
 		}
-		emitExtra(i)
+		if idx, ok := lastExtraIndex(opts.Extras, k); ok {
+			emitExtra(idx)
+		}
 	}
 
 	dst = append(dst, '}')
@@ -203,9 +219,21 @@ func keeps(f *filter.FieldFilter, key []byte) bool {
 	return f == nil || f.KeepBytes(key)
 }
 
-// extraIndex finds the extras entry with the given key.
-func extraIndex(extras []ExtraFragment, key []byte) (int, bool) {
+// firstExtraIndex finds the FIRST extras entry with the given key (its
+// insertion position under Python dict.update).
+func firstExtraIndex(extras []ExtraFragment, key []byte) (int, bool) {
 	for i := range extras {
+		if len(extras[i].Key) == len(key) && string(key) == extras[i].Key {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// lastExtraIndex finds the LAST extras entry with the given key (the
+// winning value under Python's successive data.update).
+func lastExtraIndex(extras []ExtraFragment, key []byte) (int, bool) {
+	for i := len(extras) - 1; i >= 0; i-- {
 		if len(extras[i].Key) == len(key) && string(key) == extras[i].Key {
 			return i, true
 		}
