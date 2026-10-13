@@ -78,6 +78,28 @@ ISO timestamp, `ensure_ascii` escaping) is Python-fidelity work: it
 reproduces `json.dumps(ensure_ascii=True)` byte-for-byte, which the
 charter's "byte-identical where free" clause does not require.
 
+### 1.1 cgo crossings and channel/buffer ops per entry
+
+- **cgo crossings: 1 per entry.** The C batch loop (`jp_read_batch`,
+  `ffi.go`) exists to amortise the cgo boundary over a whole batch, but
+  the streaming pipeline calls `raw.ReadRaw(1)` once per entry
+  (`daemon.readSingleRaw`, `pump.go:1207`) — batch size 1 — so the live
+  path pays **one cgo crossing per entry**, and `runtime.cgocall` is the
+  single largest flat frame (1.49 s, 21.4 % of samples). Only the
+  positioning paths (`applyInitial`/`Seek`, which use the batched
+  `ReadBatch` adapter) realise the batch ABI's amortisation. Batching the
+  streaming read (e.g. `ReadRaw(N)` with a per-entry walk) is the one
+  change that directly attacks this 5.1 µs/entry.
+- **channel/buffer ops: 1 channel send + 2 mutex sections per entry.**
+  Each emitted payload is `SenderBuffer.Enqueue`d — one `b.ch <- item`
+  channel send plus a `b.mu` lock/unlock on the reader side, and one
+  `drained` mutex pass on the sender side (`buffer.go:107-137`); the
+  enqueue path also runs `Loop.TrackEnqueue` → `rawString`
+  (`json.Marshal`, ~3.2 objects/entry). Total sender-side CPU is only
+  ~1.1 µs/entry (`sender.Loop.Run` cum 0.33 s), so the channel/mutex
+  machinery is not a hot spot — its cost is the per-item `json.Marshal`
+  in `rawString`, not the channel itself.
+
 ## 2. Whole-run allocation attribution
 
 `go tool pprof -sample_index=alloc_space|alloc_objects` over the same run:
@@ -220,6 +242,16 @@ CPU** — far short of what a compiled daemon would imply, because both are
 dominated by per-entry allocation + GC + the transform, and Go's
 allocation churn (46 objects/entry) is what eats the compiled-language
 advantage.
+
+*Comparability:* both saturated runs drive the same 300,000-entry
+fixture, same reader+transform+file-sender shape, same host, and each
+includes its implementation's own reader FFI (libsystemd for Go,
+python-systemd for Python) — so the per-entry figures measure the same
+work: read one entry, convert/rewrite it, serialize it, hand it to the
+file sender. The one asymmetry is that Python's `sitecustomize` shim is
+measurement-only scaffolding outside the repo, whereas Go's
+`JOURNALPUMP_POLL_INTERVAL_MS` seam is the existing test-only build tag;
+neither changes the per-entry work.
 
 ## 6. Verdict
 
