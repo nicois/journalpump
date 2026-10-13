@@ -19,8 +19,10 @@ func TestFieldFilterKeepBytes(t *testing.T) {
 	filts := []*filter.FieldFilter{
 		filter.NewFieldFilter("wl", config.FieldFilterConfig{Whitelist: true, Fields: []string{"_foo", "BAR"}}),
 		filter.NewFieldFilter("bl", config.FieldFilterConfig{Whitelist: false, Fields: []string{"_foo"}}),
+		// Non-ASCII whitelist: Python lowercases Unicode, so "Ä" matches.
+		filter.NewFieldFilter("uni", config.FieldFilterConfig{Whitelist: true, Fields: []string{"ä"}}),
 	}
-	keys := []string{"Foo", "_foo", "BAR", "_bar", "_zob", "__REALTIME_TIMESTAMP", "message", "", "_", "Å", "PRIORITY"}
+	keys := []string{"Foo", "_foo", "BAR", "_bar", "_zob", "__REALTIME_TIMESTAMP", "message", "", "_", "Å", "Ä", "ä", "PRIORITY", "MESSAGE"}
 	for _, ff := range filts {
 		for _, key := range keys {
 			want := ff.Keep(key)

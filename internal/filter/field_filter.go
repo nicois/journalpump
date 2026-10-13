@@ -74,8 +74,11 @@ func (f *FieldFilter) Keep(name string) bool {
 }
 
 // KeepBytes is Keep over a byte view (the raw emission path): the leading
-// underscores are stripped, ASCII letters lowercased, and the map probed
-// without allocating when the key is already lowercase.
+// underscores are stripped and the key lowercased exactly like Python's
+// str.lower(). An already-lowercase ASCII key is probed without
+// allocating; anything with an ASCII uppercase or a non-ASCII byte goes
+// through strings.ToLower so a Unicode field name (e.g. "Ä" vs the
+// whitelisted "ä") is not silently dropped.
 func (f *FieldFilter) KeepBytes(name []byte) bool {
 	i := 0
 	for i < len(name) && name[i] == '_' {
@@ -84,7 +87,7 @@ func (f *FieldFilter) KeepBytes(name []byte) bool {
 	key := name[i:]
 	needsLower := false
 	for _, c := range key {
-		if c >= 'A' && c <= 'Z' {
+		if (c >= 'A' && c <= 'Z') || c >= 0x80 {
 			needsLower = true
 			break
 		}
@@ -93,13 +96,6 @@ func (f *FieldFilter) KeepBytes(name []byte) bool {
 		_, member := f.fields[string(key)]
 		return member == f.whitelist
 	}
-	lowered := make([]byte, len(key))
-	for j, c := range key {
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		lowered[j] = c
-	}
-	_, member := f.fields[string(lowered)]
+	_, member := f.fields[strings.ToLower(string(key))]
 	return member == f.whitelist
 }
