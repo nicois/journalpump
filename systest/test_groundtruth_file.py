@@ -83,8 +83,6 @@ def test_file_sender_wire_bytes(tmp_path: Path) -> None:
     want = fixture["expected"]["lines"]
     assert len(got) == len(want)
     for index, (line, expected_line) in enumerate(zip(got, want)):
-        assert gt.semantic_equal(line, expected_line), (
-            f"line {index} payload differs semantically:\n got  {line}\n want {expected_line}"
-        )
+        gt.assert_semantic_equal(line, expected_line, f"line {index}")
     assert sent["count"] == fixture["expected"]["sent_count"]
     assert sent["cursor"] == fixture["expected"]["sent_cursor"]

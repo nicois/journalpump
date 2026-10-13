@@ -250,12 +250,11 @@ def _run_and_capture(
 def _assert_payloads_semantically_equal(got: list[str], want: list[str], mode: str) -> None:
     """Compare consumed payloads by parsed JSON (Task 32 charter
     amendment): key order and free formatting may differ; record framing,
-    headers, key, partition, count and cursor are compared raw elsewhere."""
+    headers, key, partition, count and cursor are compared raw elsewhere.
+    A byte-only diff is reported as a non-failing warning."""
     assert len(got) == len(want), f"{mode}: {len(got)} payloads, want {len(want)}"
     for index, (payload, expected) in enumerate(zip(got, want)):
-        assert gt.semantic_equal(payload, expected), (
-            f"{mode}: record {index} payload differs semantically:\n got  {payload}\n want {expected}"
-        )
+        gt.assert_semantic_equal(payload, expected, f"{mode}: record {index}")
 
 
 def test_kafka_wire_records(tmp_path: Path, kafka_broker: str) -> None:

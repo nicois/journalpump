@@ -114,6 +114,28 @@ var goldenFixtures = []goldenFixture{
 // (spec §4.4, quirk D8).
 func TestSerializeGolden(t *testing.T) {
 	t.Parallel()
+	expected := loadGoldenFixtures(t)
+	for _, fixture := range goldenFixtures {
+		want, ok := expected[fixture.name]
+		if !ok {
+			t.Errorf("golden file has no fixture named %q", fixture.name)
+			continue
+		}
+		got := string(runSerializationPipeline(t, fixture))
+		if got != want {
+			// Byte diff: logged, not fatal (byte-identity is free only).
+			t.Logf("fixture %q byte diff:\n got: %s\nwant: %s", fixture.name, got, want)
+			if !semanticEqual(t, []byte(got), []byte(want)) {
+				t.Errorf("fixture %q:\n got: %s\nwant: %s", fixture.name, got, want)
+			}
+		}
+	}
+}
+
+// loadGoldenFixtures reads testdata/serialization_golden.jsonl into a
+// name→output map and checks it covers the fixture table.
+func loadGoldenFixtures(t *testing.T) map[string]string {
+	t.Helper()
 	expected := make(map[string]string)
 	raw, err := os.ReadFile(filepath.Join("testdata", "serialization_golden.jsonl"))
 	if err != nil {
@@ -132,21 +154,94 @@ func TestSerializeGolden(t *testing.T) {
 	if len(expected) != len(goldenFixtures) {
 		t.Fatalf("golden file has %d fixtures but the test table has %d", len(expected), len(goldenFixtures))
 	}
+	return expected
+}
+
+// TestSerializeGoldenRawPath runs the same committed serialization
+// fixtures through the RAW emission path (EmitJSON), which the converted
+// chain of TestSerializeGolden never exercises: the live pipeline is
+// ReadRaw → ProcessRaw → EmitJSON, so the fixture canary must cover it too.
+func TestSerializeGoldenRawPath(t *testing.T) {
+	t.Parallel()
+	expected := loadGoldenFixtures(t)
 	for _, fixture := range goldenFixtures {
 		want, ok := expected[fixture.name]
 		if !ok {
 			t.Errorf("golden file has no fixture named %q", fixture.name)
 			continue
 		}
-		got := string(runSerializationPipeline(t, fixture))
+		got := string(runEmitJSONPipeline(t, fixture))
 		if got != want {
 			// Byte diff: logged, not fatal (byte-identity is free only).
 			t.Logf("fixture %q byte diff:\n got: %s\nwant: %s", fixture.name, got, want)
 			if !semanticEqual(t, []byte(got), []byte(want)) {
-				t.Errorf("fixture %q:\n got: %s\nwant: %s", fixture.name, got, want)
+				t.Errorf("fixture %q raw path:\n got: %s\nwant: %s", fixture.name, got, want)
 			}
 		}
 	}
+}
+
+// runEmitJSONPipeline runs one golden fixture through the raw emitter:
+// the entry is re-encoded as a jp_read_batch record (repeated []any
+// values become repeated raw keys, exactly like the reader), the batch is
+// parsed, and EmitJSON renders it with the fixture's extras.
+func runEmitJSONPipeline(t *testing.T, fixture goldenFixture) []byte {
+	t.Helper()
+	b := rawBatchFromFields(t, fixture.entry, fixture.cursor, uint64(fixture.realtime))
+	out, err := EmitJSON(nil, b, &b.Entries[0], &EmitOptions{Extras: NewExtraFragments(fixture.extras)})
+	if err != nil {
+		t.Fatalf("EmitJSON: %v", err)
+	}
+	return out
+}
+
+// rawBatchFromFields encodes []Field values as one jp_read_batch entry
+// record and parses it back. A []any value becomes one raw field per
+// element (the reader's repeated-key representation); strings and []byte
+// are written verbatim.
+func rawBatchFromFields(t *testing.T, fields []Field, cursor string, realtime uint64) *Batch {
+	t.Helper()
+	var buf []byte
+	put := func(v uint64, n int) {
+		for i := 0; i < n; i++ {
+			buf = append(buf, byte(v>>(8*i)))
+		}
+	}
+	var data [][]byte
+	for _, field := range fields {
+		switch v := field.Value.(type) {
+		case []byte:
+			data = append(data, append([]byte(field.Key+"="), v...))
+		case string:
+			data = append(data, []byte(field.Key+"="+v))
+		case []any:
+			for _, element := range v {
+				switch ev := element.(type) {
+				case []byte:
+					data = append(data, append([]byte(field.Key+"="), ev...))
+				case string:
+					data = append(data, []byte(field.Key+"="+ev))
+				default:
+					t.Fatalf("fixture field %q: unsupported list element %T", field.Key, element)
+				}
+			}
+		default:
+			t.Fatalf("fixture field %q: unsupported value %T", field.Key, field.Value)
+		}
+	}
+	put(realtime, 8)
+	put(uint64(len(cursor)), 2)
+	buf = append(buf, cursor...)
+	put(uint64(len(data)), 4)
+	for _, d := range data {
+		put(uint64(len(d)), 4)
+		buf = append(buf, d...)
+	}
+	b := &Batch{Buf: buf}
+	if _, err := ParseBatch(b, len(buf), 1); err != nil {
+		t.Fatalf("ParseBatch: %v", err)
+	}
+	return b
 }
 
 // runSerializationPipeline ports the full Python path:

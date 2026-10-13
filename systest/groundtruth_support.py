@@ -55,6 +55,7 @@ import os
 import re
 import threading
 import time
+import warnings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_DIR = REPO_ROOT / "systest-go" / "fixtures"
@@ -175,6 +176,24 @@ def semantic_equal(a: bytes | str, b: bytes | str) -> bool:
     except (ValueError, TypeError):
         return a == b
     return _json_values_equal(va, vb)
+
+
+def assert_semantic_equal(got: bytes | str, want: bytes | str, label: str) -> None:
+    """Assert two payloads carry the same parsed JSON.
+
+    Byte-identity is free only (Task 32 charter amendment), so a byte diff
+    that is still semantically equal is reported as a non-failing warning
+    for inspection; only a SEMANTIC difference fails, with both payloads.
+    """
+    if got == want:
+        return
+    if semantic_equal(got, want):
+        warnings.warn(
+            f"{label}: byte diff (semantically equal)\n  got:  {got!r}\n  want: {want!r}",
+            stacklevel=2,
+        )
+        return
+    raise AssertionError(f"{label}: payload differs semantically\n  got:  {got!r}\n  want: {want!r}")
 
 
 def build_shim(directory: Path, extra_shim: str = "") -> Path:

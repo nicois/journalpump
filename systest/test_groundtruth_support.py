@@ -10,7 +10,25 @@ binary, no journal fixture — pinning the type-awareness the parsed-object
 the non-JSON byte fallback.
 """
 
+import pytest
+
 from systest import groundtruth_support as gt
+
+
+def test_assert_semantic_equal_is_silent_on_bytes():
+    # Byte-identical: no warning, no failure.
+    gt.assert_semantic_equal(b'{"a": 1}', b'{"a": 1}', "line 0")
+    gt.assert_semantic_equal("plain non-json", "plain non-json", "line 1")
+
+
+def test_assert_semantic_equal_warns_on_byte_diff():
+    with pytest.warns(UserWarning, match="byte diff"):
+        gt.assert_semantic_equal(b'{"a": 1, "b": 2}', b'{"b":2,"a":1}', "line 0")
+
+
+def test_assert_semantic_equal_fails_on_semantic_diff():
+    with pytest.raises(AssertionError, match="differs semantically"):
+        gt.assert_semantic_equal(b'{"a": 1}', b'{"a": 2}', "line 0")
 
 
 def test_bool_is_not_a_number():
