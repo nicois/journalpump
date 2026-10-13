@@ -499,6 +499,15 @@ type ReaderRuntime struct {
 	// sender (re)initialization (initSenders resets prefilterBuilt).
 	prefilter      *journal.SeverityPrefilter
 	prefilterBuilt bool
+	// pipelineCache memoises the per-entry pipeline (targets + handler +
+	// enqueue-error sink). Its inputs — the live senders and their
+	// construction-time lookups — are stable across entries, and the
+	// pump-level settings only change on a reload, so the old code's
+	// per-entry map/slice/closure/Handler allocation was pure churn.
+	// Rebuilt only when the settings pointer changes (a reload) or
+	// initSenders runs (a sender set change); accessed only on the reader
+	// goroutine, guarded by mu for the initSenders invalidation.
+	pipelineCache *pipelineCache
 
 	// reopener is the ensure/invalidate seam (*reader.Reopener or a
 	// test fake); openFlags and initialPosition feed its OpenConfig.
@@ -869,8 +878,10 @@ func (rt *ReaderRuntime) initSenders() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	// A later open may start a sender that failed earlier, changing the
-	// target set; rebuild the §2.6 pre-filter on the next pipeline call.
+	// target set; rebuild the §2.6 pre-filter and the memoised pipeline on
+	// the next pipeline call.
 	rt.prefilterBuilt = false
+	rt.pipelineCache = nil
 	for _, resolved := range rt.resolved {
 		if _, done := rt.initialised[resolved.name]; done {
 			continue
@@ -1270,12 +1281,19 @@ func (rt *ReaderRuntime) processRaw(ctx context.Context, batch *journal.Batch, e
 // enqueue-error sink shared by the converted (process) and raw
 // (processRaw) paths.
 func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.SenderTarget, *journal.Handler) {
-	var enqueueErr error
 	// Read the CURRENT pump-level settings (Python's handler consults
 	// self.pump per entry), so a reload's global match/stats/tag changes
-	// take effect even when this reader was not rebuilt.
+	// take effect even when this reader was not rebuilt. The settings
+	// snapshot is a fresh pointer after a reload, which invalidates the
+	// memoised pipeline below.
 	settings := rt.settings()
 	rt.mu.Lock()
+	if c := rt.pipelineCache; c != nil && c.settings == settings {
+		rt.mu.Unlock()
+		c.enqueueErr = nil
+		return &c.enqueueErr, c.targets, c.handler
+	}
+	c := &pipelineCache{settings: settings}
 	// Iterate the SUCCESSFUL-initialization order (Python's
 	// self.senders.items()); each resolved entry carries the
 	// construction-time filter/extras lookups.
@@ -1283,7 +1301,7 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 	for _, resolved := range rt.resolved {
 		resolvedByName[resolved.name] = resolved
 	}
-	targets := make([]journal.SenderTarget, 0, len(rt.senders))
+	c.targets = make([]journal.SenderTarget, 0, len(rt.senders))
 	for _, name := range rt.senderOrder {
 		resolved, ok := resolvedByName[name]
 		if !ok {
@@ -1294,7 +1312,7 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 			continue
 		}
 		sbuf := live.buffer
-		targets = append(targets, journal.SenderTarget{
+		c.targets = append(c.targets, journal.SenderTarget{
 			Name:             resolved.name,
 			FieldFilter:      resolved.fieldFilter,
 			UnitLogLevels:    resolved.unitLogLevels,
@@ -1304,10 +1322,10 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 				// Python msg_buffer.add_item never fails; Enqueue blocks
 				// only past the gate and returns on ctx cancellation
 				// (shutdown) — recorded, not dropped.
-				if enqueueErr != nil {
+				if c.enqueueErr != nil {
 					return
 				}
-				enqueueErr = sbuf.Enqueue(ctx, sender.Item{Payload: item, Cursor: cursor, IndexDate: indexDate})
+				c.enqueueErr = sbuf.Enqueue(ctx, sender.Item{Payload: item, Cursor: cursor, IndexDate: indexDate})
 			},
 		})
 	}
@@ -1315,13 +1333,11 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 	// the ordered unit_log_levels and extras — are construction-time); it
 	// is rebuilt if a later open starts a previously failed sender.
 	if !rt.prefilterBuilt {
-		rt.prefilter = journal.NewSeverityPrefilter(targets)
+		rt.prefilter = journal.NewSeverityPrefilter(c.targets)
 		rt.prefilterBuilt = true
 	}
 	prefilter := rt.prefilter
-	rt.mu.Unlock()
-
-	handler := journal.NewHandler(journal.HandlerConfig{
+	c.handler = journal.NewHandler(journal.HandlerConfig{
 		ReaderName:            rt.name,
 		Searcher:              rt.searcher,
 		ReaderMatchKey:        rt.matchKey,
@@ -1339,7 +1355,20 @@ func (rt *ReaderRuntime) pipeline(ctx context.Context) (*error, []journal.Sender
 		// §2.6 global severity pre-filter over the reader's senders.
 		Prefilter: prefilter,
 	})
-	return &enqueueErr, targets, handler
+	rt.pipelineCache = c
+	rt.mu.Unlock()
+	c.enqueueErr = nil
+	return &c.enqueueErr, c.targets, c.handler
+}
+
+// pipelineCache is the memoised per-entry pipeline (see
+// ReaderRuntime.pipelineCache). enqueueErr is the reusable sink the
+// targets' AddItem closures write; it is reset before every entry.
+type pipelineCache struct {
+	settings   *pumpSettings
+	targets    []journal.SenderTarget
+	handler    *journal.Handler
+	enqueueErr error
 }
 
 // recordHits ports the read_messages tail (journalpump.py:1046-1047):

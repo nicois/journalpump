@@ -84,22 +84,13 @@ func NewExtraFragments(fields []Field) []ExtraFragment {
 // converted entry (same keys and values; key order and, where free, bytes
 // too).
 func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, error) {
-	usedExtras := make([]bool, len(opts.Extras))
+	var usedExtras []bool
+	if n := len(opts.Extras); n > 0 {
+		usedExtras = make([]bool, n)
+	}
 
 	dst = append(dst, '{')
 	first := true
-	emitKey := func(key []byte) {
-		if !first {
-			dst = append(dst, ", "...)
-		}
-		first = false
-		dst = appendJSONString(dst, key)
-		dst = append(dst, ": "...)
-	}
-	emitExtra := func(idx int) {
-		emitKey([]byte(opts.Extras[idx].Key))
-		dst = append(dst, opts.Extras[idx].JSON...)
-	}
 
 	// Pass 1: raw fields. Distinct exact keys that strip to the SAME name
 	// are a dict collision (ProcessEntry keeps the last value), so only
@@ -126,10 +117,10 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 		}
 		if idx, ok := lastExtraIndex(opts.Extras, key); ok {
 			markExtras(opts.Extras, usedExtras, key)
-			emitExtra(idx)
+			dst, first = appendExtra(dst, first, opts, idx)
 			continue
 		}
-		emitKey(key)
+		dst, first = appendKey(dst, first, key)
 		if opts.MessageOverrideSet && bytes.Equal(key, messageKey) {
 			dst = appendJSONString(dst, opts.MessageOverride)
 			continue
@@ -141,42 +132,43 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 		}
 	}
 
-	// Pass 2: synthesised keys, in the old append order.
-	emitSynth := func(key string, render func() ([]byte, error)) error {
-		k := []byte(key)
-		if idx, ok := lastExtraIndex(opts.Extras, k); ok {
-			markExtras(opts.Extras, usedExtras, k)
-			if keeps(opts.Filter, k) {
-				emitExtra(idx)
-			}
-			return nil
+	// Pass 2: synthesised keys, in the old append order. Each key is handled
+	// explicitly so the emit path allocates no per-entry func value (the old
+	// emitSynth/render closures captured dst and e and escaped to the heap).
+	// REALTIME_TIMESTAMP: a same-key extra wins in place; a filtered key is
+	// dropped; otherwise the value is rendered and appended.
+	if idx, ok := lastExtraIndex(opts.Extras, realtimeTimestampKey); ok {
+		markExtras(opts.Extras, usedExtras, realtimeTimestampKey)
+		if keeps(opts.Filter, realtimeTimestampKey) {
+			dst, first = appendExtra(dst, first, opts, idx)
 		}
-		if !keeps(opts.Filter, k) {
-			return nil
-		}
-		value, err := render()
-		if err != nil {
-			return err
-		}
-		emitKey(k)
-		dst = append(dst, value...)
-		return nil
+	} else if keeps(opts.Filter, realtimeTimestampKey) {
+		dst, first = appendKey(dst, first, realtimeTimestampKey)
+		dst = append(dst, PythonFloatRepr(float64(e.Realtime)/1e6)...)
 	}
-	if err := emitSynth("REALTIME_TIMESTAMP", func() ([]byte, error) {
-		return []byte(PythonFloatRepr(float64(e.Realtime) / 1e6)), nil
-	}); err != nil {
-		return nil, err
-	}
+	// SEQNUM.
 	if seqnum, ok := ParseSeqnumFromCursor(string(b.Cursor(e))); ok {
-		rendered, err := renderNumber(seqnum)
-		if err != nil {
-			return nil, err
-		}
-		if err := emitSynth("SEQNUM", func() ([]byte, error) { return rendered, nil }); err != nil {
-			return nil, err
+		if idx, ok := lastExtraIndex(opts.Extras, seqnumKey); ok {
+			markExtras(opts.Extras, usedExtras, seqnumKey)
+			if keeps(opts.Filter, seqnumKey) {
+				dst, first = appendExtra(dst, first, opts, idx)
+			}
+		} else if keeps(opts.Filter, seqnumKey) {
+			dst, first = appendKey(dst, first, seqnumKey)
+			var err error
+			dst, err = appendNumberValue(dst, seqnum)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-	if err := emitSynth("timestamp", func() ([]byte, error) {
+	// timestamp.
+	if idx, ok := lastExtraIndex(opts.Extras, timestampKey); ok {
+		markExtras(opts.Extras, usedExtras, timestampKey)
+		if keeps(opts.Filter, timestampKey) {
+			dst, first = appendExtra(dst, first, opts, idx)
+		}
+	} else if keeps(opts.Filter, timestampKey) {
 		iso := opts.TimestampISO
 		if iso == "" {
 			timestamp, err := TimestampFromRealtime(float64(e.Realtime) / 1e6)
@@ -185,15 +177,13 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 			}
 			iso = pythonISOFormat(timestamp)
 		}
-		// render runs only when the synthesised value is actually emitted,
-		// so filling the sidecar here is exactly the "payload carries the
-		// synthesised timestamp" condition.
+		// The sidecar is filled only when the synthesised value is actually
+		// emitted — the "payload carries the synthesised timestamp" condition.
 		if opts.IndexDate != nil && len(iso) >= 10 {
 			copy(opts.IndexDate[:], iso[:10])
 		}
-		return appendJSONString(nil, []byte(iso)), nil
-	}); err != nil {
-		return nil, err
+		dst, first = appendKey(dst, first, timestampKey)
+		dst = appendJSONString(dst, []byte(iso))
 	}
 
 	// Pass 3: extras not yet placed, in document order. A key's position
@@ -212,12 +202,31 @@ func EmitJSON(dst []byte, b *Batch, e *RawEntry, opts *EmitOptions) ([]byte, err
 			continue
 		}
 		if idx, ok := lastExtraIndex(opts.Extras, k); ok {
-			emitExtra(idx)
+			dst, first = appendExtra(dst, first, opts, idx)
 		}
 	}
 
 	dst = append(dst, '}')
 	return dst, nil
+}
+
+// appendKey writes the ", " separator (unless this is the first key), the
+// JSON-quoted key and the ": " separator, returning the updated dst and
+// first flag. It replaces the old emitKey closure, whose capture of dst
+// forced a per-entry heap allocation.
+func appendKey(dst []byte, first bool, key []byte) ([]byte, bool) {
+	if !first {
+		dst = append(dst, ", "...)
+	}
+	dst = appendJSONString(dst, key)
+	dst = append(dst, ": "...)
+	return dst, false
+}
+
+// appendExtra writes one extras fragment (key + pre-rendered JSON value).
+func appendExtra(dst []byte, first bool, opts *EmitOptions, idx int) ([]byte, bool) {
+	dst, first = appendKey(dst, first, []byte(opts.Extras[idx].Key))
+	return append(dst, opts.Extras[idx].JSON...), first
 }
 
 // keeps reports whether key survives the (optional) field filter.
@@ -257,17 +266,70 @@ func markExtras(extras []ExtraFragment, used []bool, key []byte) {
 	}
 }
 
-// renderNumber renders a seqnum result (int64 or json.Number) as JSON.
-func renderNumber(value any) ([]byte, error) {
-	switch v := value.(type) {
-	case int64:
-		return strconv.AppendInt(nil, v, 10), nil
-	case json.Number:
-		return []byte(v.String()), nil
-	default:
-		return nil, errors.New("unsupported seqnum value")
+// appendCanonicalUUID appends the canonical, double-quoted UUID form of the
+// raw value v (Python uuid.UUID: markers/braces/hyphens removed, exactly 32
+// hex digits, re-emitted lowercase in 8-4-4-4-12 groups), or reports false
+// with dst unchanged when v is not a UUID. It is the allocation-free
+// rewrite of decodeUTF8+canonicalUUID (which built several intermediate
+// strings per UUID); the marker/brace/hyphen and hex rules are identical,
+// including the "urn:"/"uuid:"-anywhere preprocessing, which falls back to
+// the shared canonicalUUID for the rare marker-bearing value.
+func appendCanonicalUUID(dst, v []byte) ([]byte, bool) {
+	if bytes.Contains(v, urnMarker) || bytes.Contains(v, uuidMarker) {
+		canonical, ok := canonicalUUID(string(v))
+		if !ok {
+			return dst, false
+		}
+		dst = append(dst, '"')
+		dst = append(dst, canonical...)
+		return append(dst, '"'), true
 	}
+	lo, hi := 0, len(v)
+	for lo < hi && (v[lo] == '{' || v[lo] == '}') {
+		lo++
+	}
+	for hi > lo && (v[hi-1] == '{' || v[hi-1] == '}') {
+		hi--
+	}
+	var buf [32]byte
+	n := 0
+	for i := lo; i < hi; i++ {
+		c := v[i]
+		if c == '-' {
+			continue
+		}
+		if n == 32 || !isHexDigit(c) {
+			return dst, false
+		}
+		buf[n] = c
+		n++
+	}
+	if n != 32 {
+		return dst, false
+	}
+	dst = append(dst, '"')
+	for i := 0; i < 32; i++ {
+		switch i {
+		case 8, 12, 16, 20:
+			dst = append(dst, '-')
+		}
+		c := buf[i]
+		if c >= 'A' && c <= 'F' {
+			c += 'a' - 'A'
+		}
+		dst = append(dst, c)
+	}
+	return append(dst, '"'), true
 }
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+var (
+	urnMarker  = []byte("urn:")
+	uuidMarker = []byte("uuid:")
+)
 
 // appendFieldValue renders one raw field's value, honouring the converter
 // class of its raw key, and appends it to dst. A first occurrence followed
@@ -367,10 +429,8 @@ func appendSingleValue(dst []byte, rawKey, value []byte) ([]byte, error) {
 	case classMon:
 		return append(dst, "null"...), nil
 	case classUUID:
-		if decoded, valid := decodeUTF8(value); valid {
-			if canonical, ok := canonicalUUID(decoded); ok {
-				return appendJSONString(dst, []byte(canonical)), nil
-			}
+		if out, ok := appendCanonicalUUID(dst, value); ok {
+			return out, nil
 		}
 		return appendStringValue(dst, value), nil
 	default:

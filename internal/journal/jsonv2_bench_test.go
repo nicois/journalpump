@@ -6,6 +6,9 @@
 package journal
 
 import (
+	"encoding/json/jsontext"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -216,4 +219,110 @@ func TestJSONv2NonASCIIIsNotPythonEscaped(t *testing.T) {
 		t.Fatalf("v2 non-ASCII form is not even semantically equal:\n python: %s\n v2:     %s", python, out)
 	}
 	t.Logf("v2 emits raw UTF-8 (%s); Python escapes (%s): semantic-only parity", out, python)
+}
+
+// BenchmarkAppendJSONStringRef and BenchmarkJSONTextAppendQuote isolate the
+// string-escaping primitive: our appendJSONString (Python
+// json.dumps(ensure_ascii=True): \uXXXX escapes for non-ASCII) against the
+// stdlib jsontext.AppendQuote (compact, raw UTF-8). The Task 32 charter
+// now permits either escaping form, so this is the "is the library
+// escaping cheaper than ours" half of the v2-format review item.
+func BenchmarkAppendJSONStringRef(b *testing.B) {
+	msg := benchMessage()
+	dst := make([]byte, 0, 512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst = appendJSONString(dst[:0], msg)
+	}
+	_ = dst
+}
+
+func BenchmarkJSONTextAppendQuote(b *testing.B) {
+	msg := benchMessage()
+	dst := make([]byte, 0, 512)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var err error
+	for i := 0; i < b.N; i++ {
+		dst, err = jsontext.AppendQuote(dst[:0], msg)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = dst
+}
+
+// BenchmarkEmitJSONjsontext builds the same 16-field object with the
+// jsontext primitives, writing fields in dynamic (source) order — the
+// format-relaxed candidate: unlike a fixed struct it CAN express an
+// arbitrary field set, at the cost of our Python-fidelity conversions.
+func BenchmarkEmitJSONjsontext(b *testing.B) {
+	e := benchStructV2()
+	dst := make([]byte, 0, 1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var err error
+	for i := 0; i < b.N; i++ {
+		dst, err = appendJSONTextEntry(dst[:0], e)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = dst
+}
+
+func appendJSONTextEntry(dst []byte, e benchEntryV2) ([]byte, error) {
+	dst = append(dst, '{')
+	first := true
+	put := []struct {
+		k string
+		v any
+	}{
+		{"CURSOR", e.Cursor},
+		{"SEQNUM_ID", e.SeqnumID},
+		{"SYSTEMD_UNIT", e.SystemdUnit},
+		{"BENCH_TOKEN", e.BenchToken},
+		{"PID", e.PID},
+		{"SYSLOG_IDENTIFIER", e.SyslogIdentifier},
+		{"MESSAGE", e.Message},
+		{"PRIORITY", e.Priority},
+		{"MONOTONIC_TIMESTAMP", e.MonotonicTimestamp},
+		{"MACHINE_ID", e.MachineID},
+		{"HOSTNAME", e.Hostname},
+		{"BOOT_ID", e.BootID},
+		{"BENCH_SEQ", e.BenchSeq},
+		{"BENCH_RUN", e.BenchRun},
+		{"REALTIME_TIMESTAMP", e.RealtimeTimestamp},
+		{"SEQNUM", e.Seqnum},
+		{"timestamp", e.Timestamp},
+	}
+	for _, f := range put {
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		var err error
+		dst, err = jsontext.AppendQuote(dst, f.k)
+		if err != nil {
+			return nil, err
+		}
+		dst = append(dst, ':')
+		switch v := f.v.(type) {
+		case string:
+			dst, err = jsontext.AppendQuote(dst, v)
+		case int64:
+			dst = strconv.AppendInt(dst, v, 10)
+		case float64:
+			dst = jsontext.AppendFloat(dst, v, 64)
+		case nil:
+			dst = append(dst, "null"...)
+		default:
+			return nil, fmt.Errorf("unhandled %T", f.v)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return append(dst, '}'), nil
 }
